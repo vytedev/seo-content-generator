@@ -1,0 +1,11 @@
+node_modules/
+coverage/
+dist/
+.env
+.env.*
+*.pem
+*.key
+credentials*
+*token*
+drizzle/meta/
+package-lock.json

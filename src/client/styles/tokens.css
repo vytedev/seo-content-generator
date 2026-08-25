@@ -1,0 +1,243 @@
+@import "tailwindcss";
+@import "tw-animate-css";
+@import "shadcn/tailwind.css";
+
+/*
+ * Locally vendored fonts — see .xevy/design.md §06 (Font delivery) and
+ * src/client/assets/fonts/README.md. Nothing is fetched from a CDN at
+ * runtime; ASCII/system fallbacks remain in every --font-* stack below.
+ */
+@font-face {
+  font-family: "Barlow Condensed";
+  font-style: normal;
+  font-weight: 600;
+  font-display: swap;
+  src: url("../assets/fonts/barlow-condensed-600.woff2") format("woff2");
+}
+@font-face {
+  font-family: "Barlow Condensed";
+  font-style: normal;
+  font-weight: 700;
+  font-display: swap;
+  src: url("../assets/fonts/barlow-condensed-700.woff2") format("woff2");
+}
+@font-face {
+  font-family: "Barlow Condensed";
+  font-style: normal;
+  font-weight: 800;
+  font-display: swap;
+  src: url("../assets/fonts/barlow-condensed-800.woff2") format("woff2");
+}
+@font-face {
+  font-family: "Inter";
+  font-style: normal;
+  font-weight: 400 700;
+  font-display: swap;
+  src: url("../assets/fonts/inter-variable.woff2") format("woff2");
+}
+@font-face {
+  font-family: "JetBrains Mono";
+  font-style: normal;
+  font-weight: 400 500;
+  font-display: swap;
+  src: url("../assets/fonts/jetbrains-mono-variable.woff2") format("woff2");
+}
+@font-face {
+  font-family: "Source Serif 4";
+  font-style: normal;
+  font-weight: 500 600;
+  font-display: swap;
+  src: url("../assets/fonts/source-serif-4-variable.woff2") format("woff2");
+}
+
+@theme {
+  /* Shared application palette. Exact hex values are contrast-critical. */
+  --color-canvas: oklch(0.974 0.006 85);
+  --color-paper: #fffefd;
+  --color-subtle: oklch(0.953 0.007 81);
+  --color-ink: #4a4a4a;
+  --color-muted: #4b5563;
+  --color-rule: oklch(0.876 0.014 74);
+  --color-action: #ff9800;
+  --color-action-hover: #e08700;
+  --color-action-active: #c77700;
+  --color-action-tint: #fff3e0;
+  --color-action-tint-active: #ffe8c2;
+  --color-action-link: #a64b00;
+  --color-action-link-hover: #8f4100;
+  --color-on-action: #ffffff;
+  --color-focus: #c77700;
+  --color-success: oklch(0.594 0.097 152);
+  --color-warning: oklch(0.617 0.122 77);
+  --color-danger: oklch(0.549 0.134 28);
+  --color-info: oklch(0.568 0.074 247);
+  --font-sans: Inter, Arial, sans-serif;
+  --font-heading: "Barlow Condensed", Arial, sans-serif;
+  --font-serif: "Source Serif 4", Georgia, serif;
+  --font-mono: "JetBrains Mono", ui-monospace, monospace;
+  --radius-control: 0.125rem;
+  --radius-field: 0.375rem;
+  --radius-group: 0.25rem;
+
+  /*
+   * Authentication-screen-only radii, namespaced for the same reason as the
+   * colours above. These deliberately EXCEED .xevy/design.md §09 (2px controls,
+   * 4px grouped panels) and its "large rounded cards" prohibition, on explicit
+   * operator direction to match the approved login reference. The app shell
+   * stays on --radius-control/--radius-group; if this softer language is meant
+   * product-wide, §09 must be updated and these folded into the shared scale.
+   */
+  --radius-login-surface: 0.75rem;
+  --radius-login-field: 0.75rem;
+  --radius-login-control: 0.375rem;
+
+  /* Type scale from .xevy/design.md — Typography */
+  --text-body: 1rem;
+  --text-body--line-height: 1.5625rem;
+  --text-document: 1rem;
+  --text-document--line-height: 1.6875rem;
+  --text-standfirst: 1rem;
+  --text-standfirst--line-height: 1.5rem;
+  --text-h3: 1.25rem;
+  --text-h3--line-height: 1.6875rem;
+  --text-screen-title: 1.75rem;
+  --text-screen-title--line-height: 2.1875rem;
+  --text-screen-title-lg: 2rem;
+  --text-screen-title-lg--line-height: 2.4375rem;
+  --text-h2: 1.625rem;
+  --text-h2--line-height: 2.0625rem;
+  --text-h1: 1.875rem;
+  --text-h1--line-height: 2.3125rem;
+}
+
+/*
+ * shadcn/ui (Radix primitives) is layered on the palette above, not a second
+ * one: every shadcn semantic token below resolves to an existing Mobelaris
+ * --color-* value. Light-only, matching .xevy/design.md.
+ */
+@theme inline {
+  --color-sidebar-ring: var(--sidebar-ring);
+  --color-sidebar-border: var(--sidebar-border);
+  --color-sidebar-accent-foreground: var(--sidebar-accent-foreground);
+  --color-sidebar-accent: var(--sidebar-accent);
+  --color-sidebar-primary-foreground: var(--sidebar-primary-foreground);
+  --color-sidebar-primary: var(--sidebar-primary);
+  --color-sidebar-foreground: var(--sidebar-foreground);
+  --color-sidebar: var(--sidebar);
+  --color-ring: var(--ring);
+  --color-input: var(--input);
+  --color-border: var(--border);
+  --color-destructive: var(--destructive);
+  --color-accent-foreground: var(--accent-foreground);
+  --color-accent: var(--accent);
+  --color-muted-foreground: var(--muted-foreground);
+  /*
+   * --color-muted is deliberately NOT re-mapped here: the app already defines
+   * --color-muted above as its secondary TEXT colour (text-muted, used
+   * throughout every screen). shadcn's own "muted" concept is a light
+   * SURFACE colour instead — remapping it here silently overrode the text
+   * colour with that light surface, making all secondary/helper text
+   * near-invisible. Vendored components needing the light-surface meaning
+   * use bg-subtle directly instead (see button.tsx, skeleton.tsx).
+   */
+  --color-secondary-foreground: var(--secondary-foreground);
+  --color-secondary: var(--secondary);
+  --color-primary-foreground: var(--primary-foreground);
+  --color-primary: var(--primary);
+  --color-popover-foreground: var(--popover-foreground);
+  --color-popover: var(--popover);
+  --color-card-foreground: var(--card-foreground);
+  --color-card: var(--card);
+  --color-foreground: var(--foreground);
+  --color-background: var(--background);
+
+  /* Restrained radius scale: 2px controls, 4px grouped surfaces — see design.md. */
+  --radius-sm: 0.125rem;
+  --radius-md: 0.125rem;
+  --radius-lg: 0.25rem;
+  --radius-xl: 0.25rem;
+  --radius-2xl: 0.25rem;
+  --radius-3xl: 0.25rem;
+  --radius-4xl: 0.25rem;
+}
+
+:root {
+  --radius: 0.25rem;
+  --background: var(--color-canvas);
+  --foreground: var(--color-ink);
+  --card: var(--color-paper);
+  --card-foreground: var(--color-ink);
+  --popover: var(--color-paper);
+  --popover-foreground: var(--color-ink);
+  --primary: var(--color-action);
+  --primary-foreground: var(--color-on-action);
+  --secondary: var(--color-subtle);
+  --secondary-foreground: var(--color-ink);
+  --muted: var(--color-subtle);
+  --muted-foreground: var(--color-muted);
+  --accent: var(--color-subtle);
+  --accent-foreground: var(--color-ink);
+  --destructive: var(--color-danger);
+  --border: var(--color-rule);
+  --input: var(--color-rule);
+  --ring: var(--color-focus);
+  --sidebar: var(--color-paper);
+  --sidebar-foreground: var(--color-ink);
+  --sidebar-primary: var(--color-action);
+  --sidebar-primary-foreground: var(--color-on-action);
+  --sidebar-accent: var(--color-subtle);
+  --sidebar-accent-foreground: var(--color-ink);
+  --sidebar-border: var(--color-rule);
+  --sidebar-ring: var(--color-focus);
+}
+
+@utility font-screen-title {
+  font-family: var(--font-heading);
+  font-feature-settings: normal;
+  font-variation-settings: normal;
+  font-weight: 800;
+  -webkit-font-smoothing: antialiased;
+  -moz-osx-font-smoothing: grayscale;
+}
+
+@layer base {
+  * {
+    box-sizing: border-box;
+    @apply border-border outline-ring/50;
+  }
+
+  html {
+    scroll-behavior: smooth;
+  }
+
+  body {
+    margin: 0;
+    background: var(--color-canvas);
+    color: var(--color-ink);
+    font-family: var(--font-sans);
+    line-height: 1.5625;
+  }
+
+  button,
+  input,
+  textarea,
+  select {
+    font: inherit;
+  }
+
+  :focus-visible {
+    outline: 3px solid var(--color-focus);
+    outline-offset: 2px;
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  *,
+  *::before,
+  *::after {
+    scroll-behavior: auto !important;
+    transition-duration: 0.01ms !important;
+    animation-duration: 0.01ms !important;
+    animation-iteration-count: 1 !important;
+  }
+}

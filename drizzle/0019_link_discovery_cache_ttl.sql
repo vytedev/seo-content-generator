@@ -1,0 +1,1 @@
+ALTER TABLE "link_discovery_cache" ADD CONSTRAINT "link_discovery_cache_ttl_bound" CHECK ("link_discovery_cache"."expires_at" > "link_discovery_cache"."retrieved_at" and "link_discovery_cache"."expires_at" <= "link_discovery_cache"."retrieved_at" + interval '24 hours');

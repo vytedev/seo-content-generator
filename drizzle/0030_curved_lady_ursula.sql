@@ -1,0 +1,3 @@
+ALTER TABLE "runs" ADD COLUMN "block_reason" text;--> statement-breakpoint
+ALTER TABLE "runs" ADD CONSTRAINT "runs_block_reason_value" CHECK ("runs"."block_reason" is null or "runs"."block_reason" in ('deterministic_blockers','coherence_cycle_cap'));--> statement-breakpoint
+ALTER TABLE "runs" ADD CONSTRAINT "runs_block_reason_matches_status" CHECK ("runs"."block_reason" is null or "runs"."status" = 'blocked');

@@ -1,0 +1,2 @@
+ALTER TABLE "coherence_recoveries" DROP CONSTRAINT "coherence_recoveries_outcome_check";--> statement-breakpoint
+ALTER TABLE "coherence_recoveries" ADD CONSTRAINT "coherence_recoveries_outcome_check" CHECK ("coherence_recoveries"."outcome" in ('revise','blocked','export'));
