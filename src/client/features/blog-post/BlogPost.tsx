@@ -12,10 +12,25 @@ import { RunWorkspace, type RunAction } from "../runs/RunWorkspace.js";
 import { RunWorkspaceSkeleton } from "../runs/RunWorkspaceSkeleton.js";
 import { BlogPostsTable } from "./BlogPostsTable.js";
 import { HandoffReference } from "./HandoffReference.js";
-import { focusRunFromList, phaseFromRunStatus } from "./phase.js";
+import { phaseFromRunStatus } from "./phase.js";
 import { WorkflowBreadcrumb, type WorkflowStep } from "./WorkflowBreadcrumb.js";
 
 type ListState = "loading" | "loaded" | "error";
+
+const RUN_QUERY_KEY = "run";
+const RUN_ID_PATTERN = /^[A-Za-z0-9_-]{1,128}$/;
+
+function runIdFromLocation(): string {
+  const value = new URLSearchParams(window.location.search).get(RUN_QUERY_KEY)?.trim() ?? "";
+  return RUN_ID_PATTERN.test(value) ? value : "";
+}
+
+function setRunInLocation(runId: string) {
+  const url = new URL(window.location.href);
+  if (runId) url.searchParams.set(RUN_QUERY_KEY, runId);
+  else url.searchParams.delete(RUN_QUERY_KEY);
+  window.history.pushState(null, "", `${url.pathname}${url.search}${url.hash}`);
+}
 
 /**
  * The one continuous article flow: start → running → needs your decision →
@@ -26,7 +41,7 @@ export function BlogPost() {
   const [listState, setListState] = useState<ListState>("loading");
   const [runs, setRuns] = useState<RunSummary[]>([]);
   const [listError, setListError] = useState("");
-  const [focusRunId, setFocusRunId] = useState("");
+  const [focusRunId, setFocusRunId] = useState(runIdFromLocation);
   // Bumped only when a run's status or stage actually moves, so the history
   // table refreshes with the pipeline without polling on its own.
   const [historyRefresh, setHistoryRefresh] = useState(0);
@@ -78,8 +93,9 @@ export function BlogPost() {
     [applyDetail],
   );
 
-  // On mount: load the run list and focus the newest resumable run (or the
-  // newest run overall, so a just-finished article still shows its result).
+  // The history/navigation slice never chooses the focused run. A normal load
+  // always stays at 01 Handoff; only an explicit, valid `?run=<uuid>` deep link
+  // reopens a run after refresh.
   useEffect(() => {
     let cancelled = false;
     fetchRecentRuns()
@@ -87,8 +103,6 @@ export function BlogPost() {
         if (cancelled) return;
         setRuns(list);
         setListState("loaded");
-        const focus = focusRunFromList(list);
-        if (focus) setFocusRunId(focus.run_id);
       })
       .catch((caught: unknown) => {
         if (cancelled) return;
@@ -98,6 +112,15 @@ export function BlogPost() {
     return () => {
       cancelled = true;
     };
+  }, []);
+
+  useEffect(() => {
+    const restoreFromHistory = () => {
+      setFocusRunId(runIdFromLocation());
+      setBackToStart(false);
+    };
+    window.addEventListener("popstate", restoreFromHistory);
+    return () => window.removeEventListener("popstate", restoreFromHistory);
   }, []);
 
   useEffect(() => {
@@ -203,6 +226,7 @@ export function BlogPost() {
   function openRun(runId: string) {
     setBackToStart(false);
     setFocusRunId(runId);
+    setRunInLocation(runId);
   }
 
   function startNew() {
@@ -210,6 +234,7 @@ export function BlogPost() {
     setDetail(null);
     setDetailState("idle");
     setFocusRunId("");
+    setRunInLocation("");
   }
 
   async function performAction(kind: Exclude<RunAction, null>) {
