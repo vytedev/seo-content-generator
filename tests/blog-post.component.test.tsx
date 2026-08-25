@@ -1,6 +1,6 @@
 import { act, cleanup, render, screen, waitFor, within } from "@testing-library/react";
 import { userEvent } from "@testing-library/user-event";
-import { afterEach, describe, expect, it, vi } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { App } from "../src/client/App.js";
 import { PIPELINE_STEPS } from "../src/shared/pipeline.js";
 
@@ -110,25 +110,36 @@ function stubFetch(list: unknown, runDetail: () => unknown) {
   });
 }
 
+beforeEach(() => {
+  window.history.replaceState(null, "", "/?run=run-m4-1");
+});
+
 afterEach(() => {
   cleanup();
   vi.restoreAllMocks();
   vi.useRealTimers();
+  window.history.replaceState(null, "", "/");
 });
 
 describe("Blog Post page", () => {
-  it("shows the start state with the resume affordance when there are no runs", async () => {
-    stubFetch({ runs: [] }, detail);
+  it("defaults a normal load to 01 Handoff even when unfinished runs exist", async () => {
+    window.history.replaceState(null, "", "/");
+    const fetchMock = stubFetch({ runs: [summary()] }, detail);
     render(<App authMode="test-bypass" />);
 
     expect(await screen.findByRole("heading", { name: "Blog post" })).toBeInTheDocument();
     expect(screen.getByLabelText("Handoff JSON")).toBeInTheDocument();
     expect(
-      screen.queryByRole("heading", { name: "Pick up where you left off" }),
-    ).not.toBeInTheDocument();
+      within(screen.getByRole("navigation", { name: "Blog post workflow" })).getAllByRole(
+        "listitem",
+      )[0],
+    ).toHaveAttribute("aria-current", "step");
+    expect(
+      fetchMock.mock.calls.some(([input]) => String(input).includes("/api/runs/run-m4-1")),
+    ).toBe(false);
   });
 
-  it("lands on the newest resumable run's running state with the ordered rail and resumes safely", async () => {
+  it("reopens the exact run from the URL and resumes safely", async () => {
     const running = {
       runs: [summary({ run_id: "run-done", status: "succeeded", current_step: null }), summary()],
     };

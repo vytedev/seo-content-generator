@@ -1,4 +1,4 @@
-import type { RunDetail, RunSummary } from "../../../shared/contracts/run-detail.js";
+import type { RunDetail } from "../../../shared/contracts/run-detail.js";
 
 /** The four operator-facing states of the Blog Post page. */
 export type BlogPostPhase = "start" | "running" | "needs-decision" | "done";
@@ -25,19 +25,4 @@ export function phaseFromRunStatus(status: RunDetail["status"]): BlogPostPhase {
     default:
       return "running";
   }
-}
-
-/** Runs the operator can pick back up: anything not finished or cancelled. */
-export function isResumable(summary: RunSummary): boolean {
-  return summary.status !== "succeeded" && summary.status !== "cancelled";
-}
-
-/**
- * Chooses which run the Blog Post page should focus when the operator
- * navigates to it: the newest resumable run if one exists, otherwise the
- * newest run overall (so a just-finished article still shows its result),
- * otherwise nothing (start state).
- */
-export function focusRunFromList(runs: RunSummary[]): RunSummary | null {
-  return runs.find(isResumable) ?? runs[0] ?? null;
 }
