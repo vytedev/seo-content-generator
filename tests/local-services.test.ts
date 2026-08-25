@@ -31,4 +31,14 @@ describe("local server composition", () => {
       }),
     ).toThrow("must target local PostgreSQL");
   });
+
+  it("allows an explicitly configured non-loopback PostgreSQL deployment", async () => {
+    const { close } = createLocalServices({
+      databaseUrl: "postgresql://user@postgres/database",
+      authMode: "disabled-test",
+      allowNonLocalDatabase: true,
+    });
+
+    await close();
+  });
 });

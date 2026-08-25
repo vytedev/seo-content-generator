@@ -59,6 +59,8 @@ export interface LocalServicesConfig {
   calibrationRetriever?: PublicPageRetriever;
   /** Tests without a database must opt out; real database composition fails closed. */
   authMode?: "required" | "disabled-test";
+  /** Explicit deployment opt-in for a non-loopback PostgreSQL endpoint. */
+  allowNonLocalDatabase?: boolean;
 }
 
 export function createLocalServices(config: LocalServicesConfig): {
@@ -94,18 +96,18 @@ export function createLocalServices(config: LocalServicesConfig): {
     );
   }
   const url = new URL(config.databaseUrl);
-  if (!new Set(["localhost", "127.0.0.1", "::1"]).has(url.hostname)) {
+  const databaseIsLocal = new Set(["localhost", "127.0.0.1", "::1"]).has(url.hostname);
+  if (!databaseIsLocal && !config.allowNonLocalDatabase) {
     throw new Error("DATABASE_URL must target local PostgreSQL for this local-only application");
   }
   const pool = new pg.Pool({ connectionString: config.databaseUrl });
-  // This composition is already hard-gated to localhost PostgreSQL above. The
-  // seeded export templates are intentionally pending until editorial approval,
-  // but local testing may use the schema's traceable local_pending_explicit
-  // policy. Production composition must not inherit this override.
+  // Seeded export templates stay pending until editorial approval. Local testing
+  // may use the schema's traceable local_pending_explicit policy, while an
+  // explicitly enabled non-loopback deployment must not inherit that override.
   const repository = new PostgresMilestoneRepository(pool, 300_000, {
     writer: { template_id: "mobelaris.writer-submission", version: "1.0.0" },
     schema: { template_id: "mobelaris.blog-schema", version: "1.0.0" },
-    allow_local_pending: true,
+    allow_local_pending: databaseIsLocal,
   });
   const googleStore = googleConfig
     ? new GoogleTokenStore(pool, googleConfig.encryptionKey)
@@ -122,7 +124,9 @@ export function createLocalServices(config: LocalServicesConfig): {
   // server — including `npm run dev`, where a stale `dist/client` build may coincidentally
   // exist on disk — means the SPA is on Vite's separate port instead.
   const googleClientOrigin =
-    process.env.npm_lifecycle_event === "start" ? "" : "http://127.0.0.1:5173";
+    process.env.npm_lifecycle_event === "start" || process.env.CONTAINER_DEV === "true"
+      ? ""
+      : "http://127.0.0.1:5173";
   const referenceApprovals = new PostgresReferenceApprovalRepository(pool);
   const calibrationRepository = new PostgresCalibrationRepository(pool);
   const calibrationRetriever = new CachedPublicPageRetriever(
@@ -208,7 +212,13 @@ export function createLocalServices(config: LocalServicesConfig): {
       auth:
         config.authMode === "disabled-test"
           ? { mode: "disabled" }
-          : { mode: "enabled", config: authConfig!, store: new PostgresSessionStore(pool) },
+          : {
+              mode: "enabled",
+              config: authConfig!,
+              store: new PostgresSessionStore(pool),
+              secureCookies:
+                process.env.NODE_ENV === "production" || process.env.CONTAINER_DEV === "true",
+            },
       findingsRepository: repository,
       modelDiagnostic,
       googleOAuth: {

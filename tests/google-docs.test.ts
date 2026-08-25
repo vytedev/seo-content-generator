@@ -164,6 +164,25 @@ describe("Google OAuth and Docs providers", () => {
         GOOGLE_TOKEN_ENCRYPTION_KEY: config.encryptionKey.toString("base64"),
       }),
     ).toEqual({ ...config, clientId: "id", clientSecret: "secret" });
+
+    const productionConfig = googleOAuthConfigFromEnv({
+      GOOGLE_OAUTH_CLIENT_ID: "id",
+      GOOGLE_OAUTH_CLIENT_SECRET: "secret",
+      GOOGLE_OAUTH_REDIRECT_URI:
+        "https://content-generator.vyte.dev/api/integrations/google/callback",
+      GOOGLE_TOKEN_ENCRYPTION_KEY: config.encryptionKey.toString("base64"),
+    });
+    expect(productionConfig?.redirectUri).toBe(
+      "https://content-generator.vyte.dev/api/integrations/google/callback",
+    );
+    expect(() =>
+      googleOAuthConfigFromEnv({
+        GOOGLE_OAUTH_CLIENT_ID: "id",
+        GOOGLE_OAUTH_CLIENT_SECRET: "secret",
+        GOOGLE_OAUTH_REDIRECT_URI: "https://content-generator.vyte.dev.example.com/callback",
+        GOOGLE_TOKEN_ENCRYPTION_KEY: config.encryptionKey.toString("base64"),
+      }),
+    ).toThrow("not approved");
   });
 
   it("requests all three authorisation scopes", () => {

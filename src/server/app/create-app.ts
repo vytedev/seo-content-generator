@@ -27,12 +27,12 @@ import {
   registerGoogleOAuthRoutes,
   type GoogleOAuthRoutes,
 } from "../routes/google-oauth-routes.js";
-import { createAuthService, type AuthServiceOptions } from "../auth/auth.js";
+import { AUTH_ALLOWED_ORIGINS, createAuthService, type AuthServiceOptions } from "../auth/auth.js";
 import { registerModelDiagnosticRoutes } from "../routes/model-diagnostic-routes.js";
 import type { ModelDiagnosticService } from "../services/model-diagnostic-service.js";
 
 const JSON_BODY_LIMIT = "100kb";
-const AUTH_ALLOWED_ORIGINS = new Set(["http://127.0.0.1:5173", "http://127.0.0.1:3100"]);
+const AUTH_ALLOWED_ORIGIN_SET = new Set<string>(AUTH_ALLOWED_ORIGINS);
 
 type CheckRunner = (input: CheckerInput) => Finding[];
 
@@ -62,7 +62,7 @@ export function createApp(options: CreateAppOptions = {}): Express {
   if (options.auth?.mode === "enabled") {
     app.use("/api", (request, response, next) => {
       const origin = request.header("origin");
-      if (origin && AUTH_ALLOWED_ORIGINS.has(origin)) {
+      if (origin && AUTH_ALLOWED_ORIGIN_SET.has(origin)) {
         response.setHeader("Access-Control-Allow-Origin", origin);
         response.setHeader("Access-Control-Allow-Credentials", "true");
         response.setHeader("Vary", "Origin");
@@ -73,7 +73,7 @@ export function createApp(options: CreateAppOptions = {}): Express {
         response.setHeader("Access-Control-Allow-Methods", "GET, HEAD, POST, PUT, PATCH, DELETE");
       }
       if (request.method === "OPTIONS") {
-        response.status(origin && AUTH_ALLOWED_ORIGINS.has(origin) ? 204 : 403).end();
+        response.status(origin && AUTH_ALLOWED_ORIGIN_SET.has(origin) ? 204 : 403).end();
         return;
       }
       next();

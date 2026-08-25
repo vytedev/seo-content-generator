@@ -5,6 +5,7 @@
   "type": "module",
   "scripts": {
     "dev": "concurrently -k -n api,web,build \"tsx watch --env-file-if-exists=.env src/server/index.ts\" \"vite --clearScreen false --logLevel error\" \"vite build --watch --logLevel error\"",
+    "dev:host": "concurrently -k -n api,web \"tsx watch --env-file-if-exists=.env src/server/index.ts\" \"vite --clearScreen false --logLevel error\"",
     "dev:server": "tsx watch --env-file-if-exists=.env src/server/index.ts",
     "dev:client": "vite --clearScreen false --logLevel error",
     "dev:client:build": "vite build --watch --logLevel error",
