@@ -1,0 +1,2 @@
+DROP INDEX "finding_review_submissions_run_unique";--> statement-breakpoint
+CREATE UNIQUE INDEX "finding_review_submissions_review_set_unique" ON "finding_review_submissions" USING btree ("review_set_id");

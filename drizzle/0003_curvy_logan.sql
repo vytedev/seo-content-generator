@@ -1,0 +1,2 @@
+DROP INDEX IF EXISTS "provider_usage_provider_request_unique";--> statement-breakpoint
+CREATE UNIQUE INDEX "provider_usage_run_provider_request_unique" ON "provider_usage" USING btree ("run_id","provider","request_id");

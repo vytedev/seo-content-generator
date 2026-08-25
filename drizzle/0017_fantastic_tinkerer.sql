@@ -1,0 +1,3 @@
+ALTER TABLE "provider_usage" DROP CONSTRAINT "provider_usage_nonnegative";--> statement-breakpoint
+ALTER TABLE "provider_usage" ADD COLUMN "latency_ms" integer;--> statement-breakpoint
+ALTER TABLE "provider_usage" ADD CONSTRAINT "provider_usage_nonnegative" CHECK ("provider_usage"."input_units" >= 0 and "provider_usage"."output_units" >= 0 and "provider_usage"."cost_micros" >= 0 and ("provider_usage"."latency_ms" is null or "provider_usage"."latency_ms" >= 0));
