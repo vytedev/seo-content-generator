@@ -5,6 +5,8 @@ DECLARE
   run_id uuid;
   execution_id uuid;
   second_execution_id uuid;
+  third_execution_id uuid;
+  review_execution_id uuid;
   lease_token uuid := gen_random_uuid();
   artifact_id uuid;
   document_id uuid;
@@ -24,6 +26,9 @@ DECLARE
   diagnostic_id uuid;
   revision_operation_id text := 'db-test-revision-operation';
   finding_id uuid;
+  queue_id uuid;
+  queue_token uuid;
+  review_operation_id text := 'db-test-review-operation';
 BEGIN
   INSERT INTO operator_sessions(token_hash, expires_at)
   VALUES(repeat('a', 64), clock_timestamp() + interval '1 hour') RETURNING id INTO session_id;
@@ -70,6 +75,87 @@ BEGIN
     'db-test-run', 'input-hash', 'MOB-TEST',
     '{"plane_ticket":"MOB-TEST","primary_keyword":"chair","related_keywords":["seat"],"page_type":"blog","word_count_target":1200,"locales_for_translation":[]}'::jsonb
   ) RETURNING id INTO run_id;
+
+  INSERT INTO pipeline_queue_jobs(run_id) VALUES(run_id) RETURNING id INTO queue_id;
+  BEGIN
+    INSERT INTO pipeline_queue_jobs(run_id) VALUES(run_id);
+    RAISE EXCEPTION 'duplicate active queue job unexpectedly succeeded';
+  EXCEPTION WHEN unique_violation THEN NULL;
+  END;
+  queue_token := gen_random_uuid();
+  UPDATE pipeline_queue_jobs SET state='leased',attempt=1,lease_token=queue_token,lease_owner='db-worker',lease_expires_at=clock_timestamp()+interval '1 minute' WHERE id=queue_id;
+  IF NOT FOUND THEN RAISE EXCEPTION 'queue claim setup failed'; END IF;
+  UPDATE pipeline_queue_jobs q SET state='completed',lease_token=null,lease_owner=null,lease_expires_at=null WHERE q.id=queue_id AND q.lease_token=gen_random_uuid();
+  IF FOUND THEN RAISE EXCEPTION 'stale queue fence unexpectedly completed job'; END IF;
+  UPDATE pipeline_queue_jobs q SET state='completed',lease_token=null,lease_owner=null,lease_expires_at=null WHERE q.id=queue_id AND q.lease_token=queue_token;
+  BEGIN
+    UPDATE pipeline_queue_jobs SET run_id=gen_random_uuid() WHERE id=queue_id;
+    RAISE EXCEPTION 'queue immutable identity unexpectedly changed';
+  EXCEPTION WHEN raise_exception THEN
+    IF SQLERRM = 'queue immutable identity unexpectedly changed' THEN RAISE; END IF;
+  END;
+  BEGIN
+    UPDATE pipeline_queue_jobs SET state='ready' WHERE id=queue_id;
+    RAISE EXCEPTION 'completed queue job unexpectedly reactivated';
+  EXCEPTION WHEN raise_exception THEN
+    IF SQLERRM = 'completed queue job unexpectedly reactivated' THEN RAISE; END IF;
+  END;
+  BEGIN
+    INSERT INTO pipeline_queue_jobs(run_id,options) VALUES(run_id,'{"prompt":"forbidden"}'::jsonb);
+    RAISE EXCEPTION 'queue payload guard unexpectedly accepted prompt';
+  EXCEPTION WHEN check_violation OR raise_exception THEN
+    IF SQLERRM = 'queue payload guard unexpectedly accepted prompt' THEN RAISE; END IF;
+  END;
+
+  -- 0046: each authorised branch must reject smuggled attempt/fence/options/error changes.
+  INSERT INTO pipeline_queue_jobs(run_id) VALUES(run_id) RETURNING id INTO queue_id;
+  BEGIN
+    UPDATE pipeline_queue_jobs SET pending_refresh=true,attempt=2 WHERE id=queue_id;
+    RAISE EXCEPTION 'pending refresh smuggled an attempt change';
+  EXCEPTION WHEN raise_exception THEN
+    IF SQLERRM = 'pending refresh smuggled an attempt change' THEN RAISE; END IF;
+  END;
+  BEGIN
+    UPDATE pipeline_queue_jobs SET pending_options='{"authorise_legacy_draft_recovery":true}'::jsonb,
+      last_error_code='smuggled' WHERE id=queue_id;
+    RAISE EXCEPTION 'pending recovery smuggled an error change';
+  EXCEPTION WHEN raise_exception THEN
+    IF SQLERRM = 'pending recovery smuggled an error change' THEN RAISE; END IF;
+  END;
+  queue_token := gen_random_uuid();
+  UPDATE pipeline_queue_jobs SET state='leased',attempt=1,lease_token=queue_token,
+    lease_owner='db-worker',lease_expires_at=clock_timestamp()+interval '1 minute' WHERE id=queue_id;
+  BEGIN
+    UPDATE pipeline_queue_jobs SET lease_expires_at=clock_timestamp()+interval '2 minutes',
+      options='{"refresh_link_discovery":true}'::jsonb WHERE id=queue_id;
+    RAISE EXCEPTION 'queue heartbeat smuggled options authority';
+  EXCEPTION WHEN raise_exception THEN
+    IF SQLERRM = 'queue heartbeat smuggled options authority' THEN RAISE; END IF;
+  END;
+  UPDATE pipeline_queue_jobs SET state='completed',lease_token=null,lease_owner=null,
+    lease_expires_at=null WHERE id=queue_id;
+
+  -- 0048: downstream authority closes monotonically under the exact active fence.
+  INSERT INTO pipeline_queue_jobs(run_id) VALUES(run_id) RETURNING id INTO queue_id;
+  queue_token := gen_random_uuid();
+  UPDATE pipeline_queue_jobs SET state='leased',attempt=1,lease_token=queue_token,
+    lease_owner='phase-worker',lease_expires_at=clock_timestamp()+interval '1 minute' WHERE id=queue_id;
+  UPDATE pipeline_queue_jobs SET phase='downstream_started',
+    lease_expires_at=lease_expires_at+interval '1 microsecond' WHERE id=queue_id;
+  BEGIN
+    UPDATE pipeline_queue_jobs SET pending_refresh=true WHERE id=queue_id;
+    RAISE EXCEPTION 'refresh accepted after downstream boundary';
+  EXCEPTION WHEN raise_exception THEN
+    IF SQLERRM = 'refresh accepted after downstream boundary' THEN RAISE; END IF;
+  END;
+  BEGIN
+    UPDATE pipeline_queue_jobs SET phase='pre_downstream' WHERE id=queue_id;
+    RAISE EXCEPTION 'downstream phase reopened without continuation';
+  EXCEPTION WHEN raise_exception THEN
+    IF SQLERRM = 'downstream phase reopened without continuation' THEN RAISE; END IF;
+  END;
+  UPDATE pipeline_queue_jobs SET state='completed',lease_token=null,lease_owner=null,
+    lease_expires_at=null WHERE id=queue_id;
 
   BEGIN
     UPDATE runs SET deterministic_repair_cycles=3 WHERE id=run_id;
@@ -127,6 +213,37 @@ BEGIN
     RAISE EXCEPTION 'revision no-op audit update unexpectedly succeeded';
   EXCEPTION WHEN raise_exception THEN
     IF SQLERRM = 'revision no-op audit update unexpectedly succeeded' THEN RAISE; END IF;
+  END;
+
+  INSERT INTO step_executions(run_id,step,attempt,status)
+  VALUES(run_id,'review_writing_style',1,'retryable_failed') RETURNING id INTO review_execution_id;
+  INSERT INTO review_operation_states(operation_id,run_id,document_version_id,producing_step_execution_id,step,request_hash,provider,model)
+  VALUES(review_operation_id,run_id,document_id,review_execution_id,'review_writing_style','review-request-hash','test','model');
+  INSERT INTO step_executions(run_id,step,attempt,status,lease_token,lease_owner,lease_expires_at,started_at)
+  VALUES(run_id,'review_writing_style',2,'running',gen_random_uuid(),'db-review-worker',clock_timestamp()+interval '1 minute',clock_timestamp())
+  RETURNING id INTO third_execution_id;
+  INSERT INTO review_operation_adoptions(operation_id,run_id,from_step_execution_id,to_step_execution_id)
+  VALUES(review_operation_id,run_id,review_execution_id,third_execution_id);
+  UPDATE review_operation_states SET producing_step_execution_id=third_execution_id WHERE operation_id=review_operation_id;
+  BEGIN
+    DELETE FROM review_operation_adoptions WHERE operation_id=review_operation_id;
+    RAISE EXCEPTION 'review adoption deletion unexpectedly succeeded';
+  EXCEPTION WHEN raise_exception THEN
+    IF SQLERRM = 'review adoption deletion unexpectedly succeeded' THEN RAISE; END IF;
+  END;
+  UPDATE review_operation_states SET status='provider_in_flight' WHERE operation_id=review_operation_id;
+  UPDATE review_operation_states SET status='checkpointed',response='{"findings":[],"usage":{"input_tokens":1,"output_tokens":1,"cost_micros":0}}'::jsonb,response_hash='review-response-hash',checkpointed_at=clock_timestamp() WHERE operation_id=review_operation_id;
+  BEGIN
+    UPDATE review_operation_states SET status='provider_in_flight' WHERE operation_id=review_operation_id;
+    RAISE EXCEPTION 'checkpointed review operation mutation unexpectedly succeeded';
+  EXCEPTION WHEN raise_exception THEN
+    IF SQLERRM = 'checkpointed review operation mutation unexpectedly succeeded' THEN RAISE; END IF;
+  END;
+  BEGIN
+    DELETE FROM review_operation_states WHERE operation_id=review_operation_id;
+    RAISE EXCEPTION 'review operation deletion unexpectedly succeeded';
+  EXCEPTION WHEN raise_exception THEN
+    IF SQLERRM = 'review operation deletion unexpectedly succeeded' THEN RAISE; END IF;
   END;
 
   INSERT INTO revision_operation_states(operation_id,run_id,document_version_id,producing_step_execution_id,request_hash)
@@ -322,8 +439,29 @@ DO $$
 DECLARE immutable_count integer;
 BEGIN
   SELECT count(*) INTO immutable_count FROM pg_trigger
-  WHERE tgname IN ('content_templates_immutable','export_manifests_immutable','coherence_checkpoints_no_delete') AND NOT tgisinternal;
-  IF immutable_count <> 3 THEN RAISE EXCEPTION 'Step 1.12 immutable triggers missing'; END IF;
+  WHERE tgname IN ('content_templates_immutable','export_manifests_immutable','coherence_checkpoints_no_delete','coherence_checkpoints_transition') AND NOT tgisinternal;
+  IF immutable_count <> 4 THEN RAISE EXCEPTION 'Step 1.12 immutable/transition triggers missing'; END IF;
+END $$;
+
+DO $$
+DECLARE trigger_count integer; constraint_count integer;
+BEGIN
+  SELECT count(*) INTO trigger_count FROM pg_trigger
+  WHERE tgname IN ('draft_operation_states_transition','draft_operation_states_no_delete') AND NOT tgisinternal;
+  SELECT count(*) INTO constraint_count FROM pg_constraint
+  WHERE conname IN ('draft_operation_states_status_check','draft_operation_states_response_pair');
+  IF trigger_count <> 2 OR constraint_count <> 2 THEN
+    RAISE EXCEPTION 'Step 1.3 durable draft operation invariants missing';
+  END IF;
+END $$;
+
+DO $$
+DECLARE constraint_count integer;
+BEGIN
+  SELECT count(*) INTO constraint_count
+  FROM pg_constraint
+  WHERE conname IN ('coherence_checkpoints_status_check','coherence_checkpoints_response_pair');
+  IF constraint_count <> 2 THEN RAISE EXCEPTION 'coherence checkpoint status constraints missing'; END IF;
 END $$;
 
 DO $$

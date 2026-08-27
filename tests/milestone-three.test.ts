@@ -1,6 +1,6 @@
 import { createHash } from "node:crypto";
-import { describe, expect, it } from "vitest";
-import { ingestHandoff } from "../src/shared/milestone-two.js";
+import { describe, expect, it, vi } from "vitest";
+import { canonicalHash, ingestHandoff, stableId } from "../src/shared/milestone-two.js";
 import {
   ReviewResponseSchema,
   mapDeterministicInput,
@@ -15,7 +15,11 @@ import {
 import { MilestoneTwoOrchestrator, MockLinkDiscoverer } from "../src/server/orchestrator.js";
 import { InMemoryMilestoneRepository } from "../src/server/persistence/memory-repository.js";
 import { MockDraftProvider } from "../src/server/providers/draft-provider.js";
-import { MockReviewProvider } from "../src/server/providers/review-provider.js";
+import {
+  MockReviewProvider,
+  type ReviewProvider,
+} from "../src/server/providers/review-provider.js";
+import { ChatCompletionReviewProvider } from "../src/server/providers/chat-completion-review-provider.js";
 import { NoNetworkFactVerifier } from "../src/server/providers/fact-verifier.js";
 import { ConflictError } from "../src/shared/errors.js";
 
@@ -90,6 +94,40 @@ class OnceFailure {
       throw new Error(`injected:${boundary}`);
     }
   }
+}
+
+function malformedInformationGainProvider(): {
+  provider: ReviewProvider;
+  fetcher: ReturnType<typeof vi.fn>;
+} {
+  const fetcher = vi.fn(
+    async () =>
+      new Response(
+        JSON.stringify({
+          id: "malformed-step-1-6",
+          choices: [{ message: { content: "{not-json" } }],
+        }),
+        { status: 200, headers: { "content-type": "application/json" } },
+      ),
+  );
+  const liveShape = new ChatCompletionReviewProvider({
+    token: "test_token_not_real",
+    model: "review-v1",
+    fetcher,
+    sleep: () => Promise.resolve(),
+  });
+  const otherSteps = new MockReviewProvider("review-v1");
+  return {
+    fetcher,
+    provider: {
+      provider: liveShape.provider,
+      model: liveShape.model,
+      review: (request) =>
+        request.step === "review_information_gain"
+          ? liveShape.review(request)
+          : otherSteps.review(request),
+    },
+  };
 }
 
 describe("milestone three", () => {
@@ -340,6 +378,246 @@ describe("milestone three", () => {
     expect(output).toBeDefined();
   });
 
+  it("adopts a begun Step 1.8 operation and rejects its stale fence", async () => {
+    const { repository, run } = await setup("m3-link-adoption");
+    const provider = new MockReviewProvider("review-v1");
+    const begin = repository.beginReviewOperation.bind(repository);
+    let crashed = false;
+    vi.spyOn(repository, "beginReviewOperation").mockImplementation(async (input) => {
+      const operation = await begin(input);
+      if (!crashed && input.step === "review_link_conversion") {
+        crashed = true;
+        throw new Error("crash after Step 1.8 begin");
+      }
+      return operation;
+    });
+
+    await expect(
+      new MilestoneThreeOrchestrator(repository, fixture, provider).run(run.run_id, "old-owner"),
+    ).rejects.toThrow("crash after Step 1.8 begin");
+    const stale = repository.attempts(run.run_id, "review_link_conversion")[0]!;
+    await new MilestoneThreeOrchestrator(repository, fixture, provider).run(
+      run.run_id,
+      "replacement-owner",
+    );
+    const adoption = repository.reviewOperationAdoptions.find(
+      (item) => item.from_step_execution_id === stale.id,
+    )!;
+    expect(adoption).toBeDefined();
+    expect(provider.calls.filter((call) => call.step === "review_link_conversion")).toHaveLength(1);
+    const attempts = new Set(
+      repository.attempts(run.run_id, "review_link_conversion").map((attempt) => attempt.id),
+    );
+    const request = JSON.parse(
+      repository.artifacts.find(
+        (item) => attempts.has(item.step_execution_id) && item.kind === "review_request",
+      )!.body_text,
+    );
+    const response = JSON.parse(
+      repository.artifacts.find(
+        (item) => attempts.has(item.step_execution_id) && item.kind === "review_response",
+      )!.body_text,
+    );
+    await expect(
+      repository.markReviewProviderInFlight({
+        run_id: run.run_id,
+        execution_id: stale.id,
+        token: "stale-token",
+        operation_id: adoption.operation_id,
+      }),
+    ).rejects.toThrow("Stale fencing token");
+    await expect(
+      repository.checkpointReviewResponse({
+        run_id: run.run_id,
+        execution_id: stale.id,
+        token: "stale-token",
+        operation_id: adoption.operation_id,
+        response,
+      }),
+    ).rejects.toThrow("Stale fencing token");
+    await expect(
+      repository.saveReview(
+        run.run_id,
+        (await repository.getDraft(run.run_id))!.version.id,
+        stale.id,
+        "stale-token",
+        "review_link_conversion",
+        request,
+        response,
+        provider.provider,
+        provider.model,
+        response,
+      ),
+    ).rejects.toThrow("Stale fencing token");
+  });
+
+  it("fails closed on an ambiguous Step 1.8 provider outcome without recall", async () => {
+    const { repository, run } = await setup("m3-link-ambiguous");
+    const provider = new MockReviewProvider("review-v1");
+    let responses = 0;
+    await expect(
+      new MilestoneThreeOrchestrator(repository, fixture, provider, {
+        hit: (boundary) => {
+          if (boundary === "after_review_provider" && ++responses === 4)
+            throw new Error("crash after Step 1.8 provider return");
+        },
+      }).run(run.run_id),
+    ).rejects.toThrow("crash after Step 1.8 provider return");
+    await expect(
+      new MilestoneThreeOrchestrator(repository, fixture, provider).run(run.run_id),
+    ).rejects.toThrow("Review provider outcome is ambiguous");
+    expect(provider.calls.filter((call) => call.step === "review_link_conversion")).toHaveLength(1);
+    expect(
+      repository.findings.filter((item) => item.step === "review_link_conversion"),
+    ).toHaveLength(0);
+    expect(
+      repository.providerUsage.filter((item) => item.operation === "review_link_conversion"),
+    ).toHaveLength(0);
+  });
+
+  it("replays a provider-only Step 1.8 checkpoint with a fresh audit and no model recall or duplicates", async () => {
+    const { repository, run } = await setup("m3-link-checkpoint-replay");
+    const provider = new MockReviewProvider("review-v1", {
+      review_link_conversion: [
+        {
+          ...modelFinding,
+          stable_key: "link-model-anchor",
+          category: "link_conversion",
+          rule_reference: "link.anchor_quality",
+        },
+      ],
+    });
+    let verifications = 0;
+    const verifier = {
+      verify: async () =>
+        ++verifications === 1
+          ? ({ outcome: "confirmed_non_200", method: "head", status: 404 } as const)
+          : ({
+              outcome: "redirect",
+              method: "head",
+              status: 301,
+              location: "/chairs-new",
+            } as const),
+    };
+    const saveReview = repository.saveReview.bind(repository);
+    let crashed = false;
+    vi.spyOn(repository, "saveReview").mockImplementation(async (...args) => {
+      if (!crashed && args[4] === "review_link_conversion") {
+        crashed = true;
+        throw new Error("crash after provider-only Step 1.8 checkpoint");
+      }
+      return saveReview(...args);
+    });
+
+    await expect(
+      new MilestoneThreeOrchestrator(
+        repository,
+        fixture,
+        provider,
+        undefined,
+        new NoNetworkFactVerifier(),
+        verifier,
+      ).run(run.run_id),
+    ).rejects.toThrow("crash after provider-only Step 1.8 checkpoint");
+    await new MilestoneThreeOrchestrator(
+      repository,
+      fixture,
+      provider,
+      undefined,
+      new NoNetworkFactVerifier(),
+      verifier,
+    ).run(run.run_id);
+    await new MilestoneThreeOrchestrator(repository, fixture, provider).run(run.run_id);
+
+    expect(verifications).toBe(2);
+    expect(provider.calls.filter((call) => call.step === "review_link_conversion")).toHaveLength(1);
+    const findings = repository.findings.filter(
+      (finding) => finding.step === "review_link_conversion",
+    );
+    expect(findings.map((finding) => finding.rule_reference)).toEqual([
+      "link.target_redirect",
+      "link.anchor_quality",
+    ]);
+    const attempts = new Set(
+      repository.attempts(run.run_id, "review_link_conversion").map((attempt) => attempt.id),
+    );
+    const artefacts = repository.artifacts.filter((item) => attempts.has(item.step_execution_id));
+    const response = JSON.parse(
+      artefacts.find((item) => item.kind === "review_response")!.body_text,
+    ) as { findings: Array<{ rule_reference: string }> };
+    expect(response.findings.map((finding) => finding.rule_reference)).toEqual([
+      "link.target_redirect",
+      "link.anchor_quality",
+    ]);
+    expect(artefacts).toHaveLength(2);
+    expect(
+      repository.providerUsage.filter((item) => item.operation === "review_link_conversion"),
+    ).toHaveLength(1);
+    const state = repository as unknown as { outputKeys: Map<string, string> };
+    const request = JSON.parse(artefacts.find((item) => item.kind === "review_request")!.body_text);
+    const currentDraft = (await repository.getDraft(run.run_id))!;
+    const linkOperationKey = `review-operation:${stableId(
+      "review-operation",
+      run.run_id,
+      currentDraft.version.id,
+      "review_link_conversion",
+      canonicalHash(request),
+      provider.provider,
+      provider.model,
+    )}`;
+    const checkpoint = JSON.parse(state.outputKeys.get(`${linkOperationKey}:response`)!) as {
+      findings: Array<{ rule_reference: string }>;
+    };
+    expect(checkpoint.findings.map((finding) => finding.rule_reference)).toEqual([
+      "link.anchor_quality",
+    ]);
+    expect(state.outputKeys.get(`${linkOperationKey}:response-hash`)).toBe(
+      canonicalHash(checkpoint),
+    );
+    expect(
+      state.outputKeys.get(`${run.run_id}:${currentDraft.version.id}:review_link_conversion`),
+    ).toBe(canonicalHash(response));
+    expect(new Set(findings.map((finding) => finding.id)).size).toBe(findings.length);
+  });
+
+  it("fails Step 1.8 atomically when checkpointResponse does not match the immutable checkpoint", async () => {
+    const { repository, run } = await setup("m3-link-wrong-checkpoint-response");
+    const provider = new MockReviewProvider("review-v1", {
+      review_link_conversion: [
+        {
+          ...modelFinding,
+          stable_key: "link-model-anchor",
+          category: "link_conversion",
+          rule_reference: "link.anchor_quality",
+        },
+      ],
+    });
+    const saveReview = repository.saveReview.bind(repository);
+    vi.spyOn(repository, "saveReview").mockImplementation(async (...args) => {
+      if (args[4] !== "review_link_conversion") return saveReview(...args);
+      const checkpoint = args[9]!;
+      const wrongArgs = [...args] as Parameters<typeof saveReview>;
+      wrongArgs[9] = { ...checkpoint, request_id: `${checkpoint.request_id}-wrong` };
+      return saveReview(...wrongArgs);
+    });
+
+    await expect(
+      new MilestoneThreeOrchestrator(repository, fixture, provider).run(run.run_id),
+    ).rejects.toThrow("exact validated provider checkpoint");
+    expect(
+      repository.findings.filter((item) => item.step === "review_link_conversion"),
+    ).toHaveLength(0);
+    expect(
+      repository.providerUsage.filter((item) => item.operation === "review_link_conversion"),
+    ).toHaveLength(0);
+    const attempts = new Set(
+      repository.attempts(run.run_id, "review_link_conversion").map((attempt) => attempt.id),
+    );
+    expect(
+      repository.artifacts.filter((item) => attempts.has(item.step_execution_id)),
+    ).toHaveLength(0);
+  });
+
   it("freezes the Step 1.5 advisory-unavailable warning into Step 1.9 for disposition", async () => {
     const { repository, run } = await setup("m3-style-fallback");
     const base = new MockReviewProvider("review-v1");
@@ -390,40 +668,176 @@ describe("milestone three", () => {
     });
   });
 
-  it("freezes the Step 1.6 advisory-unavailable warning into Step 1.9 for disposition", async () => {
-    const { repository, run } = await setup("m3-information-gain-fallback");
-    const base = new MockReviewProvider("review-v1");
-    const provider = {
-      provider: base.provider,
-      model: base.model,
-      review: async (request: Parameters<typeof base.review>[0]) => {
-        const response = await base.review(request);
-        return request.step === "review_information_gain"
-          ? {
-              ...response,
-              findings: [
-                {
-                  stable_key: "value-advisory-unavailable",
-                  category: "information_gain_advisory_unavailable",
-                  rule_reference: "value.advisory_unavailable",
-                  severity: "warning" as const,
-                  location: {
-                    field: "body_markdown",
-                    line_start: 1,
-                    line_end: 1,
-                    section: "Designer chair",
-                  },
-                  issue:
-                    "The optional information-gain advisory was unavailable because its response was unusable.",
-                  suggested_fix:
-                    "Explicitly accept or reject this warning during findings review before the run continues.",
-                },
-              ],
-            }
-          : response;
-      },
-    };
+  it("adopts Step 1.6 after a crash following durable begin and rejects the stale owner", async () => {
+    const { repository, run } = await setup("m3-information-gain-adoption");
+    const draftBefore = structuredClone(await repository.getDraft(run.run_id));
+    const provider = new MockReviewProvider("review-v1", {
+      review_information_gain: [
+        {
+          ...modelFinding,
+          stable_key: "useful-comparison",
+          category: "information_gain",
+          rule_reference: "value.comparison",
+        },
+      ],
+    });
+    let begins = 0;
+
+    await expect(
+      new MilestoneThreeOrchestrator(repository, fixture, provider, {
+        hit: (boundary) => {
+          if (boundary === "after_review_begin" && ++begins === 2)
+            throw new Error("crash after Step 1.6 begin");
+        },
+      }).run(run.run_id, "first-owner"),
+    ).rejects.toThrow("crash after Step 1.6 begin");
+    expect(provider.calls.filter((call) => call.step === "review_information_gain")).toHaveLength(
+      0,
+    );
+    const stale = repository.attempts(run.run_id, "review_information_gain")[0]!;
+    expect(stale.status).toBe("retryable_failed");
+
+    await new MilestoneThreeOrchestrator(repository, fixture, provider).run(
+      run.run_id,
+      "replacement-owner",
+    );
+
+    const adoption = repository.reviewOperationAdoptions.find(
+      (item) => item.from_step_execution_id === stale.id,
+    )!;
+    expect(adoption).toMatchObject({ run_id: run.run_id, from_step_execution_id: stale.id });
+    expect(provider.calls.filter((call) => call.step === "review_information_gain")).toHaveLength(
+      1,
+    );
+    await expect(
+      repository.markReviewProviderInFlight({
+        run_id: run.run_id,
+        execution_id: stale.id,
+        token: "stale-owner-token",
+        operation_id: adoption.operation_id,
+      }),
+    ).rejects.toThrow(/Stale fencing token/);
+    expect(await repository.getDraft(run.run_id)).toEqual(draftBefore);
+
+    const findings = repository.findings.filter((item) => item.step === "review_information_gain");
+    const usage = repository.providerUsage.filter(
+      (item) => item.operation === "review_information_gain",
+    );
+    const artefacts = repository.artifacts.filter((item) =>
+      usage.some((record) => record.step_execution_id === item.step_execution_id),
+    );
+    expect(findings).toHaveLength(1);
+    expect(usage).toHaveLength(1);
+    expect(artefacts.map((item) => item.kind).sort()).toEqual([
+      "review_request",
+      "review_response",
+    ]);
+    expect(
+      artefacts.every(
+        (item) => item.content_hash === createHash("sha256").update(item.body_text).digest("hex"),
+      ),
+    ).toBe(true);
+    expect(new Set(findings.map((item) => item.id)).size).toBe(findings.length);
+  });
+
+  it("fails closed on an ambiguous Step 1.6 provider outcome without recall or output", async () => {
+    const { repository, run } = await setup("m3-information-gain-ambiguous");
+    const provider = new MockReviewProvider("review-v1", {
+      review_information_gain: [
+        {
+          ...modelFinding,
+          stable_key: "ambiguous-value",
+          category: "information_gain",
+          rule_reference: "value.generic",
+        },
+      ],
+    });
+    let providerReturns = 0;
+
+    await expect(
+      new MilestoneThreeOrchestrator(repository, fixture, provider, {
+        hit: (boundary) => {
+          if (boundary === "after_review_provider" && ++providerReturns === 2)
+            throw new Error("crash after Step 1.6 provider return");
+        },
+      }).run(run.run_id),
+    ).rejects.toThrow("crash after Step 1.6 provider return");
+    await expect(
+      new MilestoneThreeOrchestrator(repository, fixture, provider).run(run.run_id),
+    ).rejects.toThrow("Review provider outcome is ambiguous");
+
+    expect(provider.calls.filter((call) => call.step === "review_information_gain")).toHaveLength(
+      1,
+    );
+    expect(
+      repository.findings.filter((item) => item.step === "review_information_gain"),
+    ).toHaveLength(0);
+    expect(
+      repository.providerUsage.filter((item) => item.operation === "review_information_gain"),
+    ).toHaveLength(0);
+    expect(
+      repository.artifacts.filter((item) =>
+        repository
+          .attempts(run.run_id, "review_information_gain")
+          .some((attempt) => attempt.id === item.step_execution_id),
+      ),
+    ).toHaveLength(0);
+  });
+
+  it("replays the Step 1.6 checkpoint before save without recall or duplicate records", async () => {
+    const { repository, run } = await setup("m3-information-gain-checkpoint");
+    const provider = new MockReviewProvider("review-v1", {
+      review_information_gain: [
+        {
+          ...modelFinding,
+          stable_key: "checkpointed-value",
+          category: "information_gain",
+          rule_reference: "value.generic",
+        },
+      ],
+    });
+    const saveReview = repository.saveReview.bind(repository);
+    let crashed = false;
+    vi.spyOn(repository, "saveReview").mockImplementation(async (...args) => {
+      if (!crashed && args[4] === "review_information_gain") {
+        crashed = true;
+        throw new Error("crash after Step 1.6 checkpoint");
+      }
+      return saveReview(...args);
+    });
+
+    await expect(
+      new MilestoneThreeOrchestrator(repository, fixture, provider).run(run.run_id),
+    ).rejects.toThrow("crash after Step 1.6 checkpoint");
     await new MilestoneThreeOrchestrator(repository, fixture, provider).run(run.run_id);
+    await new MilestoneThreeOrchestrator(repository, fixture, provider).run(run.run_id);
+
+    expect(provider.calls.filter((call) => call.step === "review_information_gain")).toHaveLength(
+      1,
+    );
+    expect(
+      repository.findings.filter((item) => item.step === "review_information_gain"),
+    ).toHaveLength(1);
+    expect(
+      repository.providerUsage.filter((item) => item.operation === "review_information_gain"),
+    ).toHaveLength(1);
+    const executions = new Set(
+      repository.attempts(run.run_id, "review_information_gain").map((attempt) => attempt.id),
+    );
+    const artefacts = repository.artifacts.filter((item) => executions.has(item.step_execution_id));
+    expect(artefacts).toHaveLength(2);
+    expect(
+      artefacts.every(
+        (item) => item.content_hash === createHash("sha256").update(item.body_text).digest("hex"),
+      ),
+    ).toBe(true);
+  });
+
+  it("freezes the real Step 1.6 malformed-output fallback into Step 1.9 for disposition", async () => {
+    const { repository, run } = await setup("m3-information-gain-fallback");
+    const { provider, fetcher } = malformedInformationGainProvider();
+    await new MilestoneThreeOrchestrator(repository, fixture, provider).run(run.run_id);
+    expect(fetcher).toHaveBeenCalledOnce();
     const warning = repository.findings.find(
       (finding) => finding.rule_reference === "value.advisory_unavailable",
     )!;
@@ -470,7 +884,115 @@ describe("milestone three", () => {
     );
   });
 
-  it("retries after_review_provider without duplicate durable records or draft mutation", async () => {
+  it("logs each review provider lifecycle once and in order without secrets", async () => {
+    const { repository, run } = await setup();
+    const provider = new MockReviewProvider("review-v1", {
+      review_writing_style: [modelFinding],
+    });
+    const lines: string[] = [];
+    const write = vi.spyOn(process.stdout, "write").mockImplementation((chunk) => {
+      lines.push(String(chunk));
+      return true;
+    });
+
+    await new MilestoneThreeOrchestrator(repository, fixture, provider).run(run.run_id);
+
+    const lifecycle = lines
+      .filter((line) => line.startsWith("{"))
+      .map((line) => JSON.parse(line) as { event: string; context?: string; operation_id?: string })
+      .filter((entry) => entry.context === "review");
+    const operationIds = [...new Set(lifecycle.map((entry) => entry.operation_id))];
+    const expected = [
+      "provider.reserved",
+      "provider.dispatch_started",
+      "provider.returned",
+      "provider.response_validated",
+      "provider.checkpointed",
+      "provider.persistence_completed",
+    ];
+    expect(operationIds).toHaveLength(4);
+    for (const operationId of operationIds) {
+      const events = lifecycle
+        .filter((entry) => entry.operation_id === operationId)
+        .map((entry) => entry.event);
+      expect(events).toEqual(expected);
+      for (const event of expected) expect(events.filter((item) => item === event)).toHaveLength(1);
+    }
+    expect(lines.join("\n")).not.toContain("Designed by Example Studio");
+    expect(lines.join("\n")).not.toContain("It measures 80 cm");
+    write.mockRestore();
+  });
+
+  it("logs only replay and no dispatch when a review checkpoint exists", async () => {
+    const { repository, run } = await setup();
+    const provider = new MockReviewProvider("review-v1", {
+      review_writing_style: [modelFinding],
+    });
+    const saveReview = repository.saveReview.bind(repository);
+    let interrupted = false;
+    vi.spyOn(repository, "saveReview").mockImplementation(async (...args) => {
+      if (!interrupted) {
+        interrupted = true;
+        throw new Error("stop after review checkpoint");
+      }
+      return saveReview(...args);
+    });
+    await expect(
+      new MilestoneThreeOrchestrator(repository, fixture, provider).run(run.run_id),
+    ).rejects.toThrow("stop after review checkpoint");
+
+    const lines: string[] = [];
+    const write = vi.spyOn(process.stdout, "write").mockImplementation((chunk) => {
+      lines.push(String(chunk));
+      return true;
+    });
+    await new MilestoneThreeOrchestrator(repository, fixture, provider).run(run.run_id);
+    const entries = lines
+      .filter((line) => line.startsWith("{"))
+      .map((line) => JSON.parse(line) as { event: string; operation_id?: string; context?: string })
+      .filter((entry) => entry.context === "review");
+    const replay = entries.filter((entry) => entry.event === "provider.replayed");
+    expect(replay).toHaveLength(1);
+    expect(
+      entries.some(
+        (entry) =>
+          entry.operation_id === replay[0]?.operation_id &&
+          entry.event === "provider.dispatch_started",
+      ),
+    ).toBe(false);
+    expect(provider.calls).toHaveLength(4);
+    expect(lines.join("\n")).not.toContain("Designed by Example Studio");
+    write.mockRestore();
+  });
+
+  it("adopts a started review reservation across retry chains before dispatch", async () => {
+    const { repository, run } = await setup();
+    const provider = new MockReviewProvider("review-v1", {
+      review_writing_style: [modelFinding],
+    });
+
+    for (let attempt = 0; attempt < 2; attempt += 1) {
+      await expect(
+        new MilestoneThreeOrchestrator(
+          repository,
+          fixture,
+          provider,
+          new OnceFailure("after_review_begin"),
+        ).run(run.run_id),
+      ).rejects.toThrow("injected:after_review_begin");
+    }
+    expect(provider.calls).toHaveLength(0);
+
+    await new MilestoneThreeOrchestrator(repository, fixture, provider).run(run.run_id);
+
+    expect(provider.calls).toHaveLength(4);
+    expect(repository.reviewOperationAdoptions).toHaveLength(2);
+    expect(repository.reviewOperationAdoptions[0]?.to_step_execution_id).toBe(
+      repository.reviewOperationAdoptions[1]?.from_step_execution_id,
+    );
+  });
+
+  it("parks an uncheckpointed post-provider review outcome without paid recall", async () => {
     const { repository, run } = await setup();
     const draftBefore = structuredClone(await repository.getDraft(run.run_id));
     const documentVersionsBefore = structuredClone(repository.documentVersions);
@@ -491,17 +1013,16 @@ describe("milestone three", () => {
       repository.providerUsage.filter((item) => item.operation.startsWith("review_")),
     ).toHaveLength(0);
 
-    await new MilestoneThreeOrchestrator(repository, fixture, provider).run(run.run_id);
+    await expect(
+      new MilestoneThreeOrchestrator(repository, fixture, provider).run(run.run_id),
+    ).rejects.toThrow("Review provider outcome is ambiguous");
 
-    // The first external response was not durably saved, so the retry necessarily
-    // calls the provider again with the same deterministic request identity.
-    expect(provider.calls).toHaveLength(5);
-    expect(provider.calls[0]).toEqual(provider.calls[1]);
-    expect(repository.artifacts.filter((item) => item.kind === "review_request")).toHaveLength(4);
+    expect(provider.calls).toHaveLength(1);
+    expect(repository.artifacts.filter((item) => item.kind === "review_request")).toHaveLength(0);
     expect(
       repository.providerUsage.filter((item) => item.operation.startsWith("review_")),
-    ).toHaveLength(4);
-    expect(repository.claims).toHaveLength(2);
+    ).toHaveLength(0);
+    expect(repository.claims).toHaveLength(0);
     for (const records of [repository.findings, repository.artifacts, repository.providerUsage]) {
       const ids = records.map((item) => item.id);
       expect(new Set(ids).size).toBe(ids.length);
@@ -703,6 +1224,129 @@ describe("milestone three", () => {
     ).rejects.toBeInstanceOf(ConflictError);
   });
 
+  it("rolls back the complete in-memory Step 1.9 transition when queueing fails and permits retry", async () => {
+    const { repository, run } = await setup("m3-disposition-queue-failure");
+    await new MilestoneThreeOrchestrator(
+      repository,
+      fixture,
+      new MockReviewProvider("review-v1"),
+    ).run(run.run_id);
+    const findings = await repository.listFindings(run.run_id, {});
+    const version = (await repository.getDraft(run.run_id))!.version;
+    const input = {
+      document_version_id: version.id,
+      idempotency_key: "m3-disposition-queue-failure-key",
+      dispositions: findings.map((finding) => ({
+        finding_id: finding.id,
+        decision: "accepted" as const,
+      })),
+    };
+    const state = (repository as any).runs.get(run.run_id);
+    const reviewExecution = state.steps.find(
+      (step: { step: string; status: string }) =>
+        step.step === "findings_review" && step.status === "waiting",
+    );
+    const queueJob = repository.queueJobs.find((job) => job.run_id === run.run_id)!;
+    queueJob.state = "parked";
+    queueJob.error = "operator_wait";
+    const unrelatedQueueJob = {
+      ...structuredClone(queueJob),
+      id: "unrelated-existing-job",
+      run_id: "unrelated-existing-run",
+      state: "parked" as const,
+      error: "unrelated-before",
+    };
+    repository.queueJobs.push(unrelatedQueueJob);
+    const queueJobBefore = structuredClone(queueJob);
+    const unrelatedDisposition = {
+      finding_id: "unrelated-concurrent-finding",
+      decision: "rejected" as const,
+      rationale: "Concurrent decision",
+    };
+    const unrelatedSubmission = {
+      run_id: "unrelated-concurrent-run",
+      review_set_id: "unrelated-concurrent-set",
+      idempotency_key: "unrelated-concurrent-key",
+      payload_hash: "unrelated-concurrent-hash",
+      finding_count: 1,
+    };
+    const originalEnqueue = repository.enqueueRun.bind(repository);
+    let concurrentQueueJob: (typeof repository.queueJobs)[number] | undefined;
+    const enqueue = vi.spyOn(repository, "enqueueRun").mockImplementationOnce(async (...args) => {
+      await originalEnqueue(...args);
+      unrelatedQueueJob.error = "unrelated-concurrent-update";
+      repository.dispositions.push(unrelatedDisposition);
+      repository.findingReviewSubmissions.push(unrelatedSubmission);
+      repository.queueJobs.push({
+        ...structuredClone(queueJob),
+        id: "target-partially-created-job",
+      });
+      concurrentQueueJob = {
+        ...structuredClone(unrelatedQueueJob),
+        id: "unrelated-concurrent-job",
+        run_id: "unrelated-concurrent-run",
+        error: "created-during-enqueue",
+      };
+      repository.queueJobs.push(concurrentQueueJob);
+      throw new Error("queue down after mutation");
+    });
+
+    await expect(repository.submitDispositions(run.run_id, input)).rejects.toThrow(
+      "queue down after mutation",
+    );
+
+    expect(repository.dispositions).toEqual([unrelatedDisposition]);
+    expect(repository.dispositions[0]).toBe(unrelatedDisposition);
+    expect(repository.findingReviewSubmissions).toEqual([unrelatedSubmission]);
+    expect(repository.findingReviewSubmissions[0]).toBe(unrelatedSubmission);
+    expect(reviewExecution.status).toBe("waiting");
+    expect({
+      status: state.status,
+      currentStep: state.currentStep,
+      blockReason: state.blockReason,
+    }).toEqual({ status: "waiting", currentStep: "findings_review", blockReason: null });
+    expect(repository.queueJobs.find((job) => job.id === queueJob.id)).toBe(queueJob);
+    expect(queueJob).toEqual(queueJobBefore);
+    expect(repository.queueJobs.find((job) => job.id === unrelatedQueueJob.id)).toBe(
+      unrelatedQueueJob,
+    );
+    expect(unrelatedQueueJob.error).toBe("unrelated-concurrent-update");
+    expect(repository.queueJobs.find((job) => job.id === concurrentQueueJob?.id)).toBe(
+      concurrentQueueJob,
+    );
+    expect(repository.queueJobs).not.toContainEqual(
+      expect.objectContaining({ id: "target-partially-created-job" }),
+    );
+
+    const retried = await repository.submitDispositions(run.run_id, input);
+    expect(retried).toEqual({
+      completed: true,
+      submitted: findings.length,
+      continuation_required: true,
+    });
+    expect(repository.dispositions).toHaveLength(findings.length + 1);
+    expect(repository.dispositions).toContain(unrelatedDisposition);
+    expect(repository.findingReviewSubmissions).toHaveLength(2);
+    expect(repository.findingReviewSubmissions).toContain(unrelatedSubmission);
+    expect(reviewExecution.status).toBe("succeeded");
+    expect(repository.runState(run.run_id)).toEqual({
+      status: "running",
+      current_step: "revision_pass",
+    });
+    expect(repository.queueJobs).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({ run_id: run.run_id, state: "ready" }),
+        unrelatedQueueJob,
+        concurrentQueueJob,
+      ]),
+    );
+    expect(repository.queueJobs.find((job) => job.id === queueJob.id)).toBe(queueJob);
+    expect(repository.queueJobs.find((job) => job.id === unrelatedQueueJob.id)).toBe(
+      unrelatedQueueJob,
+    );
+    enqueue.mockRestore();
+  });
+
   it("bulk-disposes findings and completes only when every current-document finding is decided", async () => {
     const { repository, run } = await setup();
     await new MilestoneThreeOrchestrator(
@@ -717,6 +1361,18 @@ describe("milestone three", () => {
       decision: "accepted" as const,
       rationale: "Bulk accepted",
     }));
+    const state = (repository as any).runs.get(run.run_id);
+    const activeReviewExecutionId = repository.findingReviewSets.at(-1)!.findings_step_execution_id;
+    state.steps.unshift({
+      id: "superseded-waiting-findings-execution",
+      step: "findings_review",
+      status: "waiting",
+      attempt: 1,
+      token: null,
+      expiresAt: null,
+    });
+    const queueJob = repository.queueJobs.find((job) => job.run_id === run.run_id)!;
+    queueJob.state = "parked";
     const first = await repository.submitDispositions(run.run_id, {
       document_version_id: version.id,
       idempotency_key: "milestone-three-decision",
@@ -727,6 +1383,11 @@ describe("milestone three", () => {
       submitted: findings.length,
       continuation_required: true,
     });
+    expect(
+      state.steps.find((step: { id: string }) => step.id === activeReviewExecutionId).status,
+    ).toBe("succeeded");
+    expect(state.steps[0].status).toBe("waiting");
+    expect(queueJob.state).toBe("ready");
     expect(
       await repository.submitDispositions(run.run_id, {
         document_version_id: version.id,

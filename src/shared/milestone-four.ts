@@ -319,6 +319,18 @@ export interface MilestoneFourRepository {
     findings: RevisionFinding[];
     rejected_locations: z.infer<typeof FindingLocationSchema>[];
     verified_fact_locations: z.infer<typeof FindingLocationSchema>[];
+    /**
+     * Complete readability authority frozen by an exceptional authorisation,
+     * keyed by finding id. Present only for `operator_authorised_repair`.
+     */
+    authorised_readability?: Record<
+      string,
+      {
+        blocks: Array<{ line_start: number; line_end: number }>;
+        selector_version?: string;
+        target_set_identity?: string;
+      }
+    >;
   }>;
   beginRevisionOperation(input: {
     run_id: string;
@@ -329,6 +341,20 @@ export interface MilestoneFourRepository {
     request: RevisionRequest;
   }): Promise<RevisionResponse | null>;
   markRevisionProviderInFlight(input: {
+    run_id: string;
+    execution_id: string;
+    token: string;
+    operation_id: string;
+  }): Promise<void>;
+  /** Durable pre-dispatch marker for the single paid coherence call. */
+  markCoherenceProviderInFlight(input: {
+    run_id: string;
+    execution_id: string;
+    token: string;
+    operation_id: string;
+  }): Promise<void>;
+  /** Narrowly proven non-dispatch release only; never clears a checkpointed response. */
+  releaseCoherenceProviderFailure(input: {
     run_id: string;
     execution_id: string;
     token: string;

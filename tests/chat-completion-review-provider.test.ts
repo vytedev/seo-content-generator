@@ -260,6 +260,7 @@ describe("ChatCompletionReviewProvider.review", () => {
       },
     });
     expect(requestBody.provider).toEqual({ require_parameters: true });
+    expect(requestBody.reasoning).toEqual({ effort: "none", exclude: true });
   });
 
   it("turns Step 1.5 token-limit truncation into its deterministic warning", async () => {
@@ -288,6 +289,7 @@ describe("ChatCompletionReviewProvider.review", () => {
       String((fetcher.mock.calls[0] as unknown as [unknown, RequestInit])[1].body),
     );
     expect(body.provider).toBeUndefined();
+    expect(body.reasoning).toBeUndefined();
     expect(body.response_format.type).toBe("json_schema");
   });
 

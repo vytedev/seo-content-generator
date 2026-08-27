@@ -4,6 +4,7 @@ import { isIP } from "node:net";
 import { z } from "zod";
 import type { SitemapClient, SitemapCandidate } from "./internal-link-discovery.js";
 import { nodeHttpsPinnedFetcher, type PinnedFetcher } from "./public-page-retriever.js";
+import { isCanonicalProductRoute } from "../../shared/product-route.js";
 import {
   ReviewRequestSchema,
   ReviewResponseSchema,
@@ -301,10 +302,7 @@ export class PublicStorefrontFactVerifier implements FactVerifier {
     let candidates: SitemapCandidate[];
     try {
       candidates = (await this.options.sitemap.listUrls())
-        .filter((candidate) => {
-          const path = new URL(candidate.url).pathname.replace(/\/+$/, "");
-          return /(?:^|\/)products\/[^/]+$/i.test(path);
-        })
+        .filter((candidate) => isCanonicalProductRoute(candidate.url))
         .slice(0, this.maxCandidates);
     } catch {
       return [];

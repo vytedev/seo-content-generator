@@ -1,4 +1,4 @@
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
 import {
   DEFAULT_BLOG_SCHEMA_TEMPLATE,
   DEFAULT_WRITER_TEMPLATE,
@@ -108,6 +108,74 @@ describe("milestone two", () => {
       false,
     );
     expect(StructuredDraftSchema.safeParse({ ...base, extra: true }).success).toBe(false);
+  });
+
+  it("forces one fresh Step 1.2 attempt after success without rerunning paid draft", async () => {
+    const { repository, result, provider } = await setup();
+    const discover = vi
+      .fn()
+      .mockResolvedValueOnce([
+        {
+          url: "https://www.example.com/products/original",
+          title: "Original",
+          primary_topic: "chair",
+          relevance: 1,
+          status: 200,
+          hierarchy: "product",
+          source: "sitemap",
+          verified_at: new Date().toISOString(),
+        },
+      ])
+      .mockResolvedValueOnce({
+        availability: "available",
+        eligibility: "eligible",
+        reason: "verified_commercial_candidates",
+        links: [
+          {
+            url: "https://www.example.com/products/refreshed",
+            title: "Refreshed",
+            primary_topic: "chair",
+            relevance: 1,
+            status: 200,
+            hierarchy: "product",
+            source: "sitemap",
+            verified_at: new Date().toISOString(),
+          },
+        ],
+        providerStatus: { sitemap: "available", gsc: "not_configured" },
+        counts: {
+          ghost_collected: 0,
+          sitemap_collected: 1,
+          gsc_collected: 0,
+          deduplicated: 1,
+          commercial: 1,
+          editorial: 0,
+          verification_attempted: 1,
+          direct_200: 1,
+          rejected_non_200: 0,
+          unresolved: 0,
+          shortlisted: 1,
+        },
+        cache: { state: "refreshed", retrieved_at: null, expires_at: null },
+        identity: {
+          query_hash: "a".repeat(64),
+          config_hash: "b".repeat(64),
+          origin_policy_hash: "c".repeat(64),
+          request_hash: "d".repeat(64),
+        },
+      });
+    const orchestrator = new MilestoneTwoOrchestrator(repository, { discover }, provider);
+    await orchestrator.run(result.run_id);
+    expect(provider.calls).toHaveLength(1);
+    await orchestrator.run(result.run_id, "refresh-worker", { refreshLinkDiscovery: true });
+    expect(discover).toHaveBeenCalledTimes(2);
+    expect(discover.mock.calls[1]?.[1]).toEqual({ refresh: true });
+    expect(provider.calls).toHaveLength(1);
+    expect(repository.attempts(result.run_id, "internal_link_discovery")).toHaveLength(2);
+    expect((await repository.getLinks(result.run_id))?.[0]?.url).toContain("original");
+    expect(
+      (await repository.getRunDetail(result.run_id)).link_discovery.metadata?.cache.state,
+    ).toBe("refreshed");
   });
 
   it("blocks drafting before model spend when discovery has no verified commercial link", async () => {
@@ -313,8 +381,7 @@ describe("milestone two", () => {
         lease.execution_id,
         "wrong-token",
         { request_id: "bad" } as never,
-        "mock",
-        "model",
+        {} as never,
       ),
     ).rejects.toThrow();
     expect({
@@ -365,8 +432,7 @@ describe("milestone two", () => {
         draftLease.execution_id,
         draftLease.token,
         response,
-        provider.provider,
-        provider.model,
+        {} as never,
       ),
     ).rejects.toThrow("Stale fencing token");
   });
@@ -399,9 +465,9 @@ describe("milestone two", () => {
         revision: 1,
         artifact_id: draftArtifact?.id,
       });
-      expect(provider.calls.length).toBe(boundary === "after_provider" ? 2 : 1);
+      expect(provider.calls).toHaveLength(1);
       expect(provider.calls[0]).toMatchObject({
-        prompt: { template_id: "mobelaris.draft", template_version: "2.0.0" },
+        prompt: provider.prompt,
         reference_snapshots: expect.arrayContaining([
           expect.objectContaining({ kind: "blog_writing_guide", content: expect.any(String) }),
           expect.objectContaining({ kind: "writer_submission_sample" }),
@@ -418,6 +484,56 @@ describe("milestone two", () => {
       );
       expect(repository.artifacts.filter((artifact) => artifact.kind === "draft")).toHaveLength(1);
       expect(repository.providerUsage).toHaveLength(1);
+    });
+  }
+
+  it("logs checkpoint replay without dispatching the provider again", async () => {
+    const { repository, result, provider } = await setup();
+    const first = new MilestoneTwoOrchestrator(
+      repository,
+      new MockLinkDiscoverer([
+        { url: "https://mobelaris.com/blog/example", title: "Example", relevance: 0.8 },
+      ]),
+      provider,
+      new OnceFailure("after_provider"),
+    );
+    await expect(first.run(result.run_id)).rejects.toThrow("injected:after_provider");
+    const output: string[] = [];
+    const write = vi.spyOn(process.stdout, "write").mockImplementation((chunk) => {
+      output.push(String(chunk));
+      return true;
+    });
+    await new MilestoneTwoOrchestrator(repository, new MockLinkDiscoverer(), provider).run(
+      result.run_id,
+      "replay-worker",
+    );
+    expect(provider.calls).toHaveLength(1);
+    expect(output.filter((line) => line.includes('"event":"provider.replayed"'))).toHaveLength(1);
+    expect(output.some((line) => line.includes('"event":"provider.dispatch_started"'))).toBe(false);
+    write.mockRestore();
+  });
+
+  for (const boundary of ["after_draft_reservation", "after_provider_return"] as const) {
+    it(`fails closed after ${boundary} without a duplicate provider call`, async () => {
+      const { repository, result, provider } = await setup();
+      const first = new MilestoneTwoOrchestrator(
+        repository,
+        new MockLinkDiscoverer([
+          { url: "https://mobelaris.com/blog/example", title: "Example", relevance: 0.8 },
+        ]),
+        provider,
+        new OnceFailure(boundary),
+      );
+      await expect(first.run(result.run_id)).rejects.toThrow(`injected:${boundary}`);
+      await expect(
+        new MilestoneTwoOrchestrator(repository, new MockLinkDiscoverer(), provider).run(
+          result.run_id,
+          "resume-worker",
+        ),
+      ).rejects.toThrow("Draft provider outcome is ambiguous");
+      expect(provider.calls).toHaveLength(boundary === "after_provider_return" ? 1 : 0);
+      expect(await repository.getDraft(result.run_id)).toBeNull();
+      expect(repository.providerUsage).toHaveLength(0);
     });
   }
 

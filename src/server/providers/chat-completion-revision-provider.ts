@@ -18,6 +18,7 @@ import {
 import type { RevisionProvider } from "./milestone-four-providers.js";
 import { formatDeterministicEditorialRubric } from "./editorial-rubric.js";
 import { readBoundedResponseBody } from "./http-response.js";
+import { classifyInvalidSuccess, isJson } from "./structured-output-diagnostics.js";
 
 /**
  * Server-only OpenRouter revision client for step 1.10.
@@ -213,7 +214,19 @@ export class ChatCompletionRevisionProvider implements RevisionProvider {
     // truncated, malformed or unsafe. Discard all raw output and fail every
     // requested subjective finding closed; the orchestrator can still retain
     // deterministic edits and advance through the normal gates.
-    logModelProviderOutputInvalid(this.provider, "revision", this.model, 1);
+    const content = wire?.choices[0]?.message.content;
+    logModelProviderOutputInvalid(
+      this.provider,
+      "revision",
+      this.model,
+      1,
+      classifyInvalidSuccess(
+        wire !== null,
+        wire?.choices[0]?.finish_reason,
+        content,
+        isJson(content),
+      ),
+    );
     return RevisionResponseSchema.parse({
       document: request.current_document,
       finding_results: request.accepted_findings.map((finding) => ({
@@ -286,7 +299,12 @@ export class ChatCompletionRevisionProvider implements RevisionProvider {
             temperature,
             max_tokens: this.maxOutputTokens,
             response_format: { type: "json_schema", json_schema: REVISION_RESPONSE_JSON_SCHEMA },
-            ...(this.provider === "openrouter" ? { provider: { require_parameters: true } } : {}),
+            ...(this.provider === "openrouter"
+              ? {
+                  provider: { require_parameters: true },
+                  reasoning: { effort: "none", exclude: true },
+                }
+              : {}),
           }),
           signal: controller.signal,
         });

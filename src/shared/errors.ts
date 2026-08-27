@@ -13,6 +13,11 @@ export class UnprocessableError extends Error {
   readonly code = "UNPROCESSABLE_ENTITY";
 }
 
+export class ServiceUnavailableError extends Error {
+  override readonly name = "ServiceUnavailableError";
+  readonly code = "SERVICE_UNAVAILABLE";
+}
+
 /** A persistence race found the same repository identity bound to different input. */
 export class RepositoryConflictError extends Error {
   override readonly name = "RepositoryConflictError";

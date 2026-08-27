@@ -10,9 +10,14 @@ import {
 import { renderExport } from "../../shared/export.js";
 import { applyRevisionEnvelope } from "../../shared/revision-application.js";
 import {
+  READABILITY_SELECTOR_VERSION,
+  REVISION_BINDING_VERSION,
   REVISION_PLANNING_VERSION,
+  bindRevisionFindingsWithAuthority,
   mergeRevisionPlan,
   planRevisionRequest,
+  readabilityTargetSetIdentity,
+  revisionBindingExclusions,
 } from "../../shared/revision-planning.js";
 import {
   mapDeterministicInput,
@@ -29,18 +34,33 @@ import {
   type MilestoneFourRepository,
   type RevisionSafeFailureCategory,
 } from "../../shared/milestone-four.js";
+import type { DeterministicManifest } from "../../shared/deterministic-run.js";
+import type { StructuredDraft } from "../../shared/contracts/content.js";
+import type { FindingLocation, FindingResult } from "../../shared/revision-application.js";
+import type { RevisionFinding } from "../../shared/milestone-four.js";
 import { RevisionProviderError } from "../providers/chat-completion-revision-provider.js";
+import { CoherenceProviderError } from "../providers/chat-completion-coherence-provider.js";
 import type { CoherenceProvider, RevisionProvider } from "../providers/milestone-four-providers.js";
-import { logger } from "../logger.js";
+import { classifyError, logger } from "../logger.js";
 import { withHeartbeat } from "./lease-heartbeat.js";
 
 // Version 2.2.0 starts a new immutable provider operation after the Step 1.8
 // occurrence-scoped contract change. Earlier provider_in_flight reservations
 // remain preserved and are never retried or overwritten.
-const REVISION_PROMPT_VERSION = "2.2.0";
+export const REVISION_PROMPT_VERSION = "2.2.0";
 const COHERENCE_PROMPT_VERSION = "2.3.0";
 
-function revisionOperationId(input: {
+// Bounded operator-facing reasons for a correction the frozen candidate
+// preflight refused to persist. They never quote provider prose.
+const PREFLIGHT_INEFFECTIVE =
+  "The correction did not resolve its deterministic blocker, so it was reverted before persistence.";
+const PREFLIGHT_INTRODUCED =
+  "The correction introduced a new deterministic blocker, so it was reverted before persistence.";
+const PREFLIGHT_AMBIGUOUS =
+  "A new deterministic blocker could not be attributed to one exact correction, so the candidate was reverted.";
+
+/** Exported for the identity-stability tests; not part of the public surface. */
+export function revisionOperationId(input: {
   runId: string;
   documentVersionId: string;
   source:
@@ -51,6 +71,13 @@ function revisionOperationId(input: {
   findingIds: string[];
   provider: string;
   model: string;
+  /**
+   * Identity of the selected readability target set. An unchanged ineffective
+   * selection therefore resolves to the same operation and replays its
+   * checkpoint instead of paying for the same edit again, while a genuinely
+   * different selection forks a new operation.
+   */
+  readabilityTargets?: string;
 }): string {
   return stableId(
     "revision-operation",
@@ -60,11 +87,37 @@ function revisionOperationId(input: {
     ...input.findingIds,
     // A no-op has no provider operation or model contract, so it remains
     // configuration-independent. Non-empty operations bind every input that
-    // can change planning or provider output while retaining source identity.
+    // can change planning or provider output while retaining source identity —
+    // including the binding identity, because a binding change moves which
+    // exact location each accepted finding authorises.
     ...(input.findingIds.length > 0
-      ? [input.provider, input.model, REVISION_PROMPT_VERSION, REVISION_PLANNING_VERSION]
+      ? [
+          input.provider,
+          input.model,
+          REVISION_PROMPT_VERSION,
+          REVISION_PLANNING_VERSION,
+          REVISION_BINDING_VERSION,
+          READABILITY_SELECTOR_VERSION,
+          input.readabilityTargets ?? "",
+        ]
       : []),
   );
+}
+
+/**
+ * Configuration and request-validation failures raised before the coherence
+ * provider issues its HTTP request. Transport, status, timeout and unparseable
+ * outcomes are deliberately excluded: upstream may already have processed a
+ * paid request, so those must stay ambiguous and fail closed.
+ */
+const UNDISPATCHED_COHERENCE_CODES = new Set([
+  "COHERENCE_PROVIDER_TOKEN_MISSING",
+  "COHERENCE_PROVIDER_MODEL_INVALID",
+  "COHERENCE_PROVIDER_MODEL_MISMATCH",
+]);
+
+function provablyUndispatchedCoherenceFailure(error: unknown): boolean {
+  return error instanceof CoherenceProviderError && UNDISPATCHED_COHERENCE_CODES.has(error.code);
 }
 
 function coherenceEligibilityReason(error: unknown): string | undefined {
@@ -122,6 +175,7 @@ function coherenceEligibilityDiagnostics(
 
 function finaliseFailureCategory(error: unknown): string {
   const message = error instanceof Error ? error.message : "";
+  if (/coherence provider outcome is ambiguous/i.test(message)) return "coherence_ambiguous";
   if (/coherence.*ambiguous|checkpoint/i.test(message)) return "coherence_checkpoint";
   if (/disallowed field|precise locator|outside the exact revision|blocker.*eligib/i.test(message))
     return "coherence_eligibility";
@@ -203,7 +257,10 @@ export type MilestoneFourFailureBoundary =
   | "after_revision_provider_return"
   | "after_revision_provider"
   | "after_revision_persist"
+  | "before_rerun_persist"
   | "after_rerun_persist"
+  | "after_coherence_reservation"
+  | "after_coherence_provider_return"
   | "after_coherence_provider"
   | "after_coherence_persist"
   | "after_export";
@@ -266,28 +323,28 @@ export class MilestoneFourOrchestrator {
       );
       const { current, handoff, links } = await this.context(runId);
       const revisionInput = await this.repository.getRevisionFindings(runId, current.version.id);
-      const findings = revisionInput.findings;
-      const operationId = revisionOperationId({
-        runId,
-        documentVersionId: current.version.id,
-        source: revisionInput.source,
-        findingIds: findings.map((finding) => finding.id),
-        provider: this.revisions.provider,
-        model: this.revisions.model,
+      // Rules the checker emits without a line range carry no exact authority,
+      // so the planner, the model gate and the envelope would all refuse them.
+      // Bind the supported ones to one precise application-owned location
+      // before anything downstream reads the accepted set.
+      // One frozen exclusion set for binding, block selection, the
+      // provider-visible targets, the additional authority and the operation
+      // identity. Recomputing it per consumer is what let a rejected paragraph
+      // reach the provider even though the envelope refused to persist it.
+      const frozenExclusions = revisionBindingExclusions({
+        document: current.draft,
+        rejectedLocations: revisionInput.rejected_locations,
       });
-      if (findings.length === 0) {
-        await this.repository.completeRevisionNoop({
-          run_id: runId,
-          execution_id: lease.execution_id,
-          token: lease.token,
-          document_version_id: current.version.id,
-          operation_id: operationId,
-          source: revisionInput.source,
-        });
-        return;
-      }
-      const request = {
-        operation_id: operationId,
+      const binding = bindRevisionFindingsWithAuthority({
+        document: current.draft,
+        primaryKeyword: handoff.primary_keyword,
+        findings: revisionInput.findings,
+        exclusions: frozenExclusions,
+      });
+      const findings = binding.findings;
+      // Planning never reads the operation id, so plan first and let the
+      // selected readability target set take part in that identity.
+      const requestCore = {
         run_id: runId,
         document_version_id: current.version.id,
         revision: current.version.revision,
@@ -304,10 +361,77 @@ export class MilestoneFourOrchestrator {
         model: this.revisions.model,
         temperature: 0,
       };
-      const plan = planRevisionRequest(request);
+      const plan = planRevisionRequest(
+        { ...requestCore, operation_id: "planning" },
+        {
+          exclusions: frozenExclusions,
+          readabilityBlocksByFinding: binding.readability_blocks,
+          // Exceptional execution is bound to the exact ranges the operator
+          // authorised; anything else fails closed before provider dispatch.
+          ...(revisionInput.authorised_readability
+            ? { authorisedReadability: revisionInput.authorised_readability }
+            : {}),
+        },
+      );
+      const readabilityTargets = plan
+        .filter((item) => item.readability_blocks?.length)
+        .map(
+          (item) => `${item.finding.id}:${readabilityTargetSetIdentity(item.readability_blocks!)}`,
+        )
+        .join("|");
+      const operationId = revisionOperationId({
+        runId,
+        documentVersionId: current.version.id,
+        source: revisionInput.source,
+        findingIds: findings.map((finding) => finding.id),
+        provider: this.revisions.provider,
+        model: this.revisions.model,
+        readabilityTargets,
+      });
+      if (findings.length === 0) {
+        await this.repository.completeRevisionNoop({
+          run_id: runId,
+          execution_id: lease.execution_id,
+          token: lease.token,
+          document_version_id: current.version.id,
+          operation_id: operationId,
+          source: revisionInput.source,
+        });
+        return;
+      }
+      const request = { ...requestCore, operation_id: operationId };
+      // A readability finding is expanded into one issued block per authorised
+      // range. Each synthetic row keeps an exact immutable source location, so
+      // the provider only ever sees application-issued ids and bounded source
+      // text, and the existing compact contract keeps enforcing exact order.
       const modelFindings = plan
         .filter((item) => item.route === "model")
-        .map((item) => item.finding);
+        .flatMap((item) =>
+          item.readability_blocks
+            ? item.readability_blocks.map((block) => ({
+                ...item.finding,
+                id: block.id,
+                location: {
+                  field: "body_markdown" as const,
+                  line_start: block.line_start,
+                  line_end: block.line_end,
+                },
+              }))
+            : [item.finding],
+        );
+      // Every exact block the readability finding owns, so one audit can hold
+      // all of its non-contiguous hunks.
+      const additionalAuthority = Object.fromEntries(
+        plan
+          .filter((item) => item.readability_blocks?.length)
+          .map((item) => [
+            item.finding.id,
+            item.readability_blocks!.map(
+              (block) => [block.line_start, block.line_end] as readonly [number, number],
+            ),
+          ]),
+      );
+
       logger.info("revision.plan_reduced", {
         run_id: runId,
         operation_id: operationId,
@@ -325,7 +449,23 @@ export class MilestoneFourOrchestrator {
         document_version_id: current.version.id,
         request,
       });
+      if (response) {
+        logger.info("provider.replayed", {
+          run_id: runId,
+          operation_id: operationId,
+          provider: this.revisions.provider,
+          context: "revision",
+          replayed: true,
+        });
+      }
       if (!response) {
+        logger.info("provider.reserved", {
+          run_id: runId,
+          operation_id: operationId,
+          provider: this.revisions.provider,
+          context: "revision",
+          state: "reserved",
+        });
         const failureIdentity = {
           provider: this.revisions.provider,
           model: this.revisions.model,
@@ -356,13 +496,38 @@ export class MilestoneFourOrchestrator {
             token: lease.token,
             operation_id: operationId,
           });
+          logger.info("provider.dispatch_started", {
+            run_id: runId,
+            operation_id: operationId,
+            provider: this.revisions.provider,
+            context: "revision",
+          });
           try {
             const rawResponse = await withHeartbeat(this.repository, lease, () =>
               this.revisions.revise(modelRequest),
             );
+            logger.info("provider.returned", {
+              run_id: runId,
+              operation_id: operationId,
+              provider: this.revisions.provider,
+              context: "revision",
+            });
             await this.failures?.hit("after_revision_provider_return");
             modelResponse = RevisionResponseSchema.parse(rawResponse);
+            logger.info("provider.response_validated", {
+              run_id: runId,
+              operation_id: operationId,
+              provider: this.revisions.provider,
+              context: "revision",
+            });
           } catch (error) {
+            logger.warn("provider.dispatch_failed", {
+              run_id: runId,
+              operation_id: operationId,
+              provider: this.revisions.provider,
+              context: "revision",
+              ...classifyError(error),
+            });
             // Once provider_in_flight is durable, an exception cannot prove that the paid
             // request was never dispatched. Preserve the reservation and fail closed so a
             // resume cannot duplicate a request that upstream may already have processed.
@@ -407,18 +572,31 @@ export class MilestoneFourOrchestrator {
           operation_id: operationId,
           response,
         });
+        logger.info("provider.checkpointed", {
+          run_id: runId,
+          operation_id: operationId,
+          provider: this.revisions.provider,
+          context: "revision",
+        });
       }
       await this.failures?.hit("after_revision_provider");
       // Reject any provider attempt to mutate server-owned claims before controlled reconstruction.
       if (JSON.stringify(response.document.claims) !== JSON.stringify(current.draft.claims))
         assertSafeRevision(request, response.document);
-      const applied = applyRevisionEnvelope({
-        current: current.draft,
-        proposed: response.document,
+      const applied = this.preflightRevision({
+        runId,
+        current,
         findings,
         results: response.finding_results,
+        proposed: response.document,
         rejected_locations: revisionInput.rejected_locations,
         verified_fact_locations: revisionInput.verified_fact_locations,
+        additional_authority: additionalAuthority,
+        manifest: validateDeterministicManifest(
+          (await this.repository.getDeterministicManifest(runId)).manifest,
+          { run_id: runId, handoff },
+        ),
+        operationId,
       });
       const controlledResponse = {
         ...response,
@@ -440,6 +618,12 @@ export class MilestoneFourOrchestrator {
         model: this.revisions.model,
         audits: applied.audits,
       });
+      logger.info("provider.persistence_completed", {
+        run_id: runId,
+        operation_id: operationId,
+        provider: this.revisions.provider,
+        context: "revision",
+      });
       await this.failures?.hit("after_revision_persist");
     } catch (error) {
       await this.safeFail(lease.execution_id, lease.token, error);
@@ -451,6 +635,173 @@ export class MilestoneFourOrchestrator {
         });
       throw error;
     }
+  }
+
+  /**
+   * Proves every controlled correction against the frozen Step 1.11 checker
+   * before the candidate is allowed to persist.
+   *
+   * `applyRevisionEnvelope` only proves that an edit stayed inside authorised
+   * structure, so an edit could be recorded `applied` while its blocker
+   * survived — or while it introduced a new one. This re-applies the same
+   * envelope with ineffective and blocker-introducing edits forced to
+   * `unable`, so successful independent siblings are preserved and the audits
+   * describe exactly the document that persists.
+   *
+   * It is a pure function of the checkpointed provider response, the immutable
+   * source document and the frozen manifest, so a resume replays it without
+   * another provider request.
+   */
+  private preflightRevision(input: {
+    runId: string;
+    operationId: string;
+    manifest: DeterministicManifest;
+    current: { draft: StructuredDraft; version: { id: string; content_hash: string } };
+    proposed: StructuredDraft;
+    findings: RevisionFinding[];
+    results: FindingResult[];
+    rejected_locations: FindingLocation[];
+    verified_fact_locations: FindingLocation[];
+    additional_authority: Readonly<Record<string, ReadonlyArray<readonly [number, number]>>>;
+  }): ReturnType<typeof applyRevisionEnvelope> {
+    const { manifest } = input;
+    const evaluate = (draft: StructuredDraft) => {
+      const owned = mapDeterministicInput({
+        run_id: input.runId,
+        document_version_id: input.current.version.id,
+        handoff: manifest.frozen_context.handoff,
+        draft,
+        persisted_links: manifest.frozen_context.internal_links_artifact.body,
+        fixture: manifest.frozen_context.fixture.content as DeterministicFixture,
+      });
+      return runVersionedDeterministicChecks(
+        checkerInputFromManifest(manifest, {
+          body_markdown: owned.body_markdown,
+          on_page: owned.on_page,
+        }),
+        { id: input.current.version.id, content_hash: input.current.version.content_hash },
+        manifest,
+      ).findings;
+    };
+    const baseline = evaluate(input.current.draft);
+    /** How many blocker occurrences of one rule a candidate still carries. */
+    const ruleBlockers = (findings: ReturnType<typeof evaluate>, rule: string) =>
+      findings.filter((finding) => finding.rule === rule && finding.severity === "blocker").length;
+
+    const force = (reverts: ReadonlyMap<string, string>): FindingResult[] =>
+      input.results.map((result) => {
+        const reason = reverts.get(result.finding_id);
+        return reason && result.status === "applied"
+          ? { finding_id: result.finding_id, status: "unable" as const, reason }
+          : result;
+      });
+    const run = (reverts: ReadonlyMap<string, string>) => {
+      const envelope = applyRevisionEnvelope({
+        current: input.current.draft,
+        proposed: input.proposed,
+        findings: input.findings,
+        results: force(reverts),
+        rejected_locations: input.rejected_locations,
+        verified_fact_locations: input.verified_fact_locations,
+        additional_authority: input.additional_authority,
+      });
+      const candidate = evaluate(envelope.document);
+      return {
+        envelope,
+        candidate,
+        comparison: compareDeterministicResults(baseline, candidate),
+      };
+    };
+    // Attribution trials repeat the same single-revert candidates once per
+    // introduced blocker. Memoise so the work stays linear in applied edits
+    // and the whole preflight fits comfortably inside the step lease.
+    const trials = new Map<string, ReturnType<typeof run>>();
+    const runOnce = (reverts: ReadonlyMap<string, string>) => {
+      const key = [...reverts.keys()].sort().join("|");
+      const cached = trials.get(key);
+      if (cached) return cached;
+      const computed = run(reverts);
+      trials.set(key, computed);
+      return computed;
+    };
+
+    const none = new Map<string, string>();
+    let pass = runOnce(none);
+    const appliedIds = (result: typeof pass) =>
+      result.envelope.audits
+        .filter((audit) => audit.status === "applied")
+        .map((audit) => audit.finding_id);
+    const reverts = new Map<string, string>();
+    const failClosed = (reason: string) => {
+      for (const id of appliedIds(pass)) reverts.set(id, reason);
+    };
+
+    // A newly introduced blocker must never persist. Attribute it by reverting
+    // one applied edit at a time; anything less exact fails closed.
+    for (const blocker of pass.comparison.introduced_blockers) {
+      const responsible = appliedIds(pass).filter((id) => {
+        const trial = runOnce(new Map([[id, PREFLIGHT_INTRODUCED]]));
+        return !trial.comparison.introduced_blockers.includes(blocker);
+      });
+      if (responsible.length === 1) reverts.set(responsible[0]!, PREFLIGHT_INTRODUCED);
+      else {
+        failClosed(PREFLIGHT_AMBIGUOUS);
+        break;
+      }
+    }
+
+    // An edit may stay `applied` only when its own blocker is provably gone.
+    //
+    // Occurrence identities are opaque hashes and several accepted findings can
+    // share one rule, so resolution is proved counterfactually instead: an edit
+    // is effective exactly when reverting it puts one of its rule's blocker
+    // occurrences back. Counting occurrences of the edit's own rule makes this
+    // per-finding, so two findings sharing a rule are judged independently, and
+    // an edit that only appears to help because a sibling did the work restores
+    // nothing and is reverted. Sharing a rule can therefore never leave an
+    // ineffective edit credited.
+    // Snapshot the attribution reverts so every counterfactual is measured
+    // against one consistent base candidate rather than a shifting one.
+    const baseReverts = new Map(reverts);
+    const basePass = runOnce(baseReverts);
+    for (const audit of basePass.envelope.audits) {
+      if (audit.status !== "applied" || baseReverts.has(audit.finding_id)) continue;
+      const finding = input.findings.find((item) => item.id === audit.finding_id);
+      if (!finding || finding.severity !== "blocker") continue;
+      const rule = finding.rule_reference;
+      // Only rules the frozen checker actually blocks on can be proved this
+      // way. A finding may carry `blocker` for a rule the checker emits as a
+      // warning; there is no deterministic blocker to resolve, so demanding
+      // proof would revert a perfectly good edit.
+      if (ruleBlockers(baseline, rule) === 0) continue;
+      const withEdit = ruleBlockers(basePass.candidate, rule);
+      const withoutEdit = ruleBlockers(
+        runOnce(new Map([...baseReverts, [audit.finding_id, PREFLIGHT_INEFFECTIVE]])).candidate,
+        rule,
+      );
+      if (withoutEdit <= withEdit) reverts.set(audit.finding_id, PREFLIGHT_INEFFECTIVE);
+    }
+
+    if (reverts.size > 0) {
+      pass = runOnce(reverts);
+      // Reverting can only remove authorised hunks, but recheck rather than
+      // assume: a candidate that still introduces a blocker reverts entirely.
+      if (pass.comparison.introduced_blockers.length > 0) {
+        failClosed(PREFLIGHT_AMBIGUOUS);
+        pass = runOnce(reverts);
+      }
+    }
+    logger.info("revision.preflight_completed", {
+      run_id: input.runId,
+      operation_id: input.operationId,
+      planning_version: REVISION_PLANNING_VERSION,
+      binding_version: REVISION_BINDING_VERSION,
+      applied_count: appliedIds(pass).length,
+      reverted_count: reverts.size,
+      retained_blockers: pass.comparison.retained_blockers.length,
+      introduced_blockers: pass.comparison.introduced_blockers.length,
+    });
+    return pass.envelope;
   }
 
   private async rerun(runId: string, owner: string): Promise<"continue" | "repair" | "blocked"> {
@@ -500,6 +851,7 @@ export class MilestoneFourOrchestrator {
           suggested_fix: finding.suggested_fix,
         }),
       );
+      await this.failures?.hit("before_rerun_persist");
       const outcome = await this.repository.saveRerun({
         run_id: runId,
         document_version_id: current.version.id,
@@ -600,13 +952,80 @@ export class MilestoneFourOrchestrator {
           document_version_id: current.version.id,
           request,
         });
+        if (response) {
+          logger.info("provider.replayed", {
+            run_id: runId,
+            operation_id: request.operation_id,
+            provider: this.coherence.provider,
+            context: "coherence",
+            replayed: true,
+          });
+        }
         if (!response) {
+          logger.info("provider.reserved", {
+            run_id: runId,
+            operation_id: request.operation_id,
+            provider: this.coherence.provider,
+            context: "coherence",
+            state: "reserved",
+          });
+          // Durably reserve the single paid call before dispatch. Once this
+          // commits, an exception can no longer prove the request was never
+          // sent, so a resume fails closed instead of paying twice.
+          stage = "coherence_provider_reservation";
+          await this.repository.markCoherenceProviderInFlight({
+            run_id: runId,
+            execution_id: lease.execution_id,
+            token: lease.token,
+            operation_id: request.operation_id,
+          });
+          logger.info("provider.dispatch_started", {
+            run_id: runId,
+            operation_id: request.operation_id,
+            provider: this.coherence.provider,
+            context: "coherence",
+          });
+          await this.failures?.hit("after_coherence_reservation");
           stage = "coherence_provider";
-          const rawCoherence = await withHeartbeat(this.repository, lease, () =>
-            this.coherence.review(request),
-          );
+          let rawCoherence: Awaited<ReturnType<CoherenceProvider["review"]>>;
+          try {
+            rawCoherence = await withHeartbeat(this.repository, lease, () =>
+              this.coherence.review(request),
+            );
+          } catch (error) {
+            logger.warn("provider.dispatch_failed", {
+              run_id: runId,
+              operation_id: request.operation_id,
+              provider: this.coherence.provider,
+              context: "coherence",
+              ...classifyError(error),
+            });
+            // Only a provider error that proves nothing was dispatched may
+            // release the reservation; anything else stays ambiguous.
+            if (provablyUndispatchedCoherenceFailure(error))
+              await this.repository.releaseCoherenceProviderFailure({
+                run_id: runId,
+                execution_id: lease.execution_id,
+                token: lease.token,
+                operation_id: request.operation_id,
+              });
+            throw error;
+          }
+          logger.info("provider.returned", {
+            run_id: runId,
+            operation_id: request.operation_id,
+            provider: this.coherence.provider,
+            context: "coherence",
+          });
+          await this.failures?.hit("after_coherence_provider_return");
           stage = "coherence_response_validation";
           response = CoherenceResponseSchema.parse(rawCoherence);
+          logger.info("provider.response_validated", {
+            run_id: runId,
+            operation_id: request.operation_id,
+            provider: this.coherence.provider,
+            context: "coherence",
+          });
           stage = "coherence_checkpoint";
           await this.repository.checkpointCoherenceResponse({
             run_id: runId,
@@ -614,6 +1033,12 @@ export class MilestoneFourOrchestrator {
             token: lease.token,
             operation_id: request.operation_id,
             response,
+          });
+          logger.info("provider.checkpointed", {
+            run_id: runId,
+            operation_id: request.operation_id,
+            provider: this.coherence.provider,
+            context: "coherence",
           });
         }
         // Validate both fresh provider output and a response recovered from an immutable checkpoint.
@@ -631,6 +1056,12 @@ export class MilestoneFourOrchestrator {
           response,
           provider: this.coherence.provider,
           model: this.coherence.model,
+        });
+        logger.info("provider.persistence_completed", {
+          run_id: runId,
+          operation_id: request.operation_id,
+          provider: this.coherence.provider,
+          context: "coherence",
         });
         await this.failures?.hit("after_coherence_persist");
       }

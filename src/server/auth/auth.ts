@@ -1,5 +1,6 @@
 import type { Express, NextFunction, Request, RequestHandler, Response } from "express";
 import { z } from "zod";
+import { LOCAL_AUTH_ALLOWED_ORIGINS } from "../../shared/local-runtime.js";
 import type { AuthConfig } from "./config.js";
 import {
   csrfToken,
@@ -15,7 +16,7 @@ const loginSchema = z
   .object({ email: z.string().trim().email(), password: z.string().min(1).max(1024) })
   .strict();
 const SAFE_METHODS = new Set(["GET", "HEAD", "OPTIONS"]);
-const ALLOWED_ORIGINS = new Set(["http://127.0.0.1:5173", "http://127.0.0.1:3100"]);
+const ALLOWED_ORIGINS = LOCAL_AUTH_ALLOWED_ORIGINS;
 
 export interface AuthServiceOptions {
   config: AuthConfig;

@@ -100,6 +100,13 @@ describe("operator authentication", () => {
       .send({ email: "operator@example.com", password: "correct horse battery staple" })
       .expect(200);
     expect(String(rotationLogin.headers["set-cookie"]?.[0]).split(";")[0]).not.toBe(cookie);
+
+    await request(app)
+      .post("/api/auth/login")
+      .set("Origin", "http://127.0.0.1:3110")
+      .send({ email: "operator@example.com", password: "correct horse battery staple" })
+      .expect(200)
+      .expect("Access-Control-Allow-Origin", "http://127.0.0.1:3110");
   });
 
   it("uses generic errors, an origin allowlist and bounded per-IP throttling", async () => {

@@ -20,7 +20,7 @@ curl --fail-with-body \
   --header 'Idempotency-Key: 123e4567-e89b-42d3-a456-426614174000' \
   --cookie 'mm03_operator_session=<http-only-session-cookie>' \
   --data '{"explicit_confirmation":true}' \
-  http://127.0.0.1:3100/api/integrations/model/diagnostic
+  http://127.0.0.1:3110/api/integrations/model/diagnostic
 ```
 
 Reusing an idempotency key returns its saved safe result without another provider request. A pending

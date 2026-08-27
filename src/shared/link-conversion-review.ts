@@ -6,6 +6,7 @@ import {
 } from "./checker/contracts.js";
 import { parseMarkdown } from "./checker/markdown.js";
 import { canonicaliseInternalUrl } from "./internal-link-url.js";
+import { isCanonicalProductRoute } from "./product-route.js";
 import type { ReviewFinding } from "./milestone-three.js";
 import { InternalLinkSchema, type InternalLink, type StructuredDraft } from "./milestone-two.js";
 
@@ -95,16 +96,14 @@ export interface LinkAuditInput {
 }
 
 export function classifyInternalLinkHierarchy(url: string): InternalLinkHierarchy {
-  const path = new URL(url).pathname.toLocaleLowerCase("en-GB");
+  const parsed = new URL(url);
+  const path = parsed.pathname.toLocaleLowerCase("en-GB");
   if (path === "/") return "homepage";
   if (/\/designers?\//.test(path)) return "designer_hub";
-  if (/\/products?\//.test(path)) return "product";
+  if (isCanonicalProductRoute(parsed)) return "product";
   const segments = path.split("/").filter(Boolean);
   if (segments.includes("collections"))
     return segments.length > 2 ? "sub_collection" : "collection";
-  // Keep the audit aligned with discovery for Mobelaris's locale-prefixed flat
-  // product routes, such as /en/style-...-chair.
-  if (segments.length === 2 && /^[a-z]{2}(?:-[a-z]{2})?$/.test(segments[0]!)) return "product";
   return "broad_category";
 }
 

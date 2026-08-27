@@ -1,0 +1,7 @@
+export const LOCAL_FRONTEND_PORT = 5173;
+export const LOCAL_API_PORT = 3110;
+
+export const LOCAL_FRONTEND_ORIGIN = `http://127.0.0.1:${LOCAL_FRONTEND_PORT}`;
+export const LOCAL_API_ORIGIN = `http://127.0.0.1:${LOCAL_API_PORT}`;
+
+export const LOCAL_AUTH_ALLOWED_ORIGINS = new Set([LOCAL_FRONTEND_ORIGIN, LOCAL_API_ORIGIN]);

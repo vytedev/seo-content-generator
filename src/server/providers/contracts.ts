@@ -4,5 +4,8 @@ import type { DraftProviderRequest, DraftProviderResponse } from "../../shared/m
 export interface DraftProvider {
   readonly provider: string;
   readonly model: string;
+  /** Mechanically derived from prompt/schema/reasoning/retry/token policy. */
+  readonly contractIdentity: string;
+  readonly prompt: NonNullable<DraftProviderRequest["prompt"]>;
   generate(request: DraftProviderRequest): Promise<DraftProviderResponse>;
 }

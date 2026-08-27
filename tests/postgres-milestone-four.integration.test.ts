@@ -1,6 +1,6 @@
 import { createHash } from "node:crypto";
 import pg from "pg";
-import { afterAll, beforeEach, describe, expect, it } from "vitest";
+import { afterAll, beforeEach, describe, expect, it, vi } from "vitest";
 import {
   REFERENCE_DOCUMENT_SEED_MANIFEST,
   generateReferenceSeedSql,
@@ -70,6 +70,20 @@ const handoff = {
   word_count_target: 900,
   locales_for_translation: [],
 };
+/**
+ * A deterministic blocker no correction route can resolve: a meta description
+ * below the deterministic shortening band, which the allowlisted planner
+ * refuses and which never reaches the model. It reaches the two-cycle cap the
+ * way a genuinely unrepairable article does, rather than through an introduced
+ * blocker that the Step 1.10 candidate preflight now reverts.
+ */
+const UNREPAIRABLE_META = "A".repeat(120);
+/** Deliberately high Flesch-Kincaid prose, so the frozen readability rule blocks. */
+const COMPLEX_PROSE =
+  "Consequently the extraordinarily sophisticated manufacturing methodology demonstrates considerable environmental responsibility whenever comparatively substantial quantities of internationally certified hardwood materials are systematically incorporated throughout the entire production infrastructure.";
+const STILL_COMPLEX_PROSE =
+  "Additionally the remarkably complicated manufacturing methodology demonstrates extraordinary environmental accountability whenever proportionally significant quantities of internationally accredited hardwood materials are meticulously integrated throughout the complete production infrastructure.";
+
 const blocker: ReviewFinding = {
   stable_key: "conflict",
   category: "inconsistency",
@@ -104,7 +118,7 @@ async function seedReferences() {
   }
 }
 
-async function setup(key: string) {
+async function setup(key: string, seedDraft: typeof draft = draft) {
   const repository = new PostgresMilestoneRepository(pool!, 2_000, {
     writer: { template_id: "mobelaris.writer-submission", version: "1.0.0" },
     schema: { template_id: "mobelaris.blog-schema", version: "1.0.0" },
@@ -114,7 +128,9 @@ async function setup(key: string) {
   await new MilestoneTwoOrchestrator(
     repository,
     new MockLinkDiscoverer([link]),
-    new MockDraftProvider("draft-v1", draft),
+    // Seeding through the draft provider keeps the Step 1.4 frozen manifest,
+    // the artefact body and its content hash consistent with each other.
+    new MockDraftProvider("draft-v1", seedDraft),
   ).run(run.run_id);
   await new MilestoneThreeOrchestrator(
     repository,
@@ -140,13 +156,16 @@ function orchestrator(
   revision: ConstructorParameters<typeof MilestoneFourOrchestrator>[2] = new MockRevisionProvider(
     "revision-v1",
   ),
+  exports: ConstructorParameters<
+    typeof MilestoneFourOrchestrator
+  >[4] = new PostgresGoogleDocsExportService(pool!, new MockGoogleDocsAdapter()),
 ) {
   return new MilestoneFourOrchestrator(
     repository,
     selectedFixture,
     revision,
     coherence,
-    new PostgresGoogleDocsExportService(pool!, new MockGoogleDocsAdapter()),
+    exports,
     failure,
   );
 }
@@ -157,6 +176,35 @@ integration("PostgreSQL milestone four", () => {
     await seedReferences();
   });
   afterAll(async () => pool?.end());
+
+  it("fences identical Step 1.11 replay while preserving active observational idempotency", async () => {
+    const { repository, run } = await setup("m4-pg-rerun-replay-fence");
+    const originalSaveRerun = repository.saveRerun.bind(repository);
+    let persistedInput: Parameters<typeof repository.saveRerun>[0] | undefined;
+    repository.saveRerun = async (input) => {
+      persistedInput = structuredClone(input);
+      return originalSaveRerun(input);
+    };
+    await orchestrator(repository).run(run.run_id);
+
+    const stale = persistedInput!;
+    await expect(originalSaveRerun(stale)).rejects.toThrow(/Stale|expired|fencing/i);
+
+    const replay = await repository.claimStep(
+      run.run_id,
+      "automated_checks_rerun",
+      "active-replay",
+      true,
+    );
+    await expect(
+      originalSaveRerun({ ...stale, execution_id: replay.execution_id, token: replay.token }),
+    ).resolves.toBe("continue");
+    const count = await pool!.query<{ count: number }>(
+      "select count(*)::int count from deterministic_reruns where run_id=$1",
+      [run.run_id],
+    );
+    expect(count.rows[0]!.count).toBe(1);
+  });
 
   it("preserves dispositions, revision/claim/source lineage and consistent final execution/export replay", async () => {
     const { repository, run, findings } = await setup("m4-pg-success");
@@ -218,18 +266,17 @@ integration("PostgreSQL milestone four", () => {
   });
 
   it("durably blocks after two Step 1.11 repair cycles and ignores the current fixture", async () => {
-    const { repository, run } = await setup("m4-pg-deterministic-block");
+    const { repository, run } = await setup("m4-pg-deterministic-block", {
+      ...draft,
+      meta_description: UNREPAIRABLE_META,
+    });
     const coherence = new MockCoherenceProvider("coherence-v1");
-    const linkRemovingRevision = new MockRevisionProvider("revision-v1", (request) => ({
-      ...request.current_document,
-      markdown: request.current_document.markdown.replace(`[chair](${link.url})`, "chair"),
-    }));
     await orchestrator(
       repository,
       coherence,
       undefined,
       { ...fixture, link_verification: [] },
-      linkRemovingRevision,
+      new MockRevisionProvider("revision-v1"),
     ).run(run.run_id);
     expect(await repository.getRunDetail(run.run_id)).toMatchObject({
       status: "blocked",
@@ -288,7 +335,7 @@ integration("PostgreSQL milestone four", () => {
       source: "deterministic_repair",
       findings: [
         {
-          rule_reference: "links.verified_internal_presence",
+          rule_reference: "on_page.meta_description.length",
           severity: "blocker",
           origin_document_version_id: blockedDocument,
         },
@@ -298,17 +345,23 @@ integration("PostgreSQL milestone four", () => {
   });
 
   it("binds exceptional repair to the exact latest Step 1.11 blockers and never coherence or Step 1.9", async () => {
-    const { repository, run } = await setup("m4-pg-exceptional-repair");
-    const removing = new MockRevisionProvider("revision-v1", (request) => ({
+    // Readability is locationless, so it exercises the application-owned
+    // binding, and it is bounded-paragraph repairable, so an authorisation is
+    // genuinely useful rather than spent on a blocker nothing can resolve.
+    const { repository, run } = await setup("m4-pg-exceptional-repair", {
+      ...draft,
+      markdown: draft.markdown.replace("> Measure first.", `${COMPLEX_PROSE}\n\n> Measure first.`),
+    });
+    const ineffective = new MockRevisionProvider("revision-v1", (request) => ({
       ...request.current_document,
-      markdown: request.current_document.markdown.replace(`[chair](${link.url})`, "chair"),
+      markdown: request.current_document.markdown.replace(COMPLEX_PROSE, STILL_COMPLEX_PROSE),
     }));
     await orchestrator(
       repository,
       new MockCoherenceProvider("coherence-v1"),
       undefined,
       fixture,
-      removing,
+      ineffective,
     ).run(run.run_id);
     const blocked = (await repository.getDraft(run.run_id))!;
     const blockedMarkdown = blocked.draft.markdown;
@@ -324,9 +377,14 @@ integration("PostgreSQL milestone four", () => {
     expect(input.source).toBe("operator_authorised_repair");
     expect(input.findings).toHaveLength(1);
     expect(input.findings[0]).toMatchObject({
-      rule_reference: "links.verified_internal_presence",
+      rule_reference: "style.readability_grade_8",
       origin_document_version_id: blocked.version.id,
     });
+    // The persisted binding must be one exact block range, never the whole field.
+    expect(input.findings[0]!.location.line_start).toBeGreaterThan(0);
+    expect(input.findings[0]!.location.line_end).toBeGreaterThanOrEqual(
+      input.findings[0]!.location.line_start!,
+    );
     const binding = (
       await pool!.query(
         `select deterministic_rerun_step_execution_id,blocker_set_hash,blocker_bindings
@@ -337,15 +395,51 @@ integration("PostgreSQL milestone four", () => {
     expect(binding.blocker_set_hash).toMatch(/^[a-f0-9]{64}$/);
     expect(binding.blocker_bindings).toHaveLength(1);
 
-    const recovery = new MockRevisionProvider("revision-v1");
+    const recovery = new MockRevisionProvider("revision-v1", (request) => ({
+      ...request.current_document,
+      markdown: request.current_document.markdown.replace(COMPLEX_PROSE, STILL_COMPLEX_PROSE),
+    }));
     await orchestrator(repository, undefined, undefined, fixture, recovery).run(run.run_id);
-    expect(recovery.calls).toHaveLength(0);
+    // Exactly one bounded exceptional model request, and the candidate preflight
+    // still refuses to persist prose that leaves the frozen grade above 8.
+    expect(recovery.calls).toHaveLength(1);
     expect((await repository.getDraft(run.run_id))!.draft.markdown).toBe(blockedMarkdown);
     expect((await repository.getRunDetail(run.run_id)).status).toBe("blocked");
     expect(
       (await pool!.query("select count(*)::int count from exports where run_id=$1", [run.run_id]))
         .rows[0].count,
     ).toBe(0);
+    // Same-key replay must be purely observational: it may not reopen the
+    // blocked child, mint a document version, start a revision operation, pay
+    // for another provider call, or extend the one-time correction. This is the
+    // exact behaviour the in-memory repository already had.
+    const snapshot = async () => ({
+      run: (
+        await pool!.query(
+          "select status,current_step,block_reason,deterministic_repair_cycles from runs where id=$1",
+          [run.run_id],
+        )
+      ).rows[0],
+      documents: (
+        await pool!.query("select count(*)::int c from document_versions where run_id=$1", [
+          run.run_id,
+        ])
+      ).rows[0].c,
+      currentVersion: (await repository.getDraft(run.run_id))!.version.id,
+      operations: (
+        await pool!.query("select count(*)::int c from revision_operation_states where run_id=$1", [
+          run.run_id,
+        ])
+      ).rows[0].c,
+      authorisations: (
+        await pool!.query(
+          "select count(*)::int c from exceptional_correction_authorisations where run_id=$1",
+          [run.run_id],
+        )
+      ).rows[0].c,
+    });
+    const before = await snapshot();
+    const callsBefore = recovery.calls.length;
     await expect(
       repository.authoriseExceptionalCorrection({
         run_id: run.run_id,
@@ -353,6 +447,104 @@ integration("PostgreSQL milestone four", () => {
         explicit_confirmation: true,
       }),
     ).resolves.toBe("replay");
+    expect(await snapshot()).toEqual(before);
+    expect(recovery.calls).toHaveLength(callsBefore);
+    expect(before.run.status).toBe("blocked");
+    // No second exceptional action, and no further revision operation can start.
+    const detail = await repository.getRunDetail(run.run_id);
+    expect(detail.exceptional_correction.available).toBe(false);
+    await orchestrator(repository, undefined, undefined, fixture, recovery)
+      .run(run.run_id)
+      .catch(() => undefined);
+    expect(await snapshot()).toEqual(before);
+    expect(recovery.calls).toHaveLength(callsBefore);
+
+    // A DIFFERENT key on an already-authorised run is a conflict, never a
+    // replay, and mutates nothing.
+    await expect(
+      repository.authoriseExceptionalCorrection({
+        run_id: run.run_id,
+        idempotency_key: `${key}:other`,
+        explicit_confirmation: true,
+      }),
+    ).rejects.toThrow(/already has an exceptional authorisation/i);
+    expect(await snapshot()).toEqual(before);
+
+    // The SAME key owned by another run is a key conflict, and mutates nothing.
+    // Key ownership is checked before any run lookup, so an unrelated run id is
+    // enough and avoids disturbing this suite's shared fixtures.
+    await expect(
+      repository.authoriseExceptionalCorrection({
+        run_id: "00000000-0000-0000-0000-0000000000ff",
+        idempotency_key: key,
+        explicit_confirmation: true,
+      }),
+    ).rejects.toThrow(/Authorisation key conflict/i);
+    expect(await snapshot()).toEqual(before);
+  });
+
+  it("fails closed on an ambiguous coherence return instead of paying twice", async () => {
+    const { repository, run } = await setup("m4-pg-coherence-ambiguous");
+    const coherence = new MockCoherenceProvider("coherence-v1");
+    let crash = true;
+    await expect(
+      orchestrator(repository, coherence, {
+        hit(boundary) {
+          if (crash && boundary === "after_coherence_provider_return") {
+            crash = false;
+            throw new Error("crash after the coherence provider returned");
+          }
+        },
+      }).run(run.run_id),
+    ).rejects.toThrow("crash after the coherence provider returned");
+    expect(coherence.calls).toHaveLength(1);
+    expect(
+      (
+        await pool!.query<{ status: string }>(
+          "select status from coherence_checkpoints where run_id=$1",
+          [run.run_id],
+        )
+      ).rows[0]?.status,
+    ).toBe("provider_in_flight");
+
+    await expect(orchestrator(repository, coherence).run(run.run_id)).rejects.toThrow(/ambiguous/i);
+    expect(coherence.calls).toHaveLength(1);
+    expect(
+      (await pool!.query("select count(*)::int c from exports where run_id=$1", [run.run_id]))
+        .rows[0].c,
+    ).toBe(0);
+  });
+
+  it("replays a checkpointed coherence response without another provider call", async () => {
+    const { repository, run } = await setup("m4-pg-coherence-replay");
+    const coherence = new MockCoherenceProvider("coherence-v1");
+    let crash = true;
+    await expect(
+      orchestrator(repository, coherence, {
+        hit(boundary) {
+          if (crash && boundary === "after_coherence_provider") {
+            crash = false;
+            throw new Error("crash after the coherence checkpoint");
+          }
+        },
+      }).run(run.run_id),
+    ).rejects.toThrow("crash after the coherence checkpoint");
+    expect(coherence.calls).toHaveLength(1);
+    expect(
+      (
+        await pool!.query<{ status: string }>(
+          "select status from coherence_checkpoints where run_id=$1",
+          [run.run_id],
+        )
+      ).rows[0]?.status,
+    ).toBe("checkpointed");
+
+    await orchestrator(repository, coherence).run(run.run_id);
+    expect(coherence.calls).toHaveLength(1);
+    expect(
+      (await pool!.query("select count(*)::int c from exports where run_id=$1", [run.run_id]))
+        .rows[0].c,
+    ).toBe(1);
   });
 
   it("routes an eligible coherence blocker through one controlled recovery cycle", async () => {
@@ -733,11 +925,12 @@ integration("PostgreSQL milestone four", () => {
     expect((await repository.getRunDetail(run.run_id)).status).toBe("succeeded");
     const recoveries = (
       await pool!.query(
-        "select producing_step_execution_id,recovery_step_execution_id from coherence_recoveries where run_id=$1",
+        "select producing_step_execution_id,recovery_step_execution_id,outcome from coherence_recoveries where run_id=$1",
         [run.run_id],
       )
     ).rows;
     expect(recoveries.length).toBeGreaterThanOrEqual(1);
+    expect(recoveries.every((row) => row.outcome === "export")).toBe(true);
     expect(
       recoveries.every((row) => row.producing_step_execution_id !== row.recovery_step_execution_id),
     ).toBe(true);
@@ -748,5 +941,153 @@ integration("PostgreSQL milestone four", () => {
       )
     ).rows;
     expect(JSON.stringify(errors)).not.toContain("secret=hidden");
+    expect(
+      (
+        await pool!.query<{ count: number }>(
+          "select count(*)::int count from exports where run_id=$1 and status='succeeded'",
+          [run.run_id],
+        )
+      ).rows[0]!.count,
+    ).toBe(1);
+  });
+
+  it("rejects recovered-checkpoint export with a forged authoritative checkpoint hash", async () => {
+    const { repository, run } = await setup("m4-pg-recovery-export-hash-negative");
+    let captured:
+      | Parameters<ConstructorParameters<typeof MilestoneFourOrchestrator>[4]["export"]>[0]
+      | undefined;
+    const capturingExport = {
+      async export(input: NonNullable<typeof captured>) {
+        captured = input;
+        throw new Error("stop before Google");
+      },
+    };
+    await expect(
+      orchestrator(
+        repository,
+        new MockCoherenceProvider("coherence-v1"),
+        undefined,
+        fixture,
+        new MockRevisionProvider("revision-v1"),
+        capturingExport,
+      ).run(run.run_id),
+    ).rejects.toThrow("stop before Google");
+    expect(captured).toBeDefined();
+
+    const checkpoint = (
+      await pool!.query<{
+        operation_id: string;
+        producing_step_execution_id: string;
+        document_version_id: string;
+      }>(
+        `select operation_id,producing_step_execution_id,document_version_id
+         from coherence_checkpoints where run_id=$1`,
+        [run.run_id],
+      )
+    ).rows[0]!;
+    const current = await repository.claimStep(
+      run.run_id,
+      "final_coherence_export",
+      "hash-forgery-recovery",
+      true,
+    );
+    await pool!.query(
+      `insert into coherence_recoveries(operation_id,run_id,document_version_id,
+        producing_step_execution_id,recovery_step_execution_id,outcome)
+       values($1,$2,$3,$4,$5,'export')`,
+      [
+        checkpoint.operation_id,
+        run.run_id,
+        checkpoint.document_version_id,
+        checkpoint.producing_step_execution_id,
+        current.execution_id,
+      ],
+    );
+    await pool!.query(
+      "update coherence_checkpoints set response_hash=repeat('0',64) where operation_id=$1",
+      [checkpoint.operation_id],
+    );
+
+    const adapter = { export: vi.fn() };
+    const service = new PostgresGoogleDocsExportService(pool!, adapter);
+    await expect(
+      service.export({
+        ...captured!,
+        step_execution_id: current.execution_id,
+        fencing_token: current.token,
+      }),
+    ).rejects.toThrow("Final blocker gate does not permit export");
+    expect(adapter.export).not.toHaveBeenCalled();
+  });
+
+  it("rejects recovered-checkpoint export without an exact recovery for the current execution", async () => {
+    const { repository, run } = await setup("m4-pg-recovery-export-negative");
+    let captured:
+      | Parameters<ConstructorParameters<typeof MilestoneFourOrchestrator>[4]["export"]>[0]
+      | undefined;
+    const capturingExport = {
+      async export(input: NonNullable<typeof captured>) {
+        captured = input;
+        throw new Error("stop before Google");
+      },
+    };
+    await expect(
+      orchestrator(
+        repository,
+        new MockCoherenceProvider("coherence-v1"),
+        undefined,
+        fixture,
+        new MockRevisionProvider("revision-v1"),
+        capturingExport,
+      ).run(run.run_id),
+    ).rejects.toThrow("stop before Google");
+    expect(captured).toBeDefined();
+
+    const operation = (
+      await pool!.query<{
+        operation_id: string;
+        step_execution_id: string;
+        document_version_id: string;
+      }>(
+        `select operation_id,step_execution_id,document_version_id from provider_operations
+         where run_id=$1 and operation='final_coherence_export'`,
+        [run.run_id],
+      )
+    ).rows[0]!;
+    const unrelated = await repository.claimStep(
+      run.run_id,
+      "final_coherence_export",
+      "unrelated-recovery",
+      true,
+    );
+    await pool!.query(
+      `insert into coherence_recoveries(operation_id,run_id,document_version_id,
+        producing_step_execution_id,recovery_step_execution_id,outcome)
+       values($1,$2,$3,$4,$5,'export')`,
+      [
+        operation.operation_id,
+        run.run_id,
+        operation.document_version_id,
+        operation.step_execution_id,
+        unrelated.execution_id,
+      ],
+    );
+    await repository.failStep(unrelated.execution_id, unrelated.token, "test retry");
+    const current = await repository.claimStep(
+      run.run_id,
+      "final_coherence_export",
+      "current-recovery",
+      true,
+    );
+    const adapter = { export: vi.fn() };
+    const service = new PostgresGoogleDocsExportService(pool!, adapter);
+    await expect(
+      service.export({
+        ...captured!,
+        step_execution_id: current.execution_id,
+        fencing_token: current.token,
+      }),
+    ).rejects.toThrow("Final blocker gate does not permit export");
+    expect(adapter.export).not.toHaveBeenCalled();
   });
 });

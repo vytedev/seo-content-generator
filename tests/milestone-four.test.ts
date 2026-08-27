@@ -1,9 +1,21 @@
 import { describe, expect, it, vi } from "vitest";
-import { ingestHandoff } from "../src/shared/milestone-two.js";
+import { ingestHandoff, stableId } from "../src/shared/milestone-two.js";
 import type { DeterministicFixture, ReviewFinding } from "../src/shared/milestone-three.js";
 import { MilestoneTwoOrchestrator, MockLinkDiscoverer } from "../src/server/orchestrator.js";
 import { MilestoneThreeOrchestrator } from "../src/server/milestone-three-orchestrator.js";
-import { MilestoneFourOrchestrator } from "../src/server/milestone-four-orchestrator.js";
+import {
+  MilestoneFourOrchestrator,
+  REVISION_PROMPT_VERSION,
+  revisionOperationId,
+} from "../src/server/milestone-four-orchestrator.js";
+import {
+  READABILITY_SELECTOR_VERSION,
+  REVISION_BINDING_VERSION,
+  REVISION_PLANNING_VERSION,
+  bindRevisionFindingsWithAuthority,
+  planRevisionRequest,
+} from "../src/shared/revision-planning.js";
+import { bindExceptionalBlockers } from "../src/shared/exceptional-recovery.js";
 import { InMemoryMilestoneRepository } from "../src/server/persistence/memory-repository.js";
 import { MockDraftProvider } from "../src/server/providers/draft-provider.js";
 import { MockReviewProvider } from "../src/server/providers/review-provider.js";
@@ -15,8 +27,9 @@ import { createApp } from "../src/server/app.js";
 import {
   assertCoherenceBlockerEligibility,
   assertSafeRevision,
+  CoherenceRequestSchema,
 } from "../src/shared/milestone-four.js";
-import type { RevisionFinding } from "../src/shared/milestone-four.js";
+import type { RevisionFinding, RevisionRequest } from "../src/shared/milestone-four.js";
 import request from "supertest";
 import { logger } from "../src/server/logger.js";
 import { RevisionProviderError } from "../src/server/providers/chat-completion-revision-provider.js";
@@ -109,13 +122,15 @@ const liveProductLink = {
   retrieved_at: "2026-08-23T10:00:00.000Z",
 };
 
-async function setup(link: Record<string, unknown> = productLink) {
+async function setup(link: Record<string, unknown> = productLink, seedDraft: typeof draft = draft) {
   const repository = new InMemoryMilestoneRepository();
   const run = await ingestHandoff(handoff, `m4-${Math.random()}`, repository);
   await new MilestoneTwoOrchestrator(
     repository,
     new MockLinkDiscoverer([link as typeof productLink]),
-    new MockDraftProvider("draft-v1", draft),
+    // Seeding through the draft provider keeps the Step 1.4 frozen manifest and
+    // the persisted artefact consistent with each other.
+    new MockDraftProvider("draft-v1", seedDraft),
   ).run(run.run_id);
   await new MilestoneThreeOrchestrator(
     repository,
@@ -140,6 +155,18 @@ async function setup(link: Record<string, unknown> = productLink) {
     })),
   });
   return { repository, run };
+}
+
+/**
+ * A deterministic blocker that no correction route can resolve: a meta
+ * description below the deterministic shortening band, which the allowlisted
+ * planner refuses and which never reaches the model. It drives a run to the
+ * two-cycle cap the way a genuinely unrepairable article does, rather than
+ * relying on an introduced blocker that the candidate preflight now reverts
+ * before it can persist.
+ */
+function makeUnrepairable(draft: { meta_description: string }) {
+  draft.meta_description = "A".repeat(120);
 }
 
 describe("milestone four", () => {
@@ -459,6 +486,57 @@ describe("milestone four", () => {
       ),
     ).toThrow("Revision altered faqs without an accepted finding");
   });
+  it("logs ordered revision and coherence provider lifecycles once without secrets", async () => {
+    const { repository, run } = await setup();
+    const lines: string[] = [];
+    const write = vi.spyOn(process.stdout, "write").mockImplementation((chunk) => {
+      lines.push(String(chunk));
+      return true;
+    });
+    await new MilestoneFourOrchestrator(
+      repository,
+      fixture,
+      new MockRevisionProvider("revision-v1"),
+      new MockCoherenceProvider("coherence-v1"),
+      repository,
+    ).run(run.run_id);
+
+    const lifecycle = lines
+      .filter((line) => line.startsWith("{"))
+      .map(
+        (line) => JSON.parse(line) as { event: string; context?: string; operation_id?: string },
+      );
+    const expected = [
+      "provider.reserved",
+      "provider.dispatch_started",
+      "provider.returned",
+      "provider.response_validated",
+      "provider.checkpointed",
+      "provider.persistence_completed",
+    ];
+    const revisions = lifecycle.filter((entry) => entry.context === "revision");
+    const revisionIds = [...new Set(revisions.map((entry) => entry.operation_id))];
+    expect(revisionIds.length).toBeGreaterThan(0);
+    for (const operationId of revisionIds) {
+      const events = revisions
+        .filter((entry) => entry.operation_id === operationId)
+        .map((entry) => entry.event);
+      expect(events).toEqual(expected);
+      for (const event of expected) expect(events.filter((item) => item === event)).toHaveLength(1);
+    }
+    const coherence = lifecycle.filter((entry) => entry.context === "coherence");
+    expect(coherence.filter((entry) => entry.event === "provider.response_validated")).toHaveLength(
+      1,
+    );
+    expect(coherence.filter((entry) => entry.event === "provider.checkpointed")).toHaveLength(1);
+    expect(
+      coherence.findIndex((entry) => entry.event === "provider.response_validated"),
+    ).toBeLessThan(coherence.findIndex((entry) => entry.event === "provider.checkpointed"));
+    expect(lines.join("\n")).not.toContain("It measures 80 cm");
+    expect(lines.join("\n")).not.toContain("unconfirmed");
+    write.mockRestore();
+  });
+
   it("passes only accepted findings, creates immutable lineage, reruns checks and exports idempotently", async () => {
     const { repository, run } = await setup();
     const revisions = new MockRevisionProvider("revision-v1");
@@ -497,6 +575,74 @@ describe("milestone four", () => {
     });
     expect(repository.exports).toHaveLength(1);
     expect((await repository.getUsageTotals(run.run_id)).cost_micros).toBeGreaterThan(0);
+  });
+
+  it("fences identical Step 1.11 replay while preserving active observational idempotency", async () => {
+    const { repository, run } = await setup();
+    const originalSaveRerun = repository.saveRerun.bind(repository);
+    let persistedInput: Parameters<typeof repository.saveRerun>[0] | undefined;
+    repository.saveRerun = async (input) => {
+      persistedInput = structuredClone(input);
+      return originalSaveRerun(input);
+    };
+    await new MilestoneFourOrchestrator(
+      repository,
+      fixture,
+      new MockRevisionProvider("revision-v1"),
+      new MockCoherenceProvider("coherence-v1"),
+      repository,
+    ).run(run.run_id);
+
+    const stale = persistedInput!;
+    await expect(originalSaveRerun(stale)).rejects.toThrow("Stale fencing token");
+
+    const replay = await repository.claimStep(
+      run.run_id,
+      "automated_checks_rerun",
+      "active-replay",
+      true,
+    );
+    await expect(
+      originalSaveRerun({ ...stale, execution_id: replay.execution_id, token: replay.token }),
+    ).resolves.toBe("continue");
+    expect(repository.deterministicReruns.size).toBe(1);
+  });
+
+  it("clears a stale Step 1.11 block reason and advances after a clean rerun", async () => {
+    const { repository, run } = await setup();
+    const originalSaveRerun = repository.saveRerun.bind(repository);
+    repository.saveRerun = async (input) => {
+      // Reproduce a stale persisted reason at the exact transition under test,
+      // after claiming Step 1.11 has already performed its normal reset.
+      (repository as any).runs.get(run.run_id).blockReason = "deterministic_blockers";
+      return originalSaveRerun(input);
+    };
+    const failures = {
+      async hit(boundary: string) {
+        if (boundary === "after_rerun_persist") throw new Error("stop after Step 1.11");
+      },
+    };
+    const orchestrator = new MilestoneFourOrchestrator(
+      repository,
+      fixture,
+      new MockRevisionProvider("revision-v1"),
+      new MockCoherenceProvider("coherence-v1"),
+      repository,
+      failures,
+    );
+
+    await expect(orchestrator.run(run.run_id)).rejects.toThrow("stop after Step 1.11");
+
+    const detail = await repository.getRunDetail(run.run_id);
+    expect(detail).toMatchObject({
+      status: "running",
+      current_step: "final_coherence_export",
+      block_reason: "unknown",
+      block_counts: { deterministic_blockers: 0, coherence_blockers: 0 },
+    });
+    expect(detail.steps.find((step) => step.step === "automated_checks_rerun")?.status).toBe(
+      "succeeded",
+    );
   });
 
   it("exports a run whose links carry live Step 1.2 verification and provenance metadata", async () => {
@@ -652,21 +798,15 @@ describe("milestone four", () => {
     expect(repository.exports).toHaveLength(1);
   });
 
-  it("hard-blocks step 1.11 introduced blockers after two repair cycles while ignoring the current fixture", async () => {
+  it("hard-blocks unresolved step 1.11 blockers after two repair cycles while ignoring the current fixture", async () => {
     const { repository, run } = await setup();
     const coherence = new MockCoherenceProvider("coherence-v1");
     const currentFixtureMustBeIgnored = { ...fixture, link_verification: [] };
-    const linkRemovingRevision = new MockRevisionProvider("revision-v1", (request) => ({
-      ...request.current_document,
-      markdown: request.current_document.markdown.replace(
-        `[designer chair](${productLink.url})`,
-        "designer chair",
-      ),
-    }));
+    makeUnrepairable((await repository.getDraft(run.run_id))!.draft);
     await new MilestoneFourOrchestrator(
       repository,
       currentFixtureMustBeIgnored,
-      linkRemovingRevision,
+      new MockRevisionProvider("revision-v1"),
       coherence,
       repository,
     ).run(run.run_id);
@@ -679,9 +819,9 @@ describe("milestone four", () => {
       block_counts: { deterministic_blockers: 1, coherence_blockers: 0 },
       deterministic_blocker_details: [
         {
-          rule_reference: "links.verified_internal_presence",
+          rule_reference: "on_page.meta_description.length",
           issue: expect.any(String),
-          location: expect.objectContaining({ field: "body_markdown" }),
+          location: expect.objectContaining({ field: "on_page.meta_description" }),
           suggested_fix: expect.any(String),
         },
       ],
@@ -729,7 +869,11 @@ describe("milestone four", () => {
       repository,
     );
     const warning = vi.spyOn(logger, "warn").mockImplementation(() => undefined);
-    const app = createApp({ serveClient: false, milestoneFour: { repository, orchestrator } });
+    const app = createApp({
+      testOnlySynchronousPipeline: true,
+      serveClient: false,
+      milestoneFour: { repository, orchestrator },
+    });
 
     const response = await request(app).post(`/api/runs/${run.run_id}/milestone-four/resume`);
 
@@ -1056,17 +1200,11 @@ describe("milestone four", () => {
 
   it("recovers only a block backed by the current persisted rerun and its blocker", async () => {
     const { repository, run } = await setup();
-    const linkRemovingRevision = new MockRevisionProvider("revision-v1", (request) => ({
-      ...request.current_document,
-      markdown: request.current_document.markdown.replace(
-        `[designer chair](${productLink.url})`,
-        "designer chair",
-      ),
-    }));
+    makeUnrepairable((await repository.getDraft(run.run_id))!.draft);
     await new MilestoneFourOrchestrator(
       repository,
       fixture,
-      linkRemovingRevision,
+      new MockRevisionProvider("revision-v1"),
       new MockCoherenceProvider("coherence-v1"),
       repository,
     ).run(run.run_id);
@@ -1077,6 +1215,7 @@ describe("milestone four", () => {
     state.deterministicRepairCycles = 0;
     const revisions = new MockRevisionProvider("revision-v1");
     const app = createApp({
+      testOnlySynchronousPipeline: true,
       serveClient: false,
       milestoneFour: {
         repository,
@@ -1109,17 +1248,11 @@ describe("milestone four", () => {
 
   it("authorises the capped exact block once and replays without a second authorisation", async () => {
     const { repository, run } = await setup();
-    const linkRemovingRevision = new MockRevisionProvider("revision-v1", (request) => ({
-      ...request.current_document,
-      markdown: request.current_document.markdown.replace(
-        `[designer chair](${productLink.url})`,
-        "designer chair",
-      ),
-    }));
+    makeUnrepairable((await repository.getDraft(run.run_id))!.draft);
     await new MilestoneFourOrchestrator(
       repository,
       fixture,
-      linkRemovingRevision,
+      new MockRevisionProvider("revision-v1"),
       new MockCoherenceProvider("coherence-v1"),
       repository,
     ).run(run.run_id);
@@ -1143,6 +1276,7 @@ describe("milestone four", () => {
     // resume the non-terminal durable run, while operation checkpoints prevent duplicate calls.
     const recovery = new MockRevisionProvider("revision-v1");
     const app = createApp({
+      testOnlySynchronousPipeline: true,
       serveClient: false,
       milestoneFour: {
         repository,
@@ -1171,7 +1305,9 @@ describe("milestone four", () => {
         idempotency_key: `${key}:other`,
         explicit_confirmation: true,
       }),
-    ).rejects.toThrow("not available");
+      // A different key on an already-authorised run is an explicit conflict,
+      // matching PostgreSQL, rather than the incidental eligibility message.
+    ).rejects.toThrow(/already has an exceptional authorisation/i);
   });
 
   it("does not retry an exception labelled malformed after dispatch", async () => {
@@ -1203,6 +1339,76 @@ describe("milestone four", () => {
     expect(repository.revisionFailures.map((row) => row.category)).toEqual(["malformed_response"]);
   });
 
+  it("returns the durable export failure when retry enqueue fails, while preserving invalid-retry 409s", async () => {
+    const { repository, run } = await setup();
+    const failingExport = {
+      export: async () => {
+        throw new Error("Google Docs export structure mismatch.");
+      },
+    };
+    const orchestrator = new MilestoneFourOrchestrator(
+      repository,
+      fixture,
+      new MockRevisionProvider("revision-v1"),
+      new MockCoherenceProvider("coherence-v1"),
+      failingExport as never,
+    );
+    await orchestrator.run(run.run_id).catch(() => undefined);
+    expect((await repository.getRunDetail(run.run_id)).status).toBe("retryable_failed");
+
+    const persisted = await repository.getRunDetail(run.run_id);
+    const exportFailure = {
+      ...persisted,
+      export: { status: "failed" as const, external_url: null },
+    };
+    const detailSpy = vi.spyOn(repository, "getRunDetail").mockResolvedValue(exportFailure);
+    const enqueueRun = vi.fn(async () => {
+      throw new Error("queue unavailable after durable export failure");
+    });
+    const app = createApp({
+      serveClient: false,
+      milestoneFour: { repository, orchestrator },
+      queue: { enqueueRun } as never,
+    });
+    const durable = await request(app).post(`/api/runs/${run.run_id}/export/retry`);
+    expect(durable.status).toBe(200);
+    expect(durable.body).toMatchObject({
+      status: "retryable_failed",
+      current_step: "final_coherence_export",
+      export: { status: "failed" },
+    });
+    expect(enqueueRun).toHaveBeenCalledTimes(1);
+
+    for (const rejected of [
+      { ...exportFailure, export: { status: "not_started" as const, external_url: null } },
+      {
+        ...exportFailure,
+        steps: exportFailure.steps.map((step) =>
+          step.step === "final_coherence_export"
+            ? { ...step, error: "Coherence provider request failed at network level" }
+            : step,
+        ),
+      },
+      { ...exportFailure, current_step: "revision_pass" as const },
+    ]) {
+      detailSpy.mockResolvedValue(rejected);
+      const invalid = await request(app).post(`/api/runs/${run.run_id}/export/retry`);
+      expect(invalid.status).toBe(409);
+      expect(invalid.body.error.code).toBe("CONFLICT");
+    }
+    expect(enqueueRun).toHaveBeenCalledTimes(1);
+
+    detailSpy
+      .mockResolvedValueOnce(exportFailure)
+      .mockResolvedValueOnce(exportFailure)
+      .mockResolvedValue({
+        ...exportFailure,
+        export: { status: "not_started", external_url: null },
+      });
+    const nonExportFallback = await request(app).post(`/api/runs/${run.run_id}/export/retry`);
+    expect(nonExportFallback.status).toBe(500);
+  });
+
   it("serves typed detail and cost APIs", async () => {
     const { repository, run } = await setup();
     const orchestrator = new MilestoneFourOrchestrator(
@@ -1212,7 +1418,11 @@ describe("milestone four", () => {
       new MockCoherenceProvider("coherence-v1"),
       repository,
     );
-    const app = createApp({ serveClient: false, milestoneFour: { repository, orchestrator } });
+    const app = createApp({
+      testOnlySynchronousPipeline: true,
+      serveClient: false,
+      milestoneFour: { repository, orchestrator },
+    });
     expect((await request(app).post(`/api/runs/${run.run_id}/milestone-four/resume`)).status).toBe(
       200,
     );
@@ -1223,5 +1433,1077 @@ describe("milestone four", () => {
       cost_micros: expect.any(Number),
     });
     expect((await request(app).get("/api/runs/missing")).status).toBe(404);
+  });
+});
+
+/** Deliberately high Flesch-Kincaid prose, so the frozen readability rule blocks. */
+const COMPLEX_PROSE =
+  "Consequently the extraordinarily sophisticated manufacturing methodology demonstrates considerable environmental responsibility whenever comparatively substantial quantities of internationally certified hardwood materials are systematically incorporated throughout the entire production infrastructure.";
+const STILL_COMPLEX_PROSE =
+  "Additionally the remarkably complicated manufacturing methodology demonstrates extraordinary environmental accountability whenever proportionally significant quantities of internationally accredited hardwood materials are meticulously integrated throughout the complete production infrastructure.";
+
+/** Every persisted revision audit row, across all document versions of a run. */
+function allAudits(repository: InMemoryMilestoneRepository) {
+  const keys = (repository as unknown as { outputKeys: Map<string, string> }).outputKeys;
+  return [...keys.entries()]
+    .filter(([key]) => key.startsWith("revision-audits:"))
+    .flatMap(([, value]) => JSON.parse(value) as Array<Record<string, unknown>>);
+}
+
+describe("step 1.10 candidate preflight", () => {
+  it("binds, applies and proves a locationless keyword.primary.h2 blocker, then exports", async () => {
+    const { repository, run } = await setup();
+    const current = (await repository.getDraft(run.run_id))!;
+    // Remove the primary keyword from every H2 so the checker emits the real
+    // locationless `keyword.primary.h2` blocker.
+    current.draft.markdown = current.draft.markdown.replace(
+      "## How a designer chair fits your room",
+      "## Choosing between seating options",
+    );
+    const revisions = new MockRevisionProvider("revision-v1");
+
+    await new MilestoneFourOrchestrator(
+      repository,
+      fixture,
+      revisions,
+      new MockCoherenceProvider("coherence-v1"),
+      repository,
+    ).run(run.run_id);
+
+    expect(await repository.getRunDetail(run.run_id)).toMatchObject({
+      status: "succeeded",
+      block_counts: { deterministic_blockers: 0 },
+    });
+    expect(repository.exports).toHaveLength(1);
+    expect((await repository.getDraft(run.run_id))!.draft.markdown).toContain(
+      "## Choosing between seating options: designer chair",
+    );
+  });
+
+  it("reverts a readability edit that stays above Grade 8 and records it truthfully as unable", async () => {
+    const { repository, run } = await setup();
+    const current = (await repository.getDraft(run.run_id))!;
+    current.draft.markdown = current.draft.markdown.replace(
+      "> Measure your room first.",
+      `${COMPLEX_PROSE}\n\n> Measure your room first.`,
+    );
+    // The provider edits the bound paragraph but leaves the grade above 8.
+    const ineffective = new MockRevisionProvider("revision-v1", (input) => ({
+      ...input.current_document,
+      markdown: input.current_document.markdown.replace(COMPLEX_PROSE, STILL_COMPLEX_PROSE),
+    }));
+
+    await new MilestoneFourOrchestrator(
+      repository,
+      fixture,
+      ineffective,
+      new MockCoherenceProvider("coherence-v1"),
+      repository,
+    ).run(run.run_id);
+
+    const detail = await repository.getRunDetail(run.run_id);
+    expect(detail).toMatchObject({
+      status: "blocked",
+      current_step: "automated_checks_rerun",
+      deterministic_repair_cycles: 2,
+      block_reason: "deterministic_blockers",
+    });
+    const finalDraft = (await repository.getDraft(run.run_id))!.draft;
+    // The ineffective edit must not have persisted.
+    expect(finalDraft.markdown).not.toContain(STILL_COMPLEX_PROSE);
+    expect(finalDraft.markdown).toContain(COMPLEX_PROSE);
+    expect(repository.exports).toHaveLength(0);
+    const reverted = allAudits(repository).filter(
+      (audit) =>
+        typeof audit.reason === "string" && /did not resolve its deterministic/.test(audit.reason),
+    );
+    expect(reverted.length).toBeGreaterThan(0);
+    for (const audit of reverted) expect(audit).toMatchObject({ status: "unable", changed: false });
+  });
+
+  it("keeps a successful sibling correction while an ineffective one is reverted", async () => {
+    const { repository, run } = await setup();
+    const current = (await repository.getDraft(run.run_id))!;
+    current.draft.markdown = current.draft.markdown
+      .replace("## How a designer chair fits your room", "## Choosing between seating options")
+      .replace("> Measure your room first.", `${COMPLEX_PROSE}\n\n> Measure your room first.`);
+    const ineffective = new MockRevisionProvider("revision-v1", (input) => ({
+      ...input.current_document,
+      markdown: input.current_document.markdown.replace(COMPLEX_PROSE, STILL_COMPLEX_PROSE),
+    }));
+
+    await new MilestoneFourOrchestrator(
+      repository,
+      fixture,
+      ineffective,
+      new MockCoherenceProvider("coherence-v1"),
+      repository,
+    ).run(run.run_id);
+
+    const finalDraft = (await repository.getDraft(run.run_id))!.draft;
+    // The deterministic H2 correction survives even though readability failed.
+    expect(finalDraft.markdown).toContain("## Choosing between seating options: designer chair");
+    expect(finalDraft.markdown).not.toContain(STILL_COMPLEX_PROSE);
+    expect(await repository.getRunDetail(run.run_id)).toMatchObject({ status: "blocked" });
+  });
+
+  it("reverts only the edit responsible for an introduced blocker", async () => {
+    const { repository, run } = await setup();
+    const current = (await repository.getDraft(run.run_id))!;
+    current.draft.markdown = current.draft.markdown.replace(
+      "## How a designer chair fits your room",
+      "## Choosing between seating options",
+    );
+    const before = current.draft.markdown;
+    // Destroys the verified internal link, which introduces a new blocker.
+    const linkRemoving = new MockRevisionProvider("revision-v1", (input) => ({
+      ...input.current_document,
+      markdown: input.current_document.markdown.replace(
+        `[designer chair](${productLink.url})`,
+        "designer chair",
+      ),
+    }));
+
+    await new MilestoneFourOrchestrator(
+      repository,
+      fixture,
+      linkRemoving,
+      new MockCoherenceProvider("coherence-v1"),
+      repository,
+    ).run(run.run_id);
+
+    const finalDraft = (await repository.getDraft(run.run_id))!.draft;
+    // The link survives because the responsible edit was reverted...
+    expect(finalDraft.markdown).toContain(`[designer chair](${productLink.url})`);
+    // ...while the independent deterministic H2 correction still landed.
+    expect(finalDraft.markdown).toContain("## Choosing between seating options: designer chair");
+    expect(before).not.toContain("seating options: designer chair");
+    expect(await repository.getRunDetail(run.run_id)).toMatchObject({
+      status: "succeeded",
+      block_counts: { deterministic_blockers: 0 },
+    });
+  });
+
+  it("does not record a misleading applied audit when every edit is reverted", async () => {
+    const { repository, run } = await setup();
+    const current = (await repository.getDraft(run.run_id))!;
+    const versionId = current.version.id;
+    current.draft.markdown = current.draft.markdown.replace(
+      "> Measure your room first.",
+      `${COMPLEX_PROSE}\n\n> Measure your room first.`,
+    );
+    const ineffective = new MockRevisionProvider("revision-v1", (input) => ({
+      ...input.current_document,
+      markdown: input.current_document.markdown.replace(COMPLEX_PROSE, STILL_COMPLEX_PROSE),
+    }));
+
+    await new MilestoneFourOrchestrator(
+      repository,
+      fixture,
+      ineffective,
+      new MockCoherenceProvider("coherence-v1"),
+      repository,
+    ).run(run.run_id);
+
+    for (const audit of allAudits(repository))
+      // Every audit must agree with the bytes that actually persisted.
+      expect(audit.changed).toBe(audit.status === "applied");
+  });
+
+  it("replays the preflight from a checkpointed response without a second provider request", async () => {
+    const { repository, run } = await setup();
+    const current = (await repository.getDraft(run.run_id))!;
+    current.draft.markdown = current.draft.markdown.replace(
+      "## How a designer chair fits your room",
+      "## Choosing between seating options",
+    );
+    const provider = new MockRevisionProvider("revision-v1");
+    const make = (failures?: ConstructorParameters<typeof MilestoneFourOrchestrator>[5]) =>
+      new MilestoneFourOrchestrator(
+        repository,
+        fixture,
+        provider,
+        new MockCoherenceProvider("coherence-v1"),
+        repository,
+        failures,
+      );
+
+    let crash = true;
+    await expect(
+      make({
+        hit(boundary) {
+          if (crash && boundary === "after_revision_persist") {
+            crash = false;
+            throw new Error("crash after the preflight persisted");
+          }
+        },
+      }).run(run.run_id),
+    ).rejects.toThrow("crash after the preflight persisted");
+    const calls = provider.calls.length;
+
+    await make().run(run.run_id);
+    // The resumed run replays the checkpoint deterministically.
+    expect(provider.calls).toHaveLength(calls);
+    expect((await repository.getDraft(run.run_id))!.draft.markdown).toContain(
+      "## Choosing between seating options: designer chair",
+    );
+  });
+});
+
+/**
+ * `structure.faq_answer_length` is a per-FAQ blocker, so two short answers give
+ * two baseline blocker occurrences of ONE rule at two independent structured
+ * leaves.
+ *
+ * Every Step 1.9 disposition is rejected so the operator round is a no-op and
+ * the first `deterministic_repair` request carries BOTH blockers together —
+ * the shape that previously made the preflight skip proof altogether and leave
+ * an ineffective edit credited as `applied`.
+ */
+const SHORT_ANSWER_A = "Far too short an answer.";
+const SHORT_ANSWER_B = "Also much too short here.";
+const twoShortFaqs = {
+  ...draft,
+  faqs: [
+    { question: "Question 1", answer: SHORT_ANSWER_A },
+    { question: "Question 2", answer: SHORT_ANSWER_B },
+    { question: "Question 3", answer: words(40) },
+  ],
+};
+
+function withFaqAnswers(document: typeof draft, answers: Record<number, string>): typeof draft {
+  return {
+    ...document,
+    faqs: document.faqs.map((faq, index) =>
+      answers[index] === undefined ? faq : { ...faq, answer: answers[index]! },
+    ),
+  };
+}
+
+describe("preflight proof when several blockers share one rule", () => {
+  const runShared = async (transform: (document: typeof draft) => typeof draft) => {
+    const { repository, run } = await setup(productLink, twoShortFaqs);
+    for (const disposition of repository.dispositions) disposition.decision = "rejected";
+    const provider = new MockRevisionProvider("revision-v1", (input) =>
+      transform(input.current_document as typeof draft),
+    );
+    await new MilestoneFourOrchestrator(
+      repository,
+      fixture,
+      provider,
+      new MockCoherenceProvider("coherence-v1"),
+      repository,
+    ).run(run.run_id);
+    const requests = repository.revisionRequests.filter(
+      (item) => item.revision_source === "deterministic_repair",
+    );
+    return {
+      repository,
+      final: (await repository.getDraft(run.run_id))!.draft,
+      detail: await repository.getRunDetail(run.run_id),
+      sharedRuleRequest: requests[0],
+    };
+  };
+
+  /** Guards the premise: the first repair request really does carry both. */
+  const expectTwoSameRuleFindings = (request: RevisionRequest | undefined) => {
+    expect(request?.accepted_findings.map((finding) => finding.rule_reference)).toEqual([
+      "structure.faq_answer_length",
+      "structure.faq_answer_length",
+    ]);
+  };
+
+  it("credits the provable edit and reverts its ineffective same-rule sibling", async () => {
+    const { final, detail, repository, sharedRuleRequest } = await runShared((document) =>
+      withFaqAnswers(document, { 0: words(50), 1: "Still far too short indeed." }),
+    );
+    expectTwoSameRuleFindings(sharedRuleRequest);
+    // FAQ 1 was genuinely fixed and survives.
+    expect(final.faqs[0]!.answer.split(/\s+/).length).toBeGreaterThanOrEqual(40);
+    // FAQ 2's edit changed bytes but resolved nothing, so it never persisted.
+    expect(final.faqs[1]!.answer).toBe(SHORT_ANSWER_B);
+    expect(detail).toMatchObject({ status: "blocked", block_reason: "deterministic_blockers" });
+    const audits = allAudits(repository);
+    expect(
+      audits.filter(
+        (audit) =>
+          typeof audit.reason === "string" &&
+          /did not resolve its deterministic/.test(audit.reason),
+      ).length,
+    ).toBeGreaterThan(0);
+    // The provable sibling keeps a truthful applied audit in the same pass.
+    expect(audits.some((audit) => audit.status === "applied")).toBe(true);
+  });
+
+  it("credits both edits when both same-rule blockers are fixed", async () => {
+    const { final, detail, sharedRuleRequest } = await runShared((document) =>
+      withFaqAnswers(document, { 0: words(50), 1: words(52) }),
+    );
+    expectTwoSameRuleFindings(sharedRuleRequest);
+    expect(final.faqs[0]!.answer.split(/\s+/).length).toBeGreaterThanOrEqual(40);
+    expect(final.faqs[1]!.answer.split(/\s+/).length).toBeGreaterThanOrEqual(40);
+    expect(detail).toMatchObject({
+      status: "succeeded",
+      block_counts: { deterministic_blockers: 0 },
+    });
+  });
+
+  it("reverts both edits when neither same-rule blocker is fixed", async () => {
+    const { final, detail, repository, sharedRuleRequest } = await runShared((document) =>
+      withFaqAnswers(document, {
+        0: "Different but still short.",
+        1: "Also different, still short.",
+      }),
+    );
+    expectTwoSameRuleFindings(sharedRuleRequest);
+    expect(final.faqs[0]!.answer).toBe(SHORT_ANSWER_A);
+    expect(final.faqs[1]!.answer).toBe(SHORT_ANSWER_B);
+    expect(detail).toMatchObject({ status: "blocked" });
+    for (const audit of allAudits(repository))
+      expect(audit.changed).toBe(audit.status === "applied");
+  });
+});
+
+describe("revision operation identity", () => {
+  const identity = {
+    runId: "run-1",
+    documentVersionId: "version-1",
+    source: "deterministic_repair" as const,
+    findingIds: ["finding-a", "finding-b"],
+    provider: "mock-local",
+    model: "revision-v1",
+  };
+
+  it("is stable for unchanged inputs so a replay resumes the same operation", () => {
+    expect(revisionOperationId(identity)).toBe(revisionOperationId({ ...identity }));
+  });
+
+  it("binds the binding identity, so a binding change starts a new operation", () => {
+    const base = (...extra: string[]) =>
+      stableId(
+        "revision-operation",
+        identity.runId,
+        identity.documentVersionId,
+        identity.source,
+        ...identity.findingIds,
+        identity.provider,
+        identity.model,
+        REVISION_PROMPT_VERSION,
+        REVISION_PLANNING_VERSION,
+        ...extra,
+      );
+    // The real identity must include REVISION_BINDING_VERSION: a binding change
+    // moves which exact location each accepted finding authorises, so it cannot
+    // reuse a checkpoint captured under the previous binding.
+    expect(revisionOperationId(identity)).toBe(
+      base(REVISION_BINDING_VERSION, READABILITY_SELECTOR_VERSION, ""),
+    );
+    expect(revisionOperationId(identity)).not.toBe(base());
+    expect(revisionOperationId(identity)).not.toBe(
+      base(`${REVISION_BINDING_VERSION}-next`, READABILITY_SELECTOR_VERSION, ""),
+    );
+    // A different selected readability target set must fork a new operation, so
+    // an unchanged ineffective selection can never silently pay twice.
+    expect(revisionOperationId({ ...identity, readabilityTargets: "f1:3-3" })).not.toBe(
+      revisionOperationId({ ...identity, readabilityTargets: "f1:5-5" }),
+    );
+    expect(revisionOperationId({ ...identity, readabilityTargets: "f1:3-3" })).toBe(
+      revisionOperationId({ ...identity, readabilityTargets: "f1:3-3" }),
+    );
+  });
+
+  it("keeps a zero-finding no-op configuration-independent", () => {
+    const noop = { ...identity, findingIds: [] };
+    expect(revisionOperationId(noop)).toBe(
+      stableId("revision-operation", noop.runId, noop.documentVersionId, noop.source),
+    );
+    // A no-op has no provider operation, so provider/model/version churn must
+    // not fork its identity.
+    expect(revisionOperationId(noop)).toBe(
+      revisionOperationId({ ...noop, provider: "other", model: "other-model" }),
+    );
+  });
+});
+
+/**
+ * Multi-block readability correction.
+ *
+ * `style.readability_grade_8` is a whole-document rule, so one paragraph cannot
+ * move Grade 19.9 to Grade 8. One accepted readability finding therefore
+ * authorises several exact, non-contiguous prose blocks.
+ */
+const HARD_BLOCKS = [
+  "Consequently the extraordinarily sophisticated manufacturing methodology demonstrates considerable environmental responsibility whenever comparatively substantial quantities of internationally certified hardwood materials are systematically incorporated throughout the entire production infrastructure.",
+  "Furthermore the interdisciplinary collaboration between contemporary furniture designers and experienced upholstery specialists consistently generates remarkably distinctive configurations which accommodate increasingly unpredictable residential requirements without compromising fundamental ergonomic considerations.",
+  "Additionally the comprehensive evaluation of proportional relationships throughout an interior necessitates considerable deliberation regarding circulation, illumination and the psychological implications of substantial upholstered furnishings within comparatively confined domestic environments.",
+];
+const SIMPLE_BLOCKS = [
+  "A chair should fit your room. Pick a size that leaves space to walk. Test the seat height first.",
+  "Good makers use solid wood. They also use strong glue and screws. Ask how the frame is joined.",
+  "Think about light and flow. Keep paths clear. A big chair can crowd a small room, so measure it.",
+];
+
+const hardDraft = {
+  ...draft,
+  markdown: [
+    "# Designer chair guide",
+    "<!-- MOBELARIS_IMAGE:designer-chair -->",
+    `Designer chair ${words(38)}`,
+    "## Key Takeaways",
+    "- Fit matters",
+    "- Comfort matters",
+    "- Materials matter",
+    "## How a designer chair fits your room",
+    `Modern seating works with a [designer chair](${productLink.url}) when scale and use are clear.`,
+    ...HARD_BLOCKS,
+    "> Measure your room first.",
+    "## Conclusion",
+    "Choose a designer chair that fits the room, use and comfort needs.",
+  ].join("\n\n"),
+};
+
+/** Replaces each authorised hard block with simple prose. */
+const simplifier = (replace: (index: number) => string) =>
+  new MockRevisionProvider("revision-v1", (input) => ({
+    ...input.current_document,
+    markdown: HARD_BLOCKS.reduce(
+      (markdown, block, index) => markdown.replace(block, replace(index)),
+      input.current_document.markdown,
+    ),
+  }));
+
+async function runReadability(provider: MockRevisionProvider) {
+  // Keep the default Step 1.9 dispositions. Blanket-rejecting every finding
+  // would turn each rejected location into a binding exclusion covering the
+  // body prose, which is correct behaviour but not a realistic operator round.
+  const { repository, run } = await setup(productLink, hardDraft);
+  await new MilestoneFourOrchestrator(
+    repository,
+    fixture,
+    provider,
+    new MockCoherenceProvider("coherence-v1"),
+    repository,
+  ).run(run.run_id);
+  return {
+    repository,
+    run,
+    final: (await repository.getDraft(run.run_id))!.draft,
+    detail: await repository.getRunDetail(run.run_id),
+  };
+}
+
+describe("bounded multi-block readability correction", () => {
+  it("authorises several exact blocks and issues only application-owned block IDs", async () => {
+    const provider = simplifier((index) => SIMPLE_BLOCKS[index]!);
+    const { repository } = await runReadability(provider);
+    const readabilityRequest = provider.calls.find((call) =>
+      call.accepted_findings.some((finding) => finding.id.includes("::rb")),
+    );
+    expect(readabilityRequest).toBeDefined();
+    const ids = readabilityRequest!.accepted_findings.map((finding) => finding.id);
+    // Application-issued, ordered, one per authorised block.
+    expect(ids).toEqual(ids.map((_, index) => `${ids[0]!.split("::")[0]}::rb${index + 1}`));
+    expect(ids.length).toBeGreaterThan(1);
+    // Every issued block is an exact, non-contiguous source range.
+    const ranges = readabilityRequest!.accepted_findings.map((finding) => [
+      finding.location.line_start,
+      finding.location.line_end,
+    ]);
+    for (const [start, end] of ranges) {
+      expect(start).toBeDefined();
+      expect(end).toBe(start);
+    }
+    expect(new Set(ranges.map((range) => range[0])).size).toBe(ranges.length);
+    expect(repository.revisionRequests.length).toBeGreaterThan(0);
+  });
+
+  it("applies several non-contiguous replacements and reaches Grade 8, then exports", async () => {
+    const { final, detail, repository } = await runReadability(
+      simplifier((index) => SIMPLE_BLOCKS[index]!),
+    );
+    for (const [index, block] of HARD_BLOCKS.entries()) {
+      expect(final.markdown).not.toContain(block);
+      expect(final.markdown).toContain(SIMPLE_BLOCKS[index]!);
+    }
+    // Structure around the edits is untouched.
+    expect(final.markdown).toContain(`[designer chair](${productLink.url})`);
+    expect(final.markdown).toContain("<!-- MOBELARIS_IMAGE:designer-chair -->");
+    expect(final.markdown).toContain("## Conclusion");
+    expect(final.markdown).toContain(`Designer chair ${words(38)}`);
+    expect(detail).toMatchObject({
+      status: "succeeded",
+      block_counts: { deterministic_blockers: 0 },
+    });
+    expect(repository.exports).toHaveLength(1);
+  });
+
+  it("reverts every readability-owned block when the candidate stays above Grade 8", async () => {
+    // Simplifying only one of three blocks cannot move the document mean.
+    const { final, detail, repository } = await runReadability(
+      simplifier((index) => (index === 0 ? SIMPLE_BLOCKS[0]! : HARD_BLOCKS[index]!)),
+    );
+    for (const block of HARD_BLOCKS) expect(final.markdown).toContain(block);
+    expect(final.markdown).not.toContain(SIMPLE_BLOCKS[0]!);
+    expect(detail).toMatchObject({ status: "blocked", block_reason: "deterministic_blockers" });
+    expect(repository.exports).toHaveLength(0);
+    const reverted = allAudits(repository).filter(
+      (audit) =>
+        typeof audit.reason === "string" && /did not resolve its deterministic/.test(audit.reason),
+    );
+    expect(reverted.length).toBeGreaterThan(0);
+    for (const audit of reverted) expect(audit).toMatchObject({ status: "unable", changed: false });
+  });
+
+  it("keeps one truthful audit carrying every applied readability hunk", async () => {
+    const { repository } = await runReadability(simplifier((index) => SIMPLE_BLOCKS[index]!));
+    const readability = allAudits(repository).find(
+      (audit) => Array.isArray(audit.hunks) && (audit.hunks as unknown[]).length > 1,
+    );
+    expect(readability).toBeDefined();
+    expect(readability).toMatchObject({ status: "applied", changed: true });
+    // One audit, several exact hunks — never one broad span.
+    expect((readability!.hunks as Array<Record<string, number>>).length).toBe(HARD_BLOCKS.length);
+    for (const hunk of readability!.hunks as Array<Record<string, number>>)
+      expect(hunk.source_end).toBe(hunk.source_start);
+  });
+
+  it("replays a checkpointed readability response without a second provider request", async () => {
+    const { repository, run } = await setup(productLink, hardDraft);
+    const provider = simplifier((index) => SIMPLE_BLOCKS[index]!);
+    const make = (failures?: ConstructorParameters<typeof MilestoneFourOrchestrator>[5]) =>
+      new MilestoneFourOrchestrator(
+        repository,
+        fixture,
+        provider,
+        new MockCoherenceProvider("coherence-v1"),
+        repository,
+        failures,
+      );
+    const readabilityCalls = () =>
+      provider.calls.filter((call) =>
+        call.accepted_findings.some((finding) => finding.id.includes("::rb")),
+      );
+    let crash = true;
+    await expect(
+      make({
+        hit(boundary) {
+          // Crash only once the readability response itself is checkpointed,
+          // not on the earlier operator revision.
+          if (crash && boundary === "after_revision_provider" && readabilityCalls().length > 0) {
+            crash = false;
+            throw new Error("crash after the readability response was checkpointed");
+          }
+        },
+      }).run(run.run_id),
+    ).rejects.toThrow("crash after the readability response was checkpointed");
+    expect(readabilityCalls()).toHaveLength(1);
+
+    await make().run(run.run_id);
+    // The resumed run replays the checkpoint rather than paying again.
+    expect(readabilityCalls()).toHaveLength(1);
+    expect((await repository.getDraft(run.run_id))!.draft.markdown).toContain(SIMPLE_BLOCKS[0]!);
+  });
+
+  it("keeps ineffective readability spend bounded by the unchanged repair budget", async () => {
+    // Each Step 1.11 rerun mints fresh finding rows and each revision mints a
+    // new document version, so a later cycle is a genuinely new operation
+    // rather than a replay. The two-cycle budget — not the operation identity —
+    // is what bounds repeated ineffective selection, so assert that bound
+    // exactly rather than claiming a cross-cycle deduplication that does not
+    // exist.
+    const provider = simplifier((index) => (index === 0 ? SIMPLE_BLOCKS[0]! : HARD_BLOCKS[index]!));
+    const { detail } = await runReadability(provider);
+    expect(detail).toMatchObject({ status: "blocked", deterministic_repair_cycles: 2 });
+    const readabilityCalls = provider.calls.filter((call) =>
+      call.accepted_findings.some((finding) => finding.id.includes("::rb")),
+    );
+    expect(readabilityCalls.length).toBeGreaterThan(0);
+    expect(readabilityCalls.length).toBeLessThanOrEqual(2);
+    // Every attempt selected the same exact blocks, so none of them widened
+    // authority in search of a result.
+    const targetSets = new Set(
+      readabilityCalls.map((call) =>
+        call.accepted_findings
+          .map((finding) => `${finding.location.line_start}-${finding.location.line_end}`)
+          .join(","),
+      ),
+    );
+    expect(targetSets.size).toBe(1);
+  });
+});
+
+describe("exceptional authorisation replay is observation-only", () => {
+  it("leaves a blocked child completely untouched on same-key replay", async () => {
+    // Reach the cap with a readability blocker that stays unresolved, so the
+    // exceptional correction produces a direct child that remains blocked.
+    const { repository, run } = await setup(productLink, hardDraft);
+    const stubborn = simplifier((index) => (index === 0 ? SIMPLE_BLOCKS[0]! : HARD_BLOCKS[index]!));
+    await new MilestoneFourOrchestrator(
+      repository,
+      fixture,
+      stubborn,
+      new MockCoherenceProvider("coherence-v1"),
+      repository,
+    ).run(run.run_id);
+    const blocked = await repository.getRunDetail(run.run_id);
+    expect(blocked).toMatchObject({ status: "blocked", deterministic_repair_cycles: 2 });
+
+    const key = `exceptional:${run.run_id}:replay`;
+    const first = await repository.authoriseExceptionalCorrection({
+      run_id: run.run_id,
+      idempotency_key: key,
+      explicit_confirmation: true,
+    });
+    expect(first).toBe("authorised");
+    await new MilestoneFourOrchestrator(
+      repository,
+      fixture,
+      stubborn,
+      new MockCoherenceProvider("coherence-v1"),
+      repository,
+    )
+      .run(run.run_id)
+      .catch(() => undefined);
+
+    const before = {
+      detail: await repository.getRunDetail(run.run_id),
+      documents: repository.documentVersions.length,
+      operations: repository.revisionRequests.length,
+      calls: stubborn.calls.length,
+      version: (await repository.getDraft(run.run_id))!.version.id,
+      authorisations: repository.exceptionalCorrectionAuthorisations.length,
+    };
+    expect(before.detail.status).toBe("blocked");
+
+    // Replay the same key: observational only.
+    await expect(
+      repository.authoriseExceptionalCorrection({
+        run_id: run.run_id,
+        idempotency_key: key,
+        explicit_confirmation: true,
+      }),
+    ).resolves.toBe("replay");
+
+    const after = {
+      detail: await repository.getRunDetail(run.run_id),
+      documents: repository.documentVersions.length,
+      operations: repository.revisionRequests.length,
+      calls: stubborn.calls.length,
+      version: (await repository.getDraft(run.run_id))!.version.id,
+      authorisations: repository.exceptionalCorrectionAuthorisations.length,
+    };
+    expect(after.detail.status).toBe(before.detail.status);
+    expect(after.detail.current_step).toBe(before.detail.current_step);
+    expect(after.detail.block_reason).toBe(before.detail.block_reason);
+    expect(after.detail.deterministic_repair_cycles).toBe(
+      before.detail.deterministic_repair_cycles,
+    );
+    expect(after.documents).toBe(before.documents);
+    expect(after.operations).toBe(before.operations);
+    expect(after.calls).toBe(before.calls);
+    expect(after.version).toBe(before.version);
+    expect(after.authorisations).toBe(before.authorisations);
+    // No second exceptional action is offered.
+    expect(after.detail.exceptional_correction.available).toBe(false);
+  });
+});
+
+describe("coherence pre-dispatch ambiguity protection", () => {
+  const runToCoherence = async (
+    failures?: ConstructorParameters<typeof MilestoneFourOrchestrator>[5],
+    coherence = new MockCoherenceProvider("coherence-v1"),
+  ) => {
+    const { repository, run } = await setup();
+    const make = (hooks?: ConstructorParameters<typeof MilestoneFourOrchestrator>[5]) =>
+      new MilestoneFourOrchestrator(
+        repository,
+        fixture,
+        new MockRevisionProvider("revision-v1"),
+        coherence,
+        repository,
+        hooks,
+      );
+    return { repository, run, coherence, make, failures };
+  };
+
+  it("enforces the coherence checkpoint state machine and replay semantics", async () => {
+    const { repository, run } = await runToCoherence();
+    const current = (await repository.getDraft(run.run_id))!;
+    const lease = await repository.claimStep(
+      run.run_id,
+      "final_coherence_export",
+      "transition-test",
+    );
+    const requestFor = (operation_id: string) =>
+      CoherenceRequestSchema.parse({
+        operation_id,
+        run_id: run.run_id,
+        parent_document_version_id: current.version.id,
+        document_version_id: current.version.id,
+        revision_reason: "coherence_repair",
+        coherence_cycle: 0,
+        handoff,
+        parent_document: current.draft,
+        current_document: current.draft,
+        revision_audits: [],
+        deterministic_result_hash: "0".repeat(64),
+        reference_snapshots: [],
+        prompt: { template_id: "mobelaris.final_coherence", template_version: "test" },
+        model: "test-model",
+        temperature: 0,
+      });
+    const response = {
+      findings: [],
+      usage: { input_units: 0, output_units: 0, cost_micros: 0 },
+    };
+    const input = {
+      ...lease,
+      run_id: run.run_id,
+      operation_id: "coherence-transition-test",
+      document_version_id: current.version.id,
+      request: requestFor("coherence-transition-test"),
+    };
+
+    await expect(repository.beginCoherenceOperation(input)).resolves.toBeNull();
+    const staleInput = { ...input, token: "stale-coherence-token" };
+    await expect(repository.markCoherenceProviderInFlight(staleInput)).rejects.toThrow(
+      "Stale fencing token",
+    );
+    await expect(repository.checkpointCoherenceResponse({ ...input, response })).rejects.toThrow(
+      "requires an in-flight",
+    );
+    await expect(repository.beginCoherenceOperation(input)).resolves.toBeNull();
+
+    await repository.markCoherenceProviderInFlight(input);
+    await expect(
+      repository.checkpointCoherenceResponse({ ...staleInput, response }),
+    ).rejects.toThrow("Stale fencing token");
+    await expect(
+      repository.checkpointCoherenceResponse({ ...input, response }),
+    ).resolves.toBeUndefined();
+    await expect(
+      repository.checkpointCoherenceResponse({ ...input, response }),
+    ).resolves.toBeUndefined();
+    await expect(
+      repository.checkpointCoherenceResponse({
+        ...input,
+        response: { ...response, usage: { ...response.usage, output_units: 1 } },
+      }),
+    ).rejects.toThrow("Immutable coherence checkpoint conflict");
+    await expect(repository.beginCoherenceOperation(input)).resolves.toEqual(response);
+    await expect(repository.markCoherenceProviderInFlight(input)).rejects.toThrow(
+      "cannot start a provider call",
+    );
+    await expect(repository.releaseCoherenceProviderFailure(input)).rejects.toThrow(
+      "cannot be released",
+    );
+
+    const releasedInput = {
+      ...input,
+      operation_id: "coherence-transition-release-test",
+      request: requestFor("coherence-transition-release-test"),
+    };
+    await expect(repository.beginCoherenceOperation(releasedInput)).resolves.toBeNull();
+    await repository.markCoherenceProviderInFlight(releasedInput);
+    await repository.releaseCoherenceProviderFailure(releasedInput);
+    await expect(repository.beginCoherenceOperation(releasedInput)).resolves.toBeNull();
+    await expect(
+      repository.checkpointCoherenceResponse({ ...releasedInput, response }),
+    ).rejects.toThrow("requires an in-flight");
+  });
+
+  it("fails closed after a loss between the durable reservation and the response", async () => {
+    const { repository, run, coherence, make } = await runToCoherence();
+    let crash = true;
+    await expect(
+      make({
+        hit(boundary) {
+          if (crash && boundary === "after_coherence_reservation") {
+            crash = false;
+            throw new Error("crash after the coherence reservation committed");
+          }
+        },
+      }).run(run.run_id),
+    ).rejects.toThrow("crash after the coherence reservation committed");
+    expect(coherence.calls).toHaveLength(0);
+
+    // The reservation is durable, so a resume must not gamble on a second call.
+    await expect(make().run(run.run_id)).rejects.toThrow(/ambiguous/i);
+    expect(coherence.calls).toHaveLength(0);
+    expect(repository.exports).toHaveLength(0);
+    expect((await repository.getRunDetail(run.run_id)).status).toBe("retryable_failed");
+  });
+
+  it("makes exactly one provider call when the return is lost before checkpointing", async () => {
+    const { repository, run, coherence, make } = await runToCoherence();
+    let crash = true;
+    await expect(
+      make({
+        hit(boundary) {
+          if (crash && boundary === "after_coherence_provider_return") {
+            crash = false;
+            throw new Error("crash after the coherence provider returned");
+          }
+        },
+      }).run(run.run_id),
+    ).rejects.toThrow("crash after the coherence provider returned");
+    expect(coherence.calls).toHaveLength(1);
+
+    await expect(make().run(run.run_id)).rejects.toThrow(/ambiguous/i);
+    // Exactly one paid call, never two.
+    expect(coherence.calls).toHaveLength(1);
+    expect(repository.exports).toHaveLength(0);
+  });
+
+  it("replays a checkpointed coherence response with zero additional calls", async () => {
+    const { repository, run, coherence, make } = await runToCoherence();
+    let crash = true;
+    await expect(
+      make({
+        hit(boundary) {
+          if (crash && boundary === "after_coherence_provider") {
+            crash = false;
+            throw new Error("crash after the coherence response was checkpointed");
+          }
+        },
+      }).run(run.run_id),
+    ).rejects.toThrow("crash after the coherence response was checkpointed");
+    expect(coherence.calls).toHaveLength(1);
+    const usageBeforeReplay = repository.providerUsage.filter(
+      (usage) => usage.operation === "final_coherence_export",
+    );
+    // Usage is persisted with the recovered coherence outcome, not before it.
+    expect(usageBeforeReplay).toHaveLength(0);
+
+    await make().run(run.run_id);
+    expect(coherence.calls).toHaveLength(1);
+    const persistedUsage = repository.providerUsage.filter(
+      (usage) => usage.operation === "final_coherence_export",
+    );
+    expect(persistedUsage).toHaveLength(1);
+    expect(persistedUsage[0]).toMatchObject({
+      input_units: 80,
+      output_units: 20,
+      cost_micros: 100,
+    });
+    await make().run(run.run_id);
+    expect(
+      repository.providerUsage.filter((usage) => usage.operation === "final_coherence_export"),
+    ).toEqual(persistedUsage);
+    expect(repository.exports).toHaveLength(1);
+  });
+
+  it("still exports normally when nothing is lost", async () => {
+    const { repository, run, coherence, make } = await runToCoherence();
+    await make().run(run.run_id);
+    expect(coherence.calls).toHaveLength(1);
+    expect(repository.exports).toHaveLength(1);
+    expect((await repository.getRunDetail(run.run_id)).status).toBe("succeeded");
+  });
+});
+
+describe("exceptional authorisation idempotency contract", () => {
+  /** Drives a run to the two-cycle cap so an authorisation is eligible. */
+  const blockedRun = async () => {
+    const { repository, run } = await setup(productLink, hardDraft);
+    const provider = simplifier((index) => (index === 0 ? SIMPLE_BLOCKS[0]! : HARD_BLOCKS[index]!));
+    await new MilestoneFourOrchestrator(
+      repository,
+      fixture,
+      provider,
+      new MockCoherenceProvider("coherence-v1"),
+      repository,
+    ).run(run.run_id);
+    expect(await repository.getRunDetail(run.run_id)).toMatchObject({
+      status: "blocked",
+      deterministic_repair_cycles: 2,
+    });
+    return { repository, run, provider };
+  };
+
+  const snapshot = async (
+    repository: InMemoryMilestoneRepository,
+    runId: string,
+    provider: MockRevisionProvider,
+  ) => {
+    const detail = await repository.getRunDetail(runId);
+    return {
+      status: detail.status,
+      current_step: detail.current_step,
+      block_reason: detail.block_reason,
+      cycles: detail.deterministic_repair_cycles,
+      coherence_cycles: detail.coherence_return_cycles,
+      documents: repository.documentVersions.length,
+      version: (await repository.getDraft(runId))!.version.id,
+      operations: repository.revisionRequests.length,
+      calls: provider.calls.length,
+      authorisations: repository.exceptionalCorrectionAuthorisations.length,
+    };
+  };
+
+  it("authorises the first key on an eligible run", async () => {
+    const { repository, run } = await blockedRun();
+    await expect(
+      repository.authoriseExceptionalCorrection({
+        run_id: run.run_id,
+        idempotency_key: "key-a",
+        explicit_confirmation: true,
+      }),
+    ).resolves.toBe("authorised");
+  });
+
+  it("replays the same key on the same run without mutating anything", async () => {
+    const { repository, run, provider } = await blockedRun();
+    await repository.authoriseExceptionalCorrection({
+      run_id: run.run_id,
+      idempotency_key: "key-a",
+      explicit_confirmation: true,
+    });
+    const before = await snapshot(repository, run.run_id, provider);
+    await expect(
+      repository.authoriseExceptionalCorrection({
+        run_id: run.run_id,
+        idempotency_key: "key-a",
+        explicit_confirmation: true,
+      }),
+    ).resolves.toBe("replay");
+    expect(await snapshot(repository, run.run_id, provider)).toEqual(before);
+  });
+
+  it("conflicts on a different key for an already-authorised run, without mutating", async () => {
+    const { repository, run, provider } = await blockedRun();
+    await repository.authoriseExceptionalCorrection({
+      run_id: run.run_id,
+      idempotency_key: "key-a",
+      explicit_confirmation: true,
+    });
+    const before = await snapshot(repository, run.run_id, provider);
+    await expect(
+      repository.authoriseExceptionalCorrection({
+        run_id: run.run_id,
+        idempotency_key: "key-b",
+        explicit_confirmation: true,
+      }),
+    ).rejects.toThrow(/already has an exceptional authorisation/i);
+    expect(await snapshot(repository, run.run_id, provider)).toEqual(before);
+  });
+
+  it("conflicts when the same key is owned by another run, without mutating", async () => {
+    const first = await blockedRun();
+    const second = await blockedRun();
+    await first.repository.authoriseExceptionalCorrection({
+      run_id: first.run.run_id,
+      idempotency_key: "shared-key",
+      explicit_confirmation: true,
+    });
+    // Same repository instance, so the key is owned by the first run.
+    const before = await snapshot(first.repository, first.run.run_id, first.provider);
+    await expect(
+      first.repository.authoriseExceptionalCorrection({
+        run_id: second.run.run_id,
+        idempotency_key: "shared-key",
+        explicit_confirmation: true,
+      }),
+    ).rejects.toThrow(/Authorisation key conflict/i);
+    expect(await snapshot(first.repository, first.run.run_id, first.provider)).toEqual(before);
+  });
+});
+
+describe("readability authority equals its frozen block set", () => {
+  /** A sibling finding that owns the hardest paragraph outright. */
+  const siblingOn = (line: number): ReviewFinding & { id: string } =>
+    ({
+      id: `sibling-${line}`,
+      stable_key: `sibling-${line}`,
+      category: "style",
+      rule_reference: "style.banned_phrase_provisional",
+      severity: "warning",
+      location: { field: "body_markdown", line_start: line, line_end: line },
+      issue: "Sibling owns this paragraph.",
+      suggested_fix: "Revise it.",
+    }) as ReviewFinding & { id: string };
+
+  const readability = {
+    id: "readability",
+    stable_key: "readability",
+    category: "deterministic" as const,
+    rule_reference: "style.readability_grade_8",
+    severity: "blocker" as const,
+    location: { field: "body_markdown" },
+    issue: "Grade is too high.",
+    suggested_fix: "Simplify.",
+    disposition: "accepted" as const,
+    origin_document_version_id: "v1",
+  };
+
+  const bindWith = (siblingLines: number[]) =>
+    bindRevisionFindingsWithAuthority({
+      document: hardDraft,
+      primaryKeyword: handoff.primary_keyword,
+      findings: [
+        readability,
+        ...siblingLines.map((line) => ({
+          ...siblingOn(line),
+          disposition: "accepted" as const,
+          origin_document_version_id: "v1",
+        })),
+      ] as never,
+    });
+
+  it("moves the primary target to the next eligible paragraph when a sibling owns the hardest", () => {
+    const all = bindWith([]);
+    const blocks = all.readability_blocks.readability!;
+    expect(blocks.length).toBeGreaterThan(1);
+    const firstLine = blocks[0]!.line_start;
+
+    const reserved = bindWith([firstLine]);
+    const reservedBlocks = reserved.readability_blocks.readability!;
+    // The sibling's paragraph is gone from the frozen set...
+    expect(reservedBlocks.map((block) => block.line_start)).not.toContain(firstLine);
+    // ...and the primary location is the first block of that exact final set.
+    const primary = reserved.findings.find((finding) => finding.id === "readability")!;
+    expect(primary.location.line_start).toBe(reservedBlocks[0]!.line_start);
+    expect(reservedBlocks.map((block) => block.line_start)).toContain(primary.location.line_start);
+  });
+
+  it("leaves readability unbound and unable when siblings own every eligible paragraph", () => {
+    const all = bindWith([]);
+    const everyLine = all.readability_blocks.readability!.map((block) => block.line_start);
+    const reserved = bindWith(everyLine);
+    expect(reserved.readability_blocks.readability).toBeUndefined();
+    const primary = reserved.findings.find((finding) => finding.id === "readability")!;
+    expect(primary.location.line_start).toBeUndefined();
+    // With no exact authority the planner cannot route it to the provider.
+    const base = {
+      operation_id: "op",
+      run_id: "run",
+      document_version_id: "v1",
+      revision: 1,
+      handoff,
+      current_document: hardDraft,
+      accepted_findings: reserved.findings,
+      reference_snapshots: [],
+      prompt: { template_id: "mobelaris.revision_pass" as const, template_version: "2.0.0" },
+      model: "model",
+      temperature: 0,
+    };
+    const planned = planRevisionRequest(base as never);
+    expect(planned.find((item) => item.finding.id === "readability")?.route).toBe("unable");
+  });
+
+  it("produces the same complete selection for the exceptional route", () => {
+    const normal = bindWith([]).readability_blocks.readability!;
+    const bindings = bindExceptionalBlockers(hardDraft, handoff.primary_keyword, [
+      {
+        id: "readability",
+        rule_reference: "style.readability_grade_8",
+        location: readability.location,
+      },
+    ]);
+    expect(bindings).not.toBeNull();
+    expect(bindings![0]!.readability_blocks).toEqual(
+      normal.map((block) => ({ line_start: block.line_start, line_end: block.line_end })),
+    );
+    expect(bindings![0]!.location.line_start).toBe(normal[0]!.line_start);
   });
 });

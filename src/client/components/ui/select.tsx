@@ -56,7 +56,7 @@ function SelectContent({
         align={align}
         sideOffset={sideOffset}
         className={cn(
-          "z-60 max-h-(--radix-select-content-available-height) min-w-(--radix-select-trigger-width) max-w-[calc(100vw-2rem)] origin-(--radix-select-content-transform-origin) overflow-x-hidden overflow-y-auto rounded-field border border-rule bg-paper text-ink duration-[170ms] ease-[cubic-bezier(0.25,1,0.5,1)] data-[state=closed]:animate-out data-[state=closed]:fade-out-0 data-[state=open]:animate-in data-[state=open]:fade-in-0",
+          "z-60 max-h-(--radix-select-content-available-height) min-w-(--radix-select-trigger-width) max-w-[calc(100vw-2rem)] origin-(--radix-select-content-transform-origin) overflow-hidden rounded-field border border-rule bg-paper text-ink duration-[170ms] ease-[cubic-bezier(0.25,1,0.5,1)] data-[state=closed]:animate-out data-[state=closed]:fade-out-0 data-[state=open]:animate-in data-[state=open]:fade-in-0",
           className,
         )}
         {...props}

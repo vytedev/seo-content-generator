@@ -11,7 +11,9 @@ Step 1.2 uses the configured public XML sitemap as its credential-free baseline.
 - Traversal detects cycles and is bounded to depth 3, exactly 100 sitemap documents and `INTERNAL_LINK_MAX_SITEMAP_URLS` canonical page URLs. Exceeding any bound blocks discovery; results are never silently truncated.
 - Candidate verification repeats the exact-origin, public-DNS and pinned-connection checks. Only a direct HTTP 200 is eligible; HEAD falls back to a bounded GET only for 405/501.
 - Verification selection is deterministic and hierarchy-first, then uses topical/GSC pre-score and canonical URL. The 100-candidate verification bound therefore cannot displace a stronger conversion hierarchy. Evidence separately records candidates omitted by the bound and by the deadline; deadline omissions are unresolved and are never counted as attempted. Final ranking remains hierarchy-first and at most 25 links are persisted.
-- Cache entries expire after 24 hours. A stale result cannot satisfy eligibility.
+- Cache entries expire after 24 hours. A stale result cannot satisfy eligibility. Eligible and blocked outcomes commit their compare-and-swap cache write atomically with immutable attempt evidence, so a crash cannot leave negative evidence uncached or a cache entry without its run evidence.
+- A refresh requested while a ready, leased or retry-waiting queue job exists is stored as a separate durable continuation signal. It never mutates options already observed by a lease, repeated requests are idempotent, and the signal is consumed into one fresh continuation after the current fenced job settles.
+- Queue recovery coordinates with the longer Step 1.2 lease. An expired queue lease waits while the step fence remains live; this wait cannot consume the three-attempt failure budget, and stale workers cannot persist evidence, cache state or completion.
 
 ## Gate behaviour
 

@@ -122,6 +122,10 @@ describe("ChatCompletionDraftProvider construction", () => {
       "https://router.huggingface.co/v1/chat/completions",
       expect.anything(),
     );
+    const requestBody = JSON.parse(
+      (fetcher.mock.calls[0] as unknown as [string, { body: string }])[1].body,
+    );
+    expect(requestBody).not.toHaveProperty("reasoning");
   });
 });
 
@@ -154,6 +158,7 @@ describe("ChatCompletionDraftProvider.generate", () => {
       json_schema: { name: "mobelaris_draft_v1", strict: true },
     });
     expect(requestBody.provider).toEqual({ require_parameters: true });
+    expect(requestBody.reasoning).toEqual({ effort: "none", exclude: true });
   });
 
   it("fails explicitly when the provider reports token-limit truncation", async () => {
@@ -177,23 +182,12 @@ describe("ChatCompletionDraftProvider.generate", () => {
     expect(response.draft).toEqual(draft);
   });
 
-  it("succeeds on the single bounded corrective re-request after invalid JSON", async () => {
-    const draft = validDraft();
-    const fetcher = vi
-      .fn<() => Promise<Response>>()
-      .mockResolvedValueOnce(completion(wire("sorry, here is prose instead")))
-      .mockResolvedValueOnce(completion(wire(JSON.stringify(draft))));
-    const response = await makeProvider(fetcher).generate(validRequest());
-    expect(response.draft).toEqual(draft);
-    expect(fetcher).toHaveBeenCalledTimes(2);
-    const secondBody = JSON.parse(
-      (fetcher.mock.calls[1] as unknown as [{}, { body: string }])[1].body,
-    );
-    expect(
-      secondBody.messages.some((m: { content: string }) =>
-        /not a single valid JSON object/.test(m.content),
-      ),
-    ).toBe(true);
+  it("does not make a corrective paid request after invalid JSON", async () => {
+    const fetcher = vi.fn(async () => completion(wire("sorry, here is prose instead")));
+    await expect(makeProvider(fetcher).generate(validRequest())).rejects.toMatchObject({
+      code: "DRAFT_PROVIDER_UNPARSEABLE",
+    });
+    expect(fetcher).toHaveBeenCalledTimes(1);
   });
 
   it("throws a typed redacted error when all attempts return unparseable output", async () => {
@@ -202,26 +196,21 @@ describe("ChatCompletionDraftProvider.generate", () => {
       (error: unknown) => {
         expect(error).toBeInstanceOf(DraftProviderError);
         expect((error as DraftProviderError).code).toBe("DRAFT_PROVIDER_UNPARSEABLE");
-        expect((error as DraftProviderError).message).toMatch(
-          /unparseable output after 2 attempts/,
-        );
+        expect((error as DraftProviderError).message).toMatch(/no automatic second request/);
         expect((error as DraftProviderError).message).not.toContain(TOKEN);
         expect((error as DraftProviderError).message).not.toContain("definitely not json");
         return true;
       },
     );
-    expect(fetcher).toHaveBeenCalledTimes(2);
+    expect(fetcher).toHaveBeenCalledTimes(1);
   });
 
-  it("retries a 500 once and then succeeds", async () => {
-    const draft = validDraft();
-    const fetcher = vi
-      .fn<() => Promise<Response>>()
-      .mockResolvedValueOnce(new Response("upstream exploded", { status: 500 }))
-      .mockResolvedValueOnce(completion(wire(JSON.stringify(draft))));
-    const response = await makeProvider(fetcher).generate(validRequest());
-    expect(response.draft).toEqual(draft);
-    expect(fetcher).toHaveBeenCalledTimes(2);
+  it("does not retry an ambiguous 500 response", async () => {
+    const fetcher = vi.fn(async () => new Response("upstream exploded", { status: 500 }));
+    await expect(makeProvider(fetcher).generate(validRequest())).rejects.toMatchObject({
+      code: "DRAFT_PROVIDER_HTTP_STATUS",
+    });
+    expect(fetcher).toHaveBeenCalledTimes(1);
   });
 
   it("does not retry a 400 and throws a redacted error", async () => {

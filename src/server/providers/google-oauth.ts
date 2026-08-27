@@ -81,6 +81,10 @@ interface StoredVersion extends StoredGoogleTokens {
   version: number;
 }
 
+class UnreadableGoogleConnectionError extends GoogleOAuthError {}
+
+export type GoogleDisconnectOutcome = "disconnected" | "already_disconnected" | "local_only";
+
 export class GoogleTokenStore {
   constructor(
     private readonly pool: Pool,
@@ -111,6 +115,26 @@ export class GoogleTokenStore {
     operation: (current: StoredVersion | null, client: PoolClient) => Promise<T>,
   ) {
     return this.withLock(async (client) => operation(await this.loadFrom(client), client));
+  }
+
+  async disconnectSerialised(
+    operation: (current: StoredVersion, client: PoolClient) => Promise<void>,
+  ): Promise<GoogleDisconnectOutcome> {
+    return this.withLock(async (client) => {
+      let current: StoredVersion | null;
+      try {
+        current = await this.loadFrom(client);
+      } catch (error) {
+        if (!(error instanceof UnreadableGoogleConnectionError)) throw error;
+        // Revocation is impossible without readable token material. Preserve the append-only
+        // history and clear only the unusable local connection while still holding the lock.
+        await this.tombstoneSerialised(client);
+        return "local_only";
+      }
+      if (!current) return "already_disconnected";
+      await operation(current, client);
+      return "disconnected";
+    });
   }
 
   async saveSerialised(client: PoolClient, tokens: StoredGoogleTokens): Promise<void> {
@@ -170,7 +194,9 @@ export class GoogleTokenStore {
         scope: parsed.scope,
       };
     } catch {
-      throw new GoogleOAuthError("The stored Google connection could not be read safely.");
+      throw new UnreadableGoogleConnectionError(
+        "The stored Google connection could not be read safely.",
+      );
     }
   }
 
@@ -262,9 +288,8 @@ export class GoogleOAuthClient {
     });
   }
 
-  async disconnect(): Promise<void> {
-    await this.store.serialised(async (stored, client) => {
-      if (!stored) return;
+  async disconnect(): Promise<GoogleDisconnectOutcome> {
+    return this.store.disconnectSerialised(async (stored, client) => {
       const token = stored.refreshToken ?? stored.accessToken;
       let response: Response;
       try {

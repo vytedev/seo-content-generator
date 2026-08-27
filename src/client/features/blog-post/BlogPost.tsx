@@ -5,6 +5,7 @@ import { PageHeader } from "../../components/PageHeader.js";
 import { Button } from "../../components/ui/button.js";
 import { fetchRecentRuns } from "../../lib/run-list-api.js";
 import { apiFetch } from "../../lib/api.js";
+import { reportClientFailure } from "../../lib/diagnostics.js";
 import { parseRunDetailResponse, resumeEndpoint, resumeRequest } from "../../lib/run-detail-api.js";
 import { FindingsReview } from "../findings/FindingsReview.js";
 import { NewRun } from "../runs/NewRun.js";
@@ -251,7 +252,9 @@ export function BlogPost() {
             : resumeEndpoint(focusRunId, detail.current_step);
     try {
       const response = await apiFetch(path, {
-        ...(kind === "resume" ? resumeRequest(detail.current_step) : { method: "POST" }),
+        ...(kind === "resume"
+          ? resumeRequest(detail.current_step, detail.draft_recovery)
+          : { method: "POST" }),
         ...(kind === "exceptional-correction"
           ? {
               headers: { "Content-Type": "application/json" },
@@ -273,13 +276,11 @@ export function BlogPost() {
     } catch (error) {
       const message = error instanceof Error ? error.message : "The action could not be completed.";
       setActionError(message);
-      // Safe diagnostics only: no request body, document content, prompts or credentials.
-      console.error("[pipeline.action_failed]", {
-        runId: focusRunId,
-        step: detail.current_step,
-        action: kind,
-        endpoint: path,
-        message,
+      reportClientFailure("pipeline.action.failed", {
+        run_id: focusRunId,
+        ...(detail.current_step ? { step: detail.current_step } : {}),
+        category: "client",
+        reason_code: "action_failed",
       });
     } finally {
       // Reconcile once more after any successful or failed action response.

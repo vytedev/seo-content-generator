@@ -1,6 +1,7 @@
 import { createHash, randomBytes, timingSafeEqual } from "node:crypto";
 import type { Express, Request, Response } from "express";
 import { z } from "zod";
+import { logger } from "../logger.js";
 import type { GoogleOAuthClient, GoogleTokenStore } from "../providers/google-oauth.js";
 
 const callbackSchema = z.object({ code: z.string().min(1), state: z.string().min(1) });
@@ -84,7 +85,14 @@ export function registerGoogleOAuthRoutes(app: Express, service: GoogleOAuthRout
   app.delete("/api/integrations/google", async (_request, response, next) => {
     if (!service.configured || !service.client) return unavailable(response);
     try {
-      await service.client.disconnect();
+      const outcome = await service.client.disconnect();
+      if (outcome === "local_only") {
+        logger.warn("google_oauth.disconnect_local_only", {
+          provider: "google",
+          outcome: "local_connection_cleared_without_remote_revoke",
+          reason_code: "stored_connection_unreadable",
+        });
+      }
       response.status(204).end();
     } catch (error) {
       next(error);

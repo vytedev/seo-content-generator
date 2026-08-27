@@ -12,6 +12,7 @@ import {
 import {
   REVIEW_STEPS,
   PersistedReviewFindingSchema,
+  PersistedReviewResponseSchema,
   ReviewResponseSchema,
   mapDeterministicInput,
   type DeterministicFixture,
@@ -23,10 +24,12 @@ import type { PipelineStepId } from "../../shared/pipeline.js";
 import type { ReviewProvider } from "../providers/review-provider.js";
 import { NoNetworkFactVerifier, type FactVerifier } from "../providers/fact-verifier.js";
 import { withHeartbeat } from "./lease-heartbeat.js";
+import { classifyError, logger } from "../logger.js";
 
 export type MilestoneThreeFailureBoundary =
   | "after_reference_snapshot"
   | "after_deterministic_persist"
+  | "after_review_begin"
   | "after_review_provider"
   | "after_review_persist"
   | "after_wait";
@@ -202,36 +205,86 @@ export class MilestoneThreeOrchestrator {
           temperature: 0,
           model: this.reviews.model,
         };
-        const providerResponse = ReviewResponseSchema.parse(
-          // Model reviews can legitimately exceed the lease interval; renew
-          // the fencing lease while the provider call is genuinely in flight.
-          await withHeartbeat(this.repository, lease, () => this.reviews.review(request)),
-        );
-        const response =
-          step === "review_fact_checking"
-            ? await withHeartbeat(this.repository, lease, async () => {
-                // The model contributes optional advisories only. The verifier builds the
-                // complete app-owned claims/sources table from the full inventory.
-                const verified = await this.factVerifier.verify(request, providerResponse);
-                return ReviewResponseSchema.parse(verified);
-              })
-            : step === "review_link_conversion" && linkAudit
-              ? ReviewResponseSchema.parse({
-                  ...providerResponse,
-                  findings: [...linkAudit.findings, ...providerResponse.findings],
-                })
-              : providerResponse;
-        await this.failures?.hit("after_review_provider");
-        await this.repository.saveReview(
-          runId,
-          draft.version.id,
-          lease.execution_id,
-          lease.token,
+        const operation = await this.repository.beginReviewOperation({
+          run_id: runId,
+          document_version_id: draft.version.id,
+          execution_id: lease.execution_id,
+          token: lease.token,
           step,
           request,
-          {
-            ...response,
-            findings: response.findings.map((finding) => ({
+          provider: this.reviews.provider,
+          model: this.reviews.model,
+        });
+        await this.failures?.hit("after_review_begin");
+        let response = operation.response;
+        if (response) {
+          logger.info("provider.replayed", {
+            run_id: runId,
+            operation_id: operation.operation_id,
+            provider: this.reviews.provider,
+            context: "review",
+            step,
+            replayed: true,
+          });
+        }
+        if (!response) {
+          logger.info("provider.reserved", {
+            run_id: runId,
+            operation_id: operation.operation_id,
+            provider: this.reviews.provider,
+            context: "review",
+            step,
+            state: "reserved",
+          });
+          // The committed reservation makes every post-dispatch crash ambiguous rather than
+          // silently spending again. A validated checkpoint is replayed without provider recall.
+          await this.repository.markReviewProviderInFlight({
+            run_id: runId,
+            execution_id: lease.execution_id,
+            token: lease.token,
+            operation_id: operation.operation_id,
+          });
+          logger.info("provider.dispatch_started", {
+            run_id: runId,
+            operation_id: operation.operation_id,
+            provider: this.reviews.provider,
+            context: "review",
+            step,
+          });
+          let rawProviderResponse: Awaited<ReturnType<ReviewProvider["review"]>>;
+          try {
+            rawProviderResponse = await withHeartbeat(this.repository, lease, () =>
+              this.reviews.review(request),
+            );
+          } catch (error) {
+            logger.warn("provider.dispatch_failed", {
+              run_id: runId,
+              operation_id: operation.operation_id,
+              provider: this.reviews.provider,
+              context: "review",
+              step,
+              ...classifyError(error),
+            });
+            throw error;
+          }
+          logger.info("provider.returned", {
+            run_id: runId,
+            operation_id: operation.operation_id,
+            provider: this.reviews.provider,
+            context: "review",
+            step,
+          });
+          const providerResponse = ReviewResponseSchema.parse(rawProviderResponse);
+          const reviewed =
+            step === "review_fact_checking"
+              ? await withHeartbeat(this.repository, lease, async () => {
+                  const verified = await this.factVerifier.verify(request, providerResponse);
+                  return ReviewResponseSchema.parse(verified);
+                })
+              : providerResponse;
+          response = {
+            ...reviewed,
+            findings: reviewed.findings.map((finding) => ({
               ...finding,
               hard_flag:
                 step === "review_fact_checking" &&
@@ -241,10 +294,60 @@ export class MilestoneThreeOrchestrator {
                     JSON.stringify(item.location) === JSON.stringify(finding.location),
                 ),
             })),
-          },
+          };
+          logger.info("provider.response_validated", {
+            run_id: runId,
+            operation_id: operation.operation_id,
+            provider: this.reviews.provider,
+            context: "review",
+            step,
+          });
+          await this.failures?.hit("after_review_provider");
+          await this.repository.checkpointReviewResponse({
+            run_id: runId,
+            execution_id: lease.execution_id,
+            token: lease.token,
+            operation_id: operation.operation_id,
+            response,
+          });
+          logger.info("provider.checkpointed", {
+            run_id: runId,
+            operation_id: operation.operation_id,
+            provider: this.reviews.provider,
+            context: "review",
+            step,
+          });
+        }
+        const checkpointResponse = response;
+        const finalResponse =
+          step === "review_link_conversion" && linkAudit
+            ? PersistedReviewResponseSchema.parse({
+                ...checkpointResponse,
+                findings: [
+                  ...linkAudit.findings.map((finding) => ({ ...finding, hard_flag: false })),
+                  ...checkpointResponse.findings,
+                ],
+              })
+            : checkpointResponse;
+        await this.repository.saveReview(
+          runId,
+          draft.version.id,
+          lease.execution_id,
+          lease.token,
+          step,
+          request,
+          finalResponse,
           this.reviews.provider,
           this.reviews.model,
+          step === "review_link_conversion" ? checkpointResponse : undefined,
         );
+        logger.info("provider.persistence_completed", {
+          run_id: runId,
+          operation_id: operation.operation_id,
+          provider: this.reviews.provider,
+          context: "review",
+          step,
+        });
         await this.failures?.hit("after_review_persist");
       } else {
         throw new Error("Step output belongs to another producing attempt");

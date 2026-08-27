@@ -15,6 +15,7 @@ import {
   type PipelineStepId,
 } from "./pipeline.js";
 import { decideIdempotency, hashIdempotencyInput } from "./worker-contracts.js";
+import type { QueueOptions } from "./queue.js";
 import {
   IngestResultSchema,
   IngestWarningSchema,
@@ -72,6 +73,8 @@ export interface IngestStore {
     handoff: Handoff,
     warnings: IngestResult["warnings"],
   ): Promise<IngestResult>;
+  /** Atomic with ingest in PostgreSQL; replay never creates a second active job. */
+  enqueueRun?(runId: string, options?: QueueOptions): Promise<void>;
 }
 
 export interface SerpCompositionProbe {
@@ -233,6 +236,23 @@ export const DraftProviderResponseSchema = z
   .strict();
 export type DraftProviderResponse = z.infer<typeof DraftProviderResponseSchema>;
 
+export interface DraftOperationIdentity {
+  operation_id: string;
+  run_id: string;
+  request_hash: string;
+  provider: string;
+  model: string;
+  contract_identity: string;
+  purpose: "initial" | "legacy_operator_recovery";
+}
+
+export interface DraftOperationCommand {
+  run_id: string;
+  execution_id: string;
+  token: string;
+  identity: DraftOperationIdentity;
+}
+
 export const ProviderUsageSchema = z
   .object({
     id: text,
@@ -257,13 +277,19 @@ export interface MilestoneRepository extends IngestStore {
     runId: string,
     step: PipelineStepId,
     owner: string,
+    replaySucceeded?: boolean,
   ): Promise<{ execution_id: string; token: string }>;
   /** Extends a live lease by the configured duration; false when no longer held. */
   heartbeatStep(executionId: string, token: string): Promise<boolean>;
   /** Operator stop: cancels a running run and revokes its in-flight leases. */
   cancelRun(runId: string): Promise<void>;
-  completeStep(executionId: string, token: string): Promise<void>;
-  failStep(executionId: string, token: string, error: string): Promise<void>;
+  completeStep(executionId: string, token: string, preserveRunProgress?: boolean): Promise<void>;
+  failStep(
+    executionId: string,
+    token: string,
+    error: string,
+    preserveRunProgress?: boolean,
+  ): Promise<void>;
   /** Appends safe Step 1.2 evidence without freezing an ineligible empty shortlist. */
   saveLinkDiscoveryEvidence(
     runId: string,
@@ -291,14 +317,32 @@ export interface MilestoneRepository extends IngestStore {
     artifact: ArtifactRecord;
     version: DocumentVersionRecord;
   } | null>;
+  /** Creates/replays the repository-derived immutable Step 1.3 identity. */
+  beginDraftOperation(input: {
+    run_id: string;
+    execution_id: string;
+    token: string;
+    request: DraftProviderRequest;
+    provider: string;
+    model: string;
+    contract_identity: string;
+    purpose: "initial" | "legacy_operator_recovery";
+    operator_authorised: boolean;
+  }): Promise<{ identity: DraftOperationIdentity; response: DraftProviderResponse | null }>;
+  markDraftProviderInFlight(input: DraftOperationCommand): Promise<void>;
+  /** Narrow release for a provider failure proven to have occurred before HTTP dispatch. */
+  releaseDraftProviderFailure(input: DraftOperationCommand): Promise<void>;
+  checkpointDraftResponse(
+    input: DraftOperationCommand & {
+      response: DraftProviderResponse;
+    },
+  ): Promise<void>;
   saveDraft(
     runId: string,
     executionId: string,
     token: string,
     response: DraftProviderResponse,
-    provider: string,
-    model: string,
-    request?: DraftProviderRequest,
+    operation: DraftOperationIdentity,
   ): Promise<{ draft: StructuredDraft; artifact: ArtifactRecord; version: DocumentVersionRecord }>;
 }
 
@@ -318,6 +362,37 @@ export function canonicalHash(value: unknown): string {
 }
 export function stableId(namespace: string, ...values: string[]): string {
   return `${namespace}_${sha256(values.join("\u0000")).slice(0, 24)}`;
+}
+
+export function deriveDraftOperationIdentity(input: {
+  run_id: string;
+  request: DraftProviderRequest;
+  provider: string;
+  model: string;
+  contract_identity: string;
+  purpose: DraftOperationIdentity["purpose"];
+}): DraftOperationIdentity {
+  const provider = input.provider.trim();
+  const model = input.model.trim();
+  const request = DraftProviderRequestSchema.parse(input.request);
+  if (!provider || !model || !input.contract_identity.trim())
+    throw new Error("Draft operation identity fields are required");
+  const request_hash = canonicalHash({
+    request,
+    provider,
+    model,
+    contract_identity: input.contract_identity,
+    purpose: input.purpose,
+  });
+  return {
+    operation_id: stableId("draft-operation", input.run_id, request_hash),
+    run_id: input.run_id,
+    request_hash,
+    provider,
+    model,
+    contract_identity: input.contract_identity,
+    purpose: input.purpose,
+  };
 }
 export function assertMilestoneStep(value: string): PipelineStepId {
   return PipelineStepIdSchema.parse(value);
