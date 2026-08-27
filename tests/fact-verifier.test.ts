@@ -138,6 +138,48 @@ describe("credential-free Step 1.7 storefront verifier", () => {
     });
   });
 
+  it("fetches locale-prefixed flat products and verifies matching storefront evidence", async () => {
+    const candidate = "https://www.mobelaris.com/en/style-charles-eames-dining-chair";
+    const fetcher = pinned({
+      "/en/style-charles-eames-dining-chair": product(),
+    });
+    const result = await verifier(candidates(candidate), fetcher).verify(
+      { ...request, fact_inventory: [items[0]!] },
+      review,
+    );
+
+    expect(fetcher).toHaveBeenCalledOnce();
+    expect(result.claims[0]?.status).toBe("verified");
+    expect(result.sources[0]?.uri).toBe(candidate);
+  });
+
+  it("fetches only canonical, same-origin, query-free product candidates", async () => {
+    const valid = "https://www.mobelaris.com/products/eames-chair";
+    const fetcher = pinned({ "/products/eames-chair": product() });
+    const result = await verifier(
+      candidates(
+        valid,
+        "https://evil.example/products/eames-chair",
+        "https://www.mobelaris.com/products/eames-chair?colour=red",
+        "https://www.mobelaris.com/en/style-eames-chair#details",
+        "https://www.mobelaris.com/en",
+        "https://www.mobelaris.com/en/about",
+        "https://www.mobelaris.com/products/eames-chair/details",
+        "https://www.mobelaris.com/collections/eames-chair",
+        "https://www.mobelaris.com/designers/eames",
+        "https://www.mobelaris.com/categories/chairs",
+        "https://www.mobelaris.com/editorial/eames-chair",
+        "https://www.mobelaris.com/blog/eames-chair",
+        "https://www.mobelaris.com/products/%E0%A4%A",
+        "https://www.mobelaris.com/products/eames%2Fchair",
+      ),
+      fetcher,
+    ).verify({ ...request, fact_inventory: [items[0]!] }, review);
+
+    expect(fetcher).toHaveBeenCalledOnce();
+    expect(result.claims[0]?.status).toBe("verified");
+  });
+
   it("extracts Product JSON-LD object, array and @graph plus visible labelled values", async () => {
     const variants = [
       `<script type="application/ld+json">${JSON.stringify({ "@type": "Product", name: "Alpha Chair", sku: "alpha", material: "Oak" })}</script>`,

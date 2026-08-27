@@ -91,7 +91,7 @@ In Google Cloud:
 7. Register this authorised redirect URI exactly:
 
 ```text
-http://127.0.0.1:3100/api/integrations/google/callback
+http://127.0.0.1:3110/api/integrations/google/callback
 ```
 
 Add the client values to the local `.env`:
@@ -99,7 +99,7 @@ Add the client values to the local `.env`:
 ```dotenv
 GOOGLE_OAUTH_CLIENT_ID=replace-with-client-id
 GOOGLE_OAUTH_CLIENT_SECRET=replace-with-client-secret
-GOOGLE_OAUTH_REDIRECT_URI=http://127.0.0.1:3100/api/integrations/google/callback
+GOOGLE_OAUTH_REDIRECT_URI=http://127.0.0.1:3110/api/integrations/google/callback
 ```
 
 Generate a new token-encryption key for this installation:
@@ -151,7 +151,7 @@ Open:
 http://127.0.0.1:5173
 ```
 
-The API runs at `http://127.0.0.1:3100`. Sign in with the operator credentials created by `npm run auth:setup`.
+The API runs at `http://127.0.0.1:3110`. Sign in with the operator credentials created by `npm run auth:setup`.
 
 For a local built run:
 
@@ -173,6 +173,14 @@ npm run db:generate
 npm run format:check
 git diff --check
 ```
+
+PostgreSQL integration suites are intentionally opt-in. To run them, create a separate disposable local test database and provide its URL only for the test command:
+
+```bash
+TEST_DATABASE_URL=postgresql://LOCAL_USER:LOCAL_PASSWORD@127.0.0.1:LOCAL_PORT/mm0301_test npm test
+```
+
+The integration helpers reset their fixtures. Never point `TEST_DATABASE_URL` at the normal local operator database, a shared database or the deployed database. Do not copy a deployed `.env` to obtain it. Remove the disposable database/container after verification.
 
 Before spending model credit or exporting a real document, verify:
 

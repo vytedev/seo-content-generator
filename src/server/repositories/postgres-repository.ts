@@ -1,6 +1,8 @@
 import { randomUUID } from "node:crypto";
 import { z } from "zod";
 import { FindingLocationSchema } from "../../shared/checker/index.js";
+import { revisionBindingExclusions } from "../../shared/revision-planning.js";
+import type { FindingLocation } from "../../shared/revision-application.js";
 import {
   bindExceptionalBlockers,
   ExceptionalBlockerBindingSchema,
@@ -14,7 +16,7 @@ import {
   type RunListPage,
   type RunListQuery,
 } from "../../shared/contracts/run-list.js";
-import { logger } from "../logger.js";
+import { classifyError, logger } from "../logger.js";
 import {
   DeterministicManifestSchema,
   DeterministicRunResultSchema,
@@ -77,6 +79,7 @@ import {
   type BulkDisposition,
   type FindingRecord,
   type MilestoneThreeRepository,
+  type PersistedReviewResponse,
   type ReferenceSnapshot,
   type ReviewFinding,
   type ReviewRequest,
@@ -92,13 +95,18 @@ import {
   LiveInternalLinkSchema,
   LinkDiscoveryMetadataSchema,
   canonicalHash,
+  stableId,
+  deriveDraftOperationIdentity,
   linkCandidateProvenance,
   contentHash,
+  type DraftOperationCommand,
+  type DraftOperationIdentity,
   type DraftProviderResponse,
   type IngestResult,
   type InternalLink,
   type MilestoneRepository,
 } from "../../shared/milestone-two.js";
+import { QueueOptionsSchema, type QueueLease, type QueueOptions } from "../../shared/queue.js";
 
 function projectEvidenceSource(row: any) {
   const snapshot = row.snapshot as Record<string, unknown> | null;
@@ -157,6 +165,29 @@ export function assertImmutableSourceMatches(
   )
     throw new Error("Immutable source conflict");
 }
+
+const authorisedReadabilityFromBindings = (
+  bindings: ReadonlyArray<{
+    finding_id: string;
+    readability_blocks?: Array<{ line_start: number; line_end: number }> | undefined;
+    selector_version?: string | undefined;
+    target_set_identity?: string | undefined;
+  }>,
+) =>
+  Object.fromEntries(
+    bindings
+      .filter((binding) => binding.readability_blocks?.length)
+      .map((binding) => [
+        binding.finding_id,
+        {
+          blocks: binding.readability_blocks!,
+          ...(binding.selector_version ? { selector_version: binding.selector_version } : {}),
+          ...(binding.target_set_identity
+            ? { target_set_identity: binding.target_set_identity }
+            : {}),
+        },
+      ]),
+  );
 
 export class PostgresMilestoneRepository
   implements MilestoneRepository, MilestoneThreeRepository, MilestoneFourRepository
@@ -241,6 +272,7 @@ export class PostgresMilestoneRepository
         values($1,$2,'ingest_result','application/json',$3,$4,$5)`,
         [runId, executionId, body, contentHash(body), Buffer.byteLength(body)],
       );
+      await this.enqueueRunClient(client, runId, {});
       return { run_id: runId, input_hash: inputHash, handoff, warnings };
     });
   }
@@ -267,7 +299,7 @@ export class PostgresMilestoneRepository
     );
     return result.rowCount === 1;
   }
-  async claimStep(runId: string, step: PipelineStepId, owner: string) {
+  async claimStep(runId: string, step: PipelineStepId, owner: string, replaySucceeded = false) {
     return this.transaction(async (client) => {
       await client.query("select id from runs where id=$1 for update", [runId]);
       const latest = await client.query<{
@@ -292,7 +324,8 @@ export class PostgresMilestoneRepository
           "select current_step from runs where id=$1",
           [runId],
         );
-        if (current.rows[0]?.current_step !== step) throw new Error("Step already succeeded");
+        if (!replaySucceeded && current.rows[0]?.current_step !== step)
+          throw new Error("Step already succeeded");
         row = (
           await client.query(
             `insert into step_executions(run_id,step,attempt,status) values($1,$2,$3,'queued') returning id,attempt,status,lease_expires_at`,
@@ -337,10 +370,11 @@ export class PostgresMilestoneRepository
         [execution.id, token],
       );
       if (!started.rows[0]?.started) throw new Error("Could not start fenced execution");
-      await client.query(
-        "update runs set status='running',current_step=$2,block_reason=null,updated_at=clock_timestamp() where id=$1",
-        [runId, step],
-      );
+      if (!replaySucceeded)
+        await client.query(
+          "update runs set status='running',current_step=$2,block_reason=null,updated_at=clock_timestamp() where id=$1",
+          [runId, step],
+        );
       logger.info("step.started", { run_id: runId, step, attempt: execution.attempt });
       return { execution_id: execution.id, token };
     });
@@ -365,11 +399,16 @@ export class PostgresMilestoneRepository
       );
       const row = run.rows[0];
       if (!row) throw new NotFoundError("The run was not found.");
-      if (row.status !== "running")
-        throw new ConflictError("Only a running blog post can be stopped.");
+      if (!new Set(["queued", "running", "retryable_failed", "waiting", "blocked"]).has(row.status))
+        throw new ConflictError("Only an active or operator-paused blog post can be stopped.");
       await client.query(
         `update step_executions set status='cancelled',lease_token=null,lease_owner=null,lease_expires_at=null,updated_at=clock_timestamp()
          where run_id=$1 and status in ('running','leased')`,
+        [runId],
+      );
+      await client.query(
+        `update pipeline_queue_jobs set state='cancelled',lease_token=null,lease_owner=null,lease_expires_at=null,updated_at=clock_timestamp()
+         where run_id=$1 and state in ('ready','leased','retry_wait','parked','operator_action')`,
         [runId],
       );
       await client.query(
@@ -379,7 +418,11 @@ export class PostgresMilestoneRepository
       logger.warn("run.cancelled", { run_id: runId });
     });
   }
-  async completeStep(executionId: string, token: string): Promise<void> {
+  async completeStep(
+    executionId: string,
+    token: string,
+    preserveRunProgress = false,
+  ): Promise<void> {
     await this.transaction(async (client) => {
       const row = await client.query<{ run_id: string; step: PipelineStepId }>(
         "select run_id,step from step_executions where id=$1 for update",
@@ -409,10 +452,11 @@ export class PostgresMilestoneRepository
       ];
       const index = order.indexOf(value.step);
       const next = order[Math.min(index + 1, order.length - 1)]!;
-      await client.query(
-        "update runs set status='running',current_step=$2,block_reason=null,updated_at=clock_timestamp() where id=$1",
-        [value.run_id, next],
-      );
+      if (!preserveRunProgress)
+        await client.query(
+          "update runs set status='running',current_step=$2,block_reason=null,updated_at=clock_timestamp() where id=$1",
+          [value.run_id, next],
+        );
       logger.info("step.completed", {
         run_id: value.run_id,
         step: value.step,
@@ -420,7 +464,12 @@ export class PostgresMilestoneRepository
       });
     });
   }
-  async failStep(executionId: string, token: string, error: string): Promise<void> {
+  async failStep(
+    executionId: string,
+    token: string,
+    error: string,
+    preserveRunProgress = false,
+  ): Promise<void> {
     const safeError = this.safeFailureMessage(error);
     await this.transaction(async (client) => {
       const row = await client.query<{ run_id: string; step: PipelineStepId; status: string }>(
@@ -440,14 +489,15 @@ export class PostgresMilestoneRepository
       );
       const value = row.rows[0];
       if (!value) throw new Error("Unknown execution");
-      await client.query(
-        "update runs set status='retryable_failed',current_step=$2,block_reason=null,updated_at=clock_timestamp() where id=$1",
-        [value.run_id, value.step],
-      );
+      if (!preserveRunProgress)
+        await client.query(
+          "update runs set status='retryable_failed',current_step=$2,block_reason=null,updated_at=clock_timestamp() where id=$1",
+          [value.run_id, value.step],
+        );
       logger.warn("step.failed", {
         run_id: value.run_id,
         step: value.step,
-        error: safeError,
+        ...classifyError(error),
       });
     });
   }
@@ -460,6 +510,7 @@ export class PostgresMilestoneRepository
     const parsed = LinkDiscoveryMetadataSchema.parse(metadata);
     await this.transaction(async (client) => {
       await this.assertFence(client, runId, executionId, token);
+      if (parsed.cacheWrite) await this.applyLinkDiscoveryCacheWrite(client, parsed);
       const body = JSON.stringify(parsed);
       await client.query(
         `insert into link_discovery_attempts(run_id,step_execution_id,eligibility,reason,source_health,counts,cache_state,identity,metadata,metadata_hash)
@@ -480,6 +531,51 @@ export class PostgresMilestoneRepository
       );
     });
   }
+  private async applyLinkDiscoveryCacheWrite(
+    client: PoolClient,
+    metadata: import("../../shared/milestone-two.js").LinkDiscoveryMetadata,
+  ): Promise<string> {
+    const cache = metadata.cacheWrite;
+    if (!cache) throw new Error("Missing link discovery cache operation");
+    if (
+      canonicalHash(cache.payload) !== cache.response_hash ||
+      new Date(cache.expires_at).getTime() <= new Date(cache.retrieved_at).getTime() ||
+      new Date(cache.expires_at).getTime() - new Date(cache.retrieved_at).getTime() > 86_400_000
+    )
+      throw new Error("Invalid link discovery cache operation");
+    const cached = await client.query<{ id: string; response_hash: string }>(
+      `insert into link_discovery_cache(cache_key,request_hash,response_hash,provider,retrieved_at,expires_at,payload)
+       values($1,$2,$3,$4,$5,$6,$7::jsonb)
+       on conflict(cache_key,request_hash) do update set response_hash=excluded.response_hash,provider=excluded.provider,retrieved_at=excluded.retrieved_at,expires_at=excluded.expires_at,payload=excluded.payload
+       where link_discovery_cache.retrieved_at=$8 returning id,response_hash`,
+      [
+        cache.cache_key,
+        cache.request_hash,
+        cache.response_hash,
+        cache.provider,
+        cache.retrieved_at,
+        cache.expires_at,
+        JSON.stringify(cache.payload),
+        cache.observed_retrieved_at,
+      ],
+    );
+    const cacheRow =
+      cached.rows[0] ??
+      (
+        await client.query<{ id: string; response_hash: string }>(
+          `select id,response_hash from link_discovery_cache where cache_key=$1 and request_hash=$2`,
+          [cache.cache_key, cache.request_hash],
+        )
+      ).rows[0];
+    if (
+      !cacheRow ||
+      cacheRow.response_hash !== cache.response_hash ||
+      (metadata.cacheId && metadata.cacheId !== cacheRow.id)
+    )
+      throw new Error("Link discovery cache fence changed before run persistence");
+    return cacheRow.id;
+  }
+
   async getHandoff(runId: string): Promise<Handoff> {
     const r = await this.pool.query<{ handoff: Handoff }>("select handoff from runs where id=$1", [
       runId,
@@ -536,46 +632,8 @@ export class PostgresMilestoneRepository
     await this.transaction(async (client) => {
       await this.assertFence(client, runId, executionId, token);
       let cacheId = parsedMetadata?.cacheId;
-      if (parsedMetadata?.cacheWrite) {
-        const cache = parsedMetadata.cacheWrite;
-        if (
-          canonicalHash(cache.payload) !== cache.response_hash ||
-          new Date(cache.expires_at).getTime() <= new Date(cache.retrieved_at).getTime() ||
-          new Date(cache.expires_at).getTime() - new Date(cache.retrieved_at).getTime() > 86_400_000
-        )
-          throw new Error("Invalid link discovery cache operation");
-        const cached = await client.query<{ id: string; response_hash: string }>(
-          `insert into link_discovery_cache(cache_key,request_hash,response_hash,provider,retrieved_at,expires_at,payload)
-           values($1,$2,$3,$4,$5,$6,$7::jsonb)
-           on conflict(cache_key,request_hash) do update set response_hash=excluded.response_hash,provider=excluded.provider,retrieved_at=excluded.retrieved_at,expires_at=excluded.expires_at,payload=excluded.payload
-           where link_discovery_cache.retrieved_at=$8 returning id,response_hash`,
-          [
-            cache.cache_key,
-            cache.request_hash,
-            cache.response_hash,
-            cache.provider,
-            cache.retrieved_at,
-            cache.expires_at,
-            JSON.stringify(cache.payload),
-            cache.observed_retrieved_at,
-          ],
-        );
-        const cacheRow =
-          cached.rows[0] ??
-          (
-            await client.query<{ id: string; response_hash: string }>(
-              `select id,response_hash from link_discovery_cache where cache_key=$1 and request_hash=$2`,
-              [cache.cache_key, cache.request_hash],
-            )
-          ).rows[0];
-        if (
-          !cacheRow ||
-          cacheRow.response_hash !== cache.response_hash ||
-          (parsedMetadata.cacheId && parsedMetadata.cacheId !== cacheRow.id)
-        )
-          throw new Error("Link discovery cache fence changed before run persistence");
-        cacheId = cacheRow.id;
-      }
+      if (parsedMetadata?.cacheWrite)
+        cacheId = await this.applyLinkDiscoveryCacheWrite(client, parsedMetadata);
       if (parsedMetadata) {
         const evidenceBody = JSON.stringify(parsedMetadata);
         await client.query(
@@ -697,22 +755,198 @@ export class PostgresMilestoneRepository
       }),
     };
   }
+  async beginDraftOperation(input: {
+    run_id: string;
+    execution_id: string;
+    token: string;
+    request: import("../../shared/milestone-two.js").DraftProviderRequest;
+    provider: string;
+    model: string;
+    contract_identity: string;
+    purpose: DraftOperationIdentity["purpose"];
+    operator_authorised: boolean;
+  }): Promise<{ identity: DraftOperationIdentity; response: DraftProviderResponse | null }> {
+    return this.transaction(async (client) => {
+      await this.assertFence(client, input.run_id, input.execution_id, input.token);
+      if (input.purpose === "legacy_operator_recovery" && !input.operator_authorised)
+        throw new Error("Legacy draft recovery requires explicit operator authorisation");
+      if (input.purpose === "initial" && input.operator_authorised)
+        throw new Error("Initial draft operation cannot carry recovery authorisation");
+      const history = await client.query<{ failed: boolean; operations: number }>(
+        `select exists(select 1 from step_executions where run_id=$1 and step='draft' and status='retryable_failed') failed,
+                (select count(*)::int from draft_operation_states where run_id=$1) operations`,
+        [input.run_id],
+      );
+      const priorDraftFailure = history.rows[0]?.failed === true;
+      const operationCount = history.rows[0]?.operations ?? 0;
+      const ambiguous = await client.query(
+        "select 1 from draft_operation_states where run_id=$1 and status='provider_in_flight' and response is null limit 1",
+        [input.run_id],
+      );
+      if (ambiguous.rowCount)
+        throw new Error(
+          "Draft provider outcome is ambiguous; no duplicate call was made. A technical owner must authorise a new recovery operation.",
+        );
+      if (
+        input.purpose === "legacy_operator_recovery" &&
+        (!priorDraftFailure || operationCount > 0)
+      )
+        throw new Error("Legacy draft recovery is not eligible for this run");
+      if (input.purpose === "initial" && priorDraftFailure && operationCount === 0)
+        throw new Error("A pre-checkpoint draft failure requires explicit operator authorisation");
+      const identity = deriveDraftOperationIdentity(input);
+      const existing = await client.query<{
+        run_id: string;
+        request_hash: string;
+        provider: string;
+        model: string;
+        contract_identity: string;
+        purpose: DraftOperationIdentity["purpose"];
+        response: unknown;
+        response_hash: string | null;
+        status: string;
+      }>(
+        `select run_id,request_hash,provider,model,contract_identity,purpose,response,response_hash,status
+         from draft_operation_states where operation_id=$1 and run_id=$2 for update`,
+        [identity.operation_id, input.run_id],
+      );
+      const row = existing.rows[0];
+      if (row) {
+        if (
+          row.request_hash !== identity.request_hash ||
+          row.provider !== identity.provider ||
+          row.model !== identity.model ||
+          row.contract_identity !== identity.contract_identity ||
+          row.purpose !== identity.purpose
+        )
+          throw new Error("Immutable draft operation conflict");
+        if (!row.response) {
+          if (row.status === "provider_in_flight")
+            throw new Error(
+              "Draft provider outcome is ambiguous; no duplicate call was made. A technical owner must authorise a new recovery operation.",
+            );
+          return { identity, response: null };
+        }
+        const response = DraftProviderResponseSchema.parse(row.response);
+        if (row.response_hash !== canonicalHash(response))
+          throw new Error("Draft checkpoint hash mismatch");
+        return { identity, response };
+      }
+      await client.query(
+        `insert into draft_operation_states(operation_id,run_id,producing_step_execution_id,request_hash,provider,model,contract_identity,purpose,operator_authorised)
+         values($1,$2,$3,$4,$5,$6,$7,$8,$9)`,
+        [
+          identity.operation_id,
+          input.run_id,
+          input.execution_id,
+          identity.request_hash,
+          identity.provider,
+          identity.model,
+          identity.contract_identity,
+          identity.purpose,
+          input.operator_authorised,
+        ],
+      );
+      return { identity, response: null };
+    });
+  }
+  private async assertDraftCommand(client: PoolClient, input: DraftOperationCommand) {
+    await this.assertFence(client, input.run_id, input.execution_id, input.token);
+    if (input.identity.run_id !== input.run_id)
+      throw new Error("Draft operation cannot cross runs");
+    const row = await client.query(
+      `select 1 from draft_operation_states where operation_id=$1 and run_id=$2 and request_hash=$3
+       and provider=$4 and model=$5 and contract_identity=$6 and purpose=$7 for update`,
+      [
+        input.identity.operation_id,
+        input.run_id,
+        input.identity.request_hash,
+        input.identity.provider,
+        input.identity.model,
+        input.identity.contract_identity,
+        input.identity.purpose,
+      ],
+    );
+    if (row.rowCount !== 1) throw new Error("Draft operation identity mismatch");
+  }
+  async markDraftProviderInFlight(input: DraftOperationCommand): Promise<void> {
+    await this.transaction(async (client) => {
+      await this.assertDraftCommand(client, input);
+      const changed = await client.query(
+        `update draft_operation_states set status='provider_in_flight'
+         where operation_id=$1 and run_id=$2 and status='started' and response is null`,
+        [input.identity.operation_id, input.run_id],
+      );
+      if (changed.rowCount !== 1) throw new Error("Draft operation cannot start a provider call");
+    });
+  }
+  async releaseDraftProviderFailure(input: DraftOperationCommand): Promise<void> {
+    await this.transaction(async (client) => {
+      await this.assertDraftCommand(client, input);
+      const changed = await client.query(
+        `update draft_operation_states set status='started'
+         where operation_id=$1 and run_id=$2 and status='provider_in_flight' and response is null`,
+        [input.identity.operation_id, input.run_id],
+      );
+      if (changed.rowCount !== 1)
+        throw new Error("Draft operation has no releasable provider reservation");
+    });
+  }
+  async checkpointDraftResponse(
+    input: DraftOperationCommand & { response: DraftProviderResponse },
+  ): Promise<void> {
+    const response = DraftProviderResponseSchema.parse(input.response);
+    const responseHash = canonicalHash(response);
+    await this.transaction(async (client) => {
+      await this.assertDraftCommand(client, input);
+      const changed = await client.query(
+        `update draft_operation_states
+         set response=$2::jsonb,response_hash=$3,status='checkpointed',checkpointed_at=clock_timestamp()
+         where operation_id=$1 and run_id=$4 and status='provider_in_flight' and response is null`,
+        [input.identity.operation_id, JSON.stringify(response), responseHash, input.run_id],
+      );
+      if (changed.rowCount !== 1) {
+        const existing = await client.query<{ response_hash: string | null }>(
+          "select response_hash from draft_operation_states where operation_id=$1 and run_id=$2",
+          [input.identity.operation_id, input.run_id],
+        );
+        if (existing.rows[0]?.response_hash !== responseHash)
+          throw new Error("Immutable draft checkpoint conflict");
+      }
+    });
+  }
   async saveDraft(
     runId: string,
     executionId: string,
     token: string,
     response: DraftProviderResponse,
-    provider: string,
-    model: string,
-    rawRequest?: import("../../shared/milestone-two.js").DraftProviderRequest,
+    operation: DraftOperationIdentity,
   ) {
     const parsed = DraftProviderResponseSchema.parse(response);
-    const request = rawRequest ? DraftProviderRequestSchema.parse(rawRequest) : undefined;
-    const parsedProvider = this.requireNonEmpty(provider, "provider");
-    const parsedModel = this.requireNonEmpty(model, "model");
     await this.transaction(async (client) => {
       await client.query("select id from runs where id=$1 for update", [runId]);
       await this.assertFence(client, runId, executionId, token);
+      if (operation.run_id !== runId) throw new Error("Draft operation cannot cross runs");
+      const checkpoint = await client.query<{ response_hash: string | null; status: string }>(
+        `select response_hash,status from draft_operation_states where operation_id=$1 and run_id=$2
+         and request_hash=$3 and provider=$4 and model=$5 and contract_identity=$6 and purpose=$7`,
+        [
+          operation.operation_id,
+          runId,
+          operation.request_hash,
+          operation.provider,
+          operation.model,
+          operation.contract_identity,
+          operation.purpose,
+        ],
+      );
+      if (
+        checkpoint.rows[0]?.status !== "checkpointed" ||
+        checkpoint.rows[0].response_hash !== canonicalHash(parsed)
+      )
+        throw new Error("Draft persistence requires its exact validated provider checkpoint");
+      const parsedProvider = operation.provider;
+      const parsedModel = operation.model;
       const existing = await client.query<{ body_text: string }>(
         `select a.body_text from document_versions d join artifacts a on a.id=d.artifact_id where d.run_id=$1 and d.revision=1`,
         [runId],
@@ -737,21 +971,19 @@ export class PostgresMilestoneRepository
         "insert into document_versions(run_id,artifact_id,revision,content_hash) values($1,$2,1,$3)",
         [runId, artifactId, hash],
       );
-      if (request) {
-        const requestBody = JSON.stringify(request);
-        const requestHash = contentHash(requestBody);
-        await client.query(
-          `insert into artifacts(id,run_id,step_execution_id,kind,media_type,body_text,content_hash,size_bytes) values($1,$2,$3,'draft_request','application/json',$4,$5,$6)`,
-          [
-            randomUUID(),
-            runId,
-            executionId,
-            requestBody,
-            requestHash,
-            Buffer.byteLength(requestBody),
-          ],
-        );
-      }
+      const requestBody = JSON.stringify(operation);
+      const requestHash = contentHash(requestBody);
+      await client.query(
+        `insert into artifacts(id,run_id,step_execution_id,kind,media_type,body_text,content_hash,size_bytes) values($1,$2,$3,'draft_request','application/json',$4,$5,$6)`,
+        [
+          randomUUID(),
+          runId,
+          executionId,
+          requestBody,
+          requestHash,
+          Buffer.byteLength(requestBody),
+        ],
+      );
       await client.query(
         `insert into provider_usage(run_id,step_execution_id,provider,model,operation,request_id,input_units,output_units,cost_micros,latency_ms) values($1,$2,$3,$4,'draft',$5,$6,$7,$8,$9)`,
         [
@@ -941,6 +1173,175 @@ export class PostgresMilestoneRepository
     );
   }
 
+  async beginReviewOperation(input: {
+    run_id: string;
+    document_version_id: string;
+    execution_id: string;
+    token: string;
+    step: ReviewStep;
+    request: ReviewRequest;
+    provider: string;
+    model: string;
+  }): Promise<{ operation_id: string; response: PersistedReviewResponse | null }> {
+    const request = ReviewRequestSchema.parse(input.request);
+    const requestHash = canonicalHash(request);
+    const provider = this.requireNonEmpty(input.provider, "provider");
+    const model = this.requireNonEmpty(input.model, "model");
+    const operationId = stableId(
+      "review-operation",
+      input.run_id,
+      input.document_version_id,
+      input.step,
+      requestHash,
+      provider,
+      model,
+    );
+    return this.transaction(async (client) => {
+      await this.assertFence(client, input.run_id, input.execution_id, input.token);
+      const existing = await client.query<{
+        run_id: string;
+        document_version_id: string;
+        producing_step_execution_id: string;
+        step: string;
+        request_hash: string;
+        provider: string;
+        model: string;
+        status: string;
+        response: unknown;
+        response_hash: string | null;
+      }>("select * from review_operation_states where operation_id=$1 for update", [operationId]);
+      const row = existing.rows[0];
+      if (row) {
+        if (
+          row.run_id !== input.run_id ||
+          row.document_version_id !== input.document_version_id ||
+          row.step !== input.step ||
+          row.request_hash !== requestHash ||
+          row.provider !== provider ||
+          row.model !== model
+        )
+          throw new Error("Immutable review operation conflict");
+        if (row.status === "provider_in_flight")
+          throw new Error("Review provider outcome is ambiguous; operator action is required");
+        if (row.status === "checkpointed") {
+          const response = PersistedReviewResponseSchema.parse(row.response);
+          if (row.response_hash !== canonicalHash(response))
+            throw new Error("Review checkpoint hash mismatch");
+          return { operation_id: operationId, response };
+        }
+        if (row.producing_step_execution_id !== input.execution_id) {
+          const ownership = await client.query<{
+            previous_status: string;
+            previous_lease_token: string | null;
+            previous_lease_owner: string | null;
+            previous_lease_expires_at: Date | null;
+            previous_attempt: number;
+            current_status: string;
+            current_attempt: number;
+            current_step: string;
+          }>(
+            `select previous.status previous_status,previous.lease_token previous_lease_token,
+                    previous.lease_owner previous_lease_owner,previous.lease_expires_at previous_lease_expires_at,
+                    previous.attempt previous_attempt,current.status current_status,
+                    current.attempt current_attempt,current.step current_step
+               from step_executions previous,step_executions current
+              where previous.id=$1 and previous.run_id=$2 and previous.step=$3
+                and current.id=$4 and current.run_id=$2 and current.step=$3`,
+            [row.producing_step_execution_id, input.run_id, input.step, input.execution_id],
+          );
+          const owner = ownership.rows[0];
+          if (
+            !owner ||
+            owner.previous_status !== "retryable_failed" ||
+            owner.previous_lease_token !== null ||
+            owner.previous_lease_owner !== null ||
+            owner.previous_lease_expires_at !== null ||
+            owner.current_status !== "running" ||
+            owner.previous_attempt >= owner.current_attempt
+          )
+            throw new Error("Started review operation cannot be adopted by this attempt");
+          await client.query(
+            `insert into review_operation_adoptions(operation_id,run_id,from_step_execution_id,to_step_execution_id)
+             values($1,$2,$3,$4)`,
+            [operationId, input.run_id, row.producing_step_execution_id, input.execution_id],
+          );
+          const adopted = await client.query(
+            `update review_operation_states set producing_step_execution_id=$3
+              where operation_id=$1 and run_id=$2 and status='started' and producing_step_execution_id=$4`,
+            [operationId, input.run_id, input.execution_id, row.producing_step_execution_id],
+          );
+          if (adopted.rowCount !== 1) throw new Error("Review operation adoption conflict");
+        }
+        return { operation_id: operationId, response: null };
+      }
+      await client.query(
+        `insert into review_operation_states(operation_id,run_id,document_version_id,producing_step_execution_id,step,request_hash,provider,model)
+         values($1,$2,$3,$4,$5,$6,$7,$8)`,
+        [
+          operationId,
+          input.run_id,
+          input.document_version_id,
+          input.execution_id,
+          input.step,
+          requestHash,
+          provider,
+          model,
+        ],
+      );
+      return { operation_id: operationId, response: null };
+    });
+  }
+
+  async markReviewProviderInFlight(input: {
+    run_id: string;
+    execution_id: string;
+    token: string;
+    operation_id: string;
+  }): Promise<void> {
+    await this.transaction(async (client) => {
+      await this.assertFence(client, input.run_id, input.execution_id, input.token);
+      const changed = await client.query(
+        "update review_operation_states set status='provider_in_flight' where operation_id=$1 and run_id=$2 and status='started' and producing_step_execution_id=$3",
+        [input.operation_id, input.run_id, input.execution_id],
+      );
+      if (changed.rowCount !== 1) throw new Error("Review operation is not ready for dispatch");
+    });
+  }
+
+  async checkpointReviewResponse(input: {
+    run_id: string;
+    execution_id: string;
+    token: string;
+    operation_id: string;
+    response: PersistedReviewResponse;
+  }): Promise<void> {
+    const response = PersistedReviewResponseSchema.parse(input.response);
+    const hash = canonicalHash(response);
+    await this.transaction(async (client) => {
+      await this.assertFence(client, input.run_id, input.execution_id, input.token);
+      const changed = await client.query(
+        `update review_operation_states set status='checkpointed',response=$2::jsonb,response_hash=$3,checkpointed_at=clock_timestamp()
+         where operation_id=$1 and run_id=$4 and status='provider_in_flight' and producing_step_execution_id=$5`,
+        [input.operation_id, JSON.stringify(response), hash, input.run_id, input.execution_id],
+      );
+      if (changed.rowCount === 1) return;
+      const existing = await client.query<{
+        status: string;
+        response_hash: string | null;
+        producing_step_execution_id: string;
+      }>(
+        "select status,response_hash,producing_step_execution_id from review_operation_states where operation_id=$1",
+        [input.operation_id],
+      );
+      if (
+        existing.rows[0]?.status !== "checkpointed" ||
+        existing.rows[0].response_hash !== hash ||
+        existing.rows[0].producing_step_execution_id !== input.execution_id
+      )
+        throw new Error("Immutable review checkpoint conflict");
+    });
+  }
+
   async saveReview(
     runId: string,
     documentVersionId: string,
@@ -951,14 +1352,36 @@ export class PostgresMilestoneRepository
     rawResponse: ReviewResponse & { findings: Array<ReviewFinding & { hard_flag: boolean }> },
     provider: string,
     model: string,
+    rawCheckpointResponse?: PersistedReviewResponse,
   ): Promise<void> {
     const request = ReviewRequestSchema.parse(rawRequest),
-      response = PersistedReviewResponseSchema.parse(rawResponse);
+      response = PersistedReviewResponseSchema.parse(rawResponse),
+      checkpointResponse = rawCheckpointResponse
+        ? PersistedReviewResponseSchema.parse(rawCheckpointResponse)
+        : response;
     const parsedProvider = this.requireNonEmpty(provider, "provider"),
       parsedModel = this.requireNonEmpty(model, "model");
     await this.transaction(async (client) => {
       await this.assertFence(client, runId, executionId, token);
+      const operationId = stableId(
+        "review-operation",
+        runId,
+        documentVersionId,
+        step,
+        canonicalHash(request),
+        parsedProvider,
+        parsedModel,
+      );
+      const checkpoint = await client.query<{ status: string; response_hash: string | null }>(
+        "select status,response_hash from review_operation_states where operation_id=$1 and run_id=$2",
+        [operationId, runId],
+      );
       const identity = canonicalHash(response);
+      if (
+        checkpoint.rows[0]?.status !== "checkpointed" ||
+        checkpoint.rows[0].response_hash !== canonicalHash(checkpointResponse)
+      )
+        throw new Error("Review persistence requires its exact validated provider checkpoint");
       const existing = await client.query<{ content_hash: string }>(
         "select content_hash from step_outputs where run_id=$1 and document_version_id=$2 and step=$3",
         [runId, documentVersionId, step],
@@ -1541,6 +1964,7 @@ export class PostgresMilestoneRepository
           "update runs set status='running',current_step='revision_pass',block_reason=null,updated_at=clock_timestamp() where id=$1",
           [runId],
         );
+        await this.enqueueRunClient(client, runId, {});
       }
       return {
         completed: !pending.rows[0],
@@ -1572,29 +1996,7 @@ export class PostgresMilestoneRepository
         [runId],
       )
     ).rows[0];
-    const continuedExceptional = exceptional
-      ? ((
-          await this.pool.query<{ eligible: boolean }>(
-            `select exists(
-               select 1 from document_versions authorised
-               join document_versions current on current.run_id=authorised.run_id and current.id=$2
-                 and current.revision=authorised.revision+1
-               where authorised.id=$1 and not exists(
-                 select 1 from findings f join step_executions e on e.id=f.step_execution_id
-                 where f.run_id=current.run_id and f.document_version_id=current.id
-                   and e.step='automated_checks_rerun' and e.status='succeeded' and f.severity='blocker'
-                   and f.rule_reference not in ('on_page.meta_description.length','keyword.primary.h2')
-               )
-             ) eligible`,
-            [exceptional.document_version_id, documentVersionId],
-          )
-        ).rows[0]?.eligible ?? false)
-      : false;
-    if (
-      exceptional &&
-      exceptional.document_version_id !== documentVersionId &&
-      !continuedExceptional
-    )
+    if (exceptional && exceptional.document_version_id !== documentVersionId)
       throw new Error("Exceptional correction is not bound to the current document.");
     const currentRerun = (
       await this.pool.query<{
@@ -1614,20 +2016,14 @@ export class PostgresMilestoneRepository
          where r.run_id=$1 and r.document_version_id=$2
            and ($3::uuid is null or r.step_execution_id=$3)
          group by r.step_execution_id,r.retained_blockers,r.introduced_blockers`,
-        [
-          runId,
-          documentVersionId,
-          continuedExceptional
-            ? null
-            : (exceptional?.deterministic_rerun_step_execution_id ?? null),
-        ],
+        [runId, documentVersionId, exceptional?.deterministic_rerun_step_execution_id ?? null],
       )
     ).rows[0];
     if (
       exceptional &&
       (!currentRerun ||
         currentRerun.actual_blockers !== currentRerun.blockers ||
-        (!continuedExceptional && currentRerun.blocker_set_hash !== exceptional.blocker_set_hash))
+        currentRerun.blocker_set_hash !== exceptional.blocker_set_hash)
     )
       throw new Error("Exceptional correction blocker binding no longer matches Step 1.11.");
     const source =
@@ -1672,17 +2068,11 @@ export class PostgresMilestoneRepository
           ? [runId, documentVersionId, currentRerun!.step_execution_id]
           : [runId, documentVersionId],
     );
+    // Authority is only ever the immutable persisted authorisation; it is never
+    // recomputed at execution time, so it cannot widen after the operator
+    // confirmed it.
     const exceptionalBindings = exceptional
-      ? continuedExceptional
-        ? (bindExceptionalBlockers(
-            (await this.getDraft(runId))!.draft,
-            result.rows.map((row: any) => ({
-              id: row.id,
-              rule_reference: row.rule_reference,
-              location: row.location,
-            })),
-          ) ?? [])
-        : z.array(ExceptionalBlockerBindingSchema).parse(exceptional.blocker_bindings)
+      ? z.array(ExceptionalBlockerBindingSchema).parse(exceptional.blocker_bindings)
       : [];
     const findings = result.rows.map((row: any) => ({
       id: row.id,
@@ -1713,6 +2103,7 @@ export class PostgresMilestoneRepository
       findings,
       rejected_locations: exclusions.rows.map((row) => row.location),
       verified_fact_locations: verified.rows.map((row) => row.location),
+      authorised_readability: authorisedReadabilityFromBindings(exceptionalBindings),
     };
   }
 
@@ -2238,6 +2629,7 @@ export class PostgresMilestoneRepository
       PersistedReviewFindingSchema.parse({ ...item, hard_flag: false }),
     );
     return this.transaction(async (client) => {
+      await this.assertFence(client, input.run_id, input.execution_id, input.token);
       const existing = (
         await client.query<{ result_hash: string; result: unknown }>(
           `select result_hash,result from deterministic_reruns
@@ -2268,7 +2660,6 @@ export class PostgresMilestoneRepository
         }
         throw new ConflictError("Step 1.11 rerun already exists with different content");
       }
-      await this.assertFence(client, input.run_id, input.execution_id, input.token);
       await this.insertFindingsClient(
         client,
         input.run_id,
@@ -2466,18 +2857,30 @@ export class PostgresMilestoneRepository
         request_hash: string;
         response: unknown;
         response_hash: string | null;
+        status: string;
       }>(
-        "select request_hash,response,response_hash from coherence_checkpoints where operation_id=$1 for update",
+        "select request_hash,response,response_hash,status from coherence_checkpoints where operation_id=$1 for update",
         [input.operation_id],
       );
       if (existing.rows[0]) {
-        if (existing.rows[0].request_hash !== requestHash)
+        const row = existing.rows[0];
+        if (row.request_hash !== requestHash)
           throw new Error("Immutable coherence operation conflict");
-        if (!existing.rows[0].response) return null;
-        const response = CoherenceResponseSchema.parse(existing.rows[0].response);
-        if (existing.rows[0].response_hash !== canonicalHash(response))
-          throw new Error("Coherence checkpoint hash mismatch");
-        return response;
+        if (row.response) {
+          if (row.status !== "checkpointed")
+            throw new Error("Coherence checkpoint response has invalid status");
+          const response = CoherenceResponseSchema.parse(row.response);
+          if (row.response_hash !== canonicalHash(response))
+            throw new Error("Coherence checkpoint hash mismatch");
+          return response;
+        }
+        if (row.status === "provider_in_flight")
+          throw new Error(
+            "Coherence provider outcome is ambiguous; no duplicate call was made. Operator action is required before this document can continue.",
+          );
+        if (row.status !== "started")
+          throw new Error("Coherence checkpoint has an invalid response state");
+        return null;
       }
       await client.query(
         `insert into coherence_checkpoints(operation_id,run_id,document_version_id,producing_step_execution_id,request_hash) values($1,$2,$3,$4,$5)`,
@@ -2492,6 +2895,42 @@ export class PostgresMilestoneRepository
       return null;
     });
   }
+  async markCoherenceProviderInFlight(input: {
+    run_id: string;
+    execution_id: string;
+    token: string;
+    operation_id: string;
+  }): Promise<void> {
+    await this.transaction(async (client) => {
+      await this.assertFence(client, input.run_id, input.execution_id, input.token);
+      const changed = await client.query(
+        `update coherence_checkpoints set status=$$provider_in_flight$$
+         where operation_id=$1 and run_id=$2 and status=$$started$$ and response is null and response_hash is null`,
+        [input.operation_id, input.run_id],
+      );
+      if (changed.rowCount !== 1)
+        throw new Error("Coherence operation cannot start a provider call");
+    });
+  }
+
+  async releaseCoherenceProviderFailure(input: {
+    run_id: string;
+    execution_id: string;
+    token: string;
+    operation_id: string;
+  }): Promise<void> {
+    await this.transaction(async (client) => {
+      await this.assertFence(client, input.run_id, input.execution_id, input.token);
+      const changed = await client.query(
+        `update coherence_checkpoints set status=$$started$$
+         where operation_id=$1 and run_id=$2 and status=$$provider_in_flight$$ and response is null and response_hash is null`,
+        [input.operation_id, input.run_id],
+      );
+      if (changed.rowCount !== 1)
+        throw new Error("Coherence release requires an in-flight provider operation");
+    });
+  }
+
   async checkpointCoherenceResponse(input: {
     run_id: string;
     execution_id: string;
@@ -2504,17 +2943,24 @@ export class PostgresMilestoneRepository
     await this.transaction(async (client) => {
       await this.assertFence(client, input.run_id, input.execution_id, input.token);
       const result = await client.query(
-        `update coherence_checkpoints set response=$2::jsonb,response_hash=$3,checkpointed_at=clock_timestamp() where operation_id=$1 and run_id=$4 and response is null`,
+        `update coherence_checkpoints set response=$2::jsonb,response_hash=$3,status=$$checkpointed$$,checkpointed_at=clock_timestamp()
+         where operation_id=$1 and run_id=$4 and status=$$provider_in_flight$$ and response is null and response_hash is null`,
         [input.operation_id, JSON.stringify(response), responseHash, input.run_id],
       );
-      if (result.rowCount !== 1) {
-        const existing = await client.query<{ response_hash: string }>(
-          "select response_hash from coherence_checkpoints where operation_id=$1",
-          [input.operation_id],
-        );
-        if (existing.rows[0]?.response_hash !== responseHash)
-          throw new Error("Immutable coherence checkpoint conflict");
-      }
+      if (result.rowCount === 1) return;
+      const existing = await client.query<{
+        response: unknown;
+        response_hash: string | null;
+        status: string;
+      }>(
+        "select response,response_hash,status from coherence_checkpoints where operation_id=$1 for update",
+        [input.operation_id],
+      );
+      const row = existing.rows[0];
+      if (row?.response && row.status === "checkpointed" && row.response_hash === responseHash)
+        return;
+      if (row?.response) throw new Error("Immutable coherence checkpoint conflict");
+      throw new Error("Coherence checkpoint requires an in-flight provider operation");
     });
   }
 
@@ -2854,6 +3300,7 @@ export class PostgresMilestoneRepository
            )`,
         [runId],
       );
+      if (changed.rowCount === 1) await this.enqueueRunClient(client, runId, {});
       return changed.rowCount === 1;
     });
   }
@@ -2865,37 +3312,28 @@ export class PostgresMilestoneRepository
   }): Promise<"authorised" | "replay"> {
     return this.transaction(async (client) => {
       await client.query("select id from runs where id=$1 for update", [input.run_id]);
-      const replay = await client.query<{ run_id: string }>(
-        `select run_id from exceptional_correction_authorisations
+      const replay = await client.query<{ run_id: string; idempotency_key: string }>(
+        `select run_id,idempotency_key from exceptional_correction_authorisations
          where idempotency_key=$1 or run_id=$2
          order by (idempotency_key=$1) desc limit 1`,
         [input.idempotency_key, input.run_id],
       );
-      if (replay.rows[0]) {
-        if (replay.rows[0].run_id !== input.run_id)
+      const existing = replay.rows[0];
+      if (existing) {
+        if (
+          existing.idempotency_key === input.idempotency_key &&
+          existing.run_id === input.run_id
+        ) {
+          // Replay is purely observational, exactly as the in-memory repository
+          // behaves: it must not reopen a blocked child, change the run status,
+          // current step, block reason, document version, blocker set or
+          // revision operation, and it must not extend the one-time correction.
+          return "replay" as const;
+        }
+        if (existing.idempotency_key === input.idempotency_key)
           throw new ConflictError("Authorisation key conflict");
-        // Continue the direct child once when the original authorised model edit
-        // left only the two checks now supported by deterministic correction.
-        await client.query(
-          `update runs r set status='running',current_step='revision_pass',block_reason=null,updated_at=clock_timestamp()
-           where r.id=$1 and r.status='blocked' and r.block_reason='deterministic_blockers'
-             and r.deterministic_repair_cycles=2 and exists(
-               select 1 from exceptional_correction_authorisations a
-               join document_versions authorised on authorised.id=a.document_version_id and authorised.run_id=a.run_id
-               join document_versions current on current.run_id=a.run_id and current.revision=authorised.revision+1
-               join deterministic_reruns rr on rr.run_id=current.run_id and rr.document_version_id=current.id
-               join step_executions e on e.id=rr.step_execution_id and e.step='automated_checks_rerun' and e.status='succeeded'
-               where a.run_id=r.id
-                 and (select count(*) from findings f where f.run_id=r.id and f.document_version_id=current.id and f.step_execution_id=e.id and f.severity='blocker')=2
-                 and not exists(
-                   select 1 from findings f where f.run_id=r.id and f.document_version_id=current.id
-                     and f.step_execution_id=e.id and f.severity='blocker'
-                     and f.rule_reference not in ('on_page.meta_description.length','keyword.primary.h2')
-                 )
-             )`,
-          [input.run_id],
-        );
-        return "replay" as const;
+        if (existing.run_id === input.run_id)
+          throw new ConflictError("The run already has an exceptional authorisation.");
       }
       const authority = (
         await client.query<{
@@ -2930,7 +3368,31 @@ export class PostgresMilestoneRepository
             )
           ).rows
         : [];
-      const bindings = draft ? bindExceptionalBlockers(draft.draft, blockerRows) : null;
+      // Authorisation must freeze the same exclusions execution will apply,
+      // otherwise it could record authority over a rejected paragraph that the
+      // planner then refuses — and an operator-visible authorisation would name
+      // prose the operator had already rejected.
+      const rejectedForAuthority = authority
+        ? (
+            await client.query<{ location: unknown }>(
+              `select f.location from findings f
+               join finding_dispositions d on d.finding_id=f.id and d.run_id=f.run_id
+               where f.run_id=$1 and f.document_version_id=$2 and d.decision='rejected'`,
+              [input.run_id, authority.document_version_id],
+            )
+          ).rows.map((row) => row.location as FindingLocation)
+        : [];
+      const bindings = draft
+        ? bindExceptionalBlockers(
+            draft.draft,
+            (await this.getHandoff(input.run_id)).primary_keyword,
+            blockerRows,
+            revisionBindingExclusions({
+              document: draft.draft,
+              rejectedLocations: rejectedForAuthority,
+            }),
+          )
+        : null;
       if (!input.explicit_confirmation || !authority || !bindings)
         throw new ConflictError("Exceptional correction is not available for this exact document.");
       await client.query(
@@ -2949,6 +3411,7 @@ export class PostgresMilestoneRepository
         "update runs set status='running',current_step='revision_pass',block_reason=null,updated_at=clock_timestamp() where id=$1",
         [input.run_id],
       );
+      await this.enqueueRunClient(client, input.run_id, {});
       return "authorised" as const;
     });
   }
@@ -2969,6 +3432,20 @@ export class PostgresMilestoneRepository
     ).rows;
     const current = await this.getDraft(runId);
     const linksArtifact = await this.getLinksArtifact(runId);
+    const draftOperation = (
+      await this.pool.query<{ status: string }>(
+        "select status from draft_operation_states where run_id=$1 order by created_at desc limit 1",
+        [runId],
+      )
+    ).rows[0];
+    const draftRecovery =
+      run.status === "retryable_failed" && run.current_step === "draft" && !current
+        ? draftOperation?.status === "provider_in_flight"
+          ? ("ambiguous_technical_review" as const)
+          : draftOperation
+            ? ("none" as const)
+            : ("legacy_confirmation_required" as const)
+        : ("none" as const);
     const latestLinkAttempt = (
       await this.pool.query<{ metadata: unknown }>(
         `select metadata from link_discovery_attempts where run_id=$1 order by created_at desc limit 1`,
@@ -3008,30 +3485,6 @@ export class PostgresMilestoneRepository
         [runId],
       )
     ).rows[0];
-    const continuedExceptionalAvailable = Boolean(
-      exceptional &&
-      current &&
-      (
-        await this.pool.query<{ eligible: boolean }>(
-          `select exists(
-               select 1 from document_versions authorised
-               join document_versions current on current.run_id=authorised.run_id and current.id=$2
-                 and current.revision=authorised.revision+1
-               where authorised.id=$1
-                 and (select count(*) from findings f join step_executions e on e.id=f.step_execution_id
-                      where f.run_id=current.run_id and f.document_version_id=current.id
-                        and e.step='automated_checks_rerun' and e.status='succeeded' and f.severity='blocker')=2
-                 and not exists(
-                   select 1 from findings f join step_executions e on e.id=f.step_execution_id
-                   where f.run_id=current.run_id and f.document_version_id=current.id
-                     and e.step='automated_checks_rerun' and e.status='succeeded' and f.severity='blocker'
-                     and f.rule_reference not in ('on_page.meta_description.length','keyword.primary.h2')
-                 )
-             ) eligible`,
-          [exceptional.document_version_id, current.version.id],
-        )
-      ).rows[0]?.eligible,
-    );
     const steps = PIPELINE_STEPS.flatMap((definition) => {
       const rows = executions.filter((item: any) => item.step === definition.id);
       return (
@@ -3093,13 +3546,14 @@ export class PostgresMilestoneRepository
       // A run waiting at 1.9 whose dispositions are recorded (step succeeded)
       // is exactly that: resting, ready for the operator to continue.
       can_retry:
-        run.status === "retryable_failed" ||
+        (run.status === "retryable_failed" && draftRecovery !== "ambiguous_technical_review") ||
         run.status === "running" ||
         (run.status === "waiting" &&
           executions.some(
             (item: any) => item.step === "findings_review" && item.status === "succeeded",
           )) ||
         (exported?.status === "failed" && run.status !== "blocked"),
+      draft_recovery: draftRecovery,
       blocked_for_operator: run.status === "blocked",
       can_recover_deterministic_block:
         run.status === "blocked" &&
@@ -3111,7 +3565,7 @@ export class PostgresMilestoneRepository
           run.status === "blocked" &&
           blockReason === "deterministic_blockers" &&
           run.deterministic_repair_cycles === 2 &&
-          (!exceptional || continuedExceptionalAvailable) &&
+          !exceptional &&
           blockEvidence.deterministic_blockers > 0,
         authorised: Boolean(exceptional),
         requires_ai: current
@@ -3307,6 +3761,343 @@ export class PostgresMilestoneRepository
     const r = await client.query<{ changed: boolean }>(sql, values);
     if (!r.rows[0]?.changed) throw new Error("Stale or expired fencing token");
   }
+  async enqueueRun(runId: string, options: QueueOptions = {}): Promise<void> {
+    const parsed = QueueOptionsSchema.parse(options);
+    await this.transaction((client) => this.enqueueRunClient(client, runId, parsed));
+  }
+
+  async claimQueueJob(owner: string, leaseMs: number): Promise<QueueLease | null> {
+    if (!owner.trim() || !Number.isSafeInteger(leaseMs) || leaseMs <= 0)
+      throw new Error("Invalid queue lease request");
+    return this.transaction(async (client) => {
+      const selected = await client.query<{ id: string; run_id: string; state: string }>(
+        `select q.id,q.run_id,q.state from pipeline_queue_jobs q join runs r on r.id=q.run_id
+         where r.status<>'cancelled'
+           and (r.status not in ('waiting','blocked','succeeded') or q.options='{"refresh_link_discovery":true}'::jsonb)
+           and (q.state='ready' or (q.state='retry_wait' and q.available_at<=clock_timestamp()) or
+                (q.state='leased' and q.lease_expires_at<=clock_timestamp()))
+         order by q.available_at,q.created_at for update of q skip locked limit 1`,
+      );
+      const candidate = selected.rows[0];
+      if (!candidate) return null;
+      // A queue lease is only coordination. After a worker crash it may expire before the
+      // independently fenced step lease. Wait for that owner rather than creating an unsafe
+      // duplicate execution or charging this coordination poll to the retry budget.
+      const activeStep = await client.query(
+        `select 1 from step_executions where run_id=$1 and status in ('leased','running')
+         and lease_expires_at>clock_timestamp() limit 1`,
+        [candidate.run_id],
+      );
+      if (candidate.state === "leased" && activeStep.rowCount) {
+        await client.query(
+          `update pipeline_queue_jobs set state='retry_wait',available_at=clock_timestamp()+interval '1 second',
+           lease_token=null,lease_owner=null,lease_expires_at=null,last_error_code='step_lease_coordination_wait',
+           updated_at=clock_timestamp() where id=$1`,
+          [candidate.id],
+        );
+        return null;
+      }
+      const id = candidate.id;
+      const token = randomUUID();
+      const claimed = await client.query<{
+        id: string;
+        run_id: string;
+        attempt: number;
+        phase: "pre_downstream" | "downstream_started";
+        options: unknown;
+      }>(
+        `update pipeline_queue_jobs set state='leased',attempt=attempt+1,lease_token=$2,lease_owner=$3,
+           lease_expires_at=clock_timestamp()+($4::text)::interval,last_error_code=null,updated_at=clock_timestamp()
+         where id=$1 and attempt<3 returning id,run_id,attempt,phase,options`,
+        [id, token, owner, `${leaseMs} milliseconds`],
+      );
+      const row = claimed.rows[0];
+      if (!row) {
+        await client.query(
+          `update pipeline_queue_jobs set state='operator_action',lease_token=null,lease_owner=null,
+           lease_expires_at=null,last_error_code='retry_limit',updated_at=clock_timestamp() where id=$1`,
+          [id],
+        );
+        return null;
+      }
+      return {
+        id: row.id,
+        run_id: row.run_id,
+        token,
+        attempt: row.attempt,
+        phase: row.phase,
+        options: QueueOptionsSchema.parse(row.options),
+      };
+    });
+  }
+
+  async heartbeatQueueJob(jobId: string, token: string, leaseMs: number): Promise<boolean> {
+    const changed = await this.pool.query(
+      `update pipeline_queue_jobs set lease_expires_at=clock_timestamp()+($3::text)::interval,updated_at=clock_timestamp()
+       where id=$1 and state='leased' and lease_token=$2 and lease_expires_at>clock_timestamp() returning id`,
+      [jobId, token, `${leaseMs} milliseconds`],
+    );
+    return changed.rowCount === 1;
+  }
+
+  async closeRefreshWindow(
+    jobId: string,
+    token: string,
+  ): Promise<"refresh_promoted" | "downstream_started" | null> {
+    const changed = await this.pool.query<{ outcome: "refresh_promoted" | "downstream_started" }>(
+      `with owned as (
+         select id,phase,pending_refresh from pipeline_queue_jobs
+         where id=$1 and state='leased' and lease_token=$2 and lease_expires_at>clock_timestamp()
+         for update
+       ), changed as (
+         update pipeline_queue_jobs q set
+          state=case when o.pending_refresh then 'ready'::queue_job_state else q.state end,
+          phase=case when o.pending_refresh then 'pre_downstream'::queue_job_phase else 'downstream_started'::queue_job_phase end,
+          options=case when o.pending_refresh then '{"refresh_link_discovery":true}'::jsonb else q.options end,
+          resume_after_refresh=case when o.pending_refresh then true else q.resume_after_refresh end,
+          attempt=case when o.pending_refresh then 0 else q.attempt end,
+          available_at=case when o.pending_refresh then clock_timestamp() else q.available_at end,
+          lease_token=case when o.pending_refresh then null else q.lease_token end,
+          lease_owner=case when o.pending_refresh then null else q.lease_owner end,
+          lease_expires_at=case when o.pending_refresh then null else q.lease_expires_at + interval '1 microsecond' end,
+          last_error_code=case when o.pending_refresh then null else q.last_error_code end,
+          pending_refresh=false,updated_at=clock_timestamp()
+         from owned o where q.id=o.id and o.phase='pre_downstream'
+         returning case when state='ready' then 'refresh_promoted' else 'downstream_started' end outcome
+       )
+       select outcome from changed
+       union all
+       select 'downstream_started'::text outcome from owned where phase='downstream_started'
+       limit 1`,
+      [jobId, token],
+    );
+    return changed.rows[0]?.outcome ?? null;
+  }
+
+  async finishQueueJob(
+    jobId: string,
+    token: string,
+    state: "parked" | "operator_action" | "completed" | "cancelled",
+    errorCode?: string,
+  ): Promise<boolean> {
+    const changed = await this.pool.query(
+      `update pipeline_queue_jobs set
+       state=case when (resume_after_refresh or pending_refresh or pending_options<>'{}'::jsonb) and $3<>'cancelled' then 'ready'::queue_job_state else $3::queue_job_state end,
+       options=case when resume_after_refresh and $3<>'cancelled' then '{}'::jsonb when pending_refresh and $3<>'cancelled' then '{"refresh_link_discovery":true}'::jsonb when pending_options<>'{}'::jsonb and $3<>'cancelled' then pending_options else options end,
+       phase=case when (resume_after_refresh or pending_refresh or pending_options<>'{}'::jsonb) and $3<>'cancelled' then 'pre_downstream'::queue_job_phase else phase end,
+       pending_refresh=case when (resume_after_refresh or pending_refresh or pending_options<>'{}'::jsonb) and $3<>'cancelled' then false else pending_refresh end,
+       resume_after_refresh=case when resume_after_refresh and $3<>'cancelled' then false else resume_after_refresh end,
+       pending_options=case when (resume_after_refresh or pending_refresh or pending_options<>'{}'::jsonb) and $3<>'cancelled' then '{}'::jsonb else pending_options end,
+       attempt=case when (resume_after_refresh or pending_refresh or pending_options<>'{}'::jsonb) and $3<>'cancelled' then 0 else attempt end,
+       available_at=case when (resume_after_refresh or pending_refresh or pending_options<>'{}'::jsonb) and $3<>'cancelled' then clock_timestamp() else available_at end,
+       lease_token=null,lease_owner=null,lease_expires_at=null,
+       last_error_code=case when (resume_after_refresh or pending_refresh or pending_options<>'{}'::jsonb) and $3<>'cancelled' then null else $4 end,
+       updated_at=clock_timestamp() where id=$1 and state='leased' and lease_token=$2 and lease_expires_at>clock_timestamp() returning id`,
+      [jobId, token, state, errorCode ?? null],
+    );
+    return changed.rowCount === 1;
+  }
+
+  async deferQueueJob(jobId: string, token: string, delayMs: number): Promise<boolean> {
+    const changed = await this.pool.query(
+      `update pipeline_queue_jobs set state='retry_wait',attempt=greatest(attempt-1,0),
+       available_at=clock_timestamp()+($3::text)::interval,lease_token=null,lease_owner=null,
+       lease_expires_at=null,last_error_code='step_lease_coordination_wait',updated_at=clock_timestamp()
+       where id=$1 and state='leased' and lease_token=$2 and lease_expires_at>clock_timestamp() returning id`,
+      [jobId, token, `${Math.max(0, Math.trunc(delayMs))} milliseconds`],
+    );
+    return changed.rowCount === 1;
+  }
+
+  async retryQueueJob(
+    jobId: string,
+    token: string,
+    delayMs: number,
+    errorCode: string,
+  ): Promise<boolean> {
+    const changed = await this.pool.query(
+      `update pipeline_queue_jobs set state=case when attempt<3 then 'retry_wait'::queue_job_state else 'operator_action'::queue_job_state end,
+       available_at=clock_timestamp()+($3::text)::interval,lease_token=null,lease_owner=null,lease_expires_at=null,
+       last_error_code=$4,updated_at=clock_timestamp() where id=$1 and state='leased' and lease_token=$2 and lease_expires_at>clock_timestamp() returning id`,
+      [jobId, token, `${Math.max(0, Math.trunc(delayMs))} milliseconds`, errorCode],
+    );
+    return changed.rowCount === 1;
+  }
+
+  async recoverQueueJobs(): Promise<void> {
+    await this.transaction(async (client) => {
+      await client.query(
+        `update pipeline_queue_jobs q set
+         state=case when r.status='cancelled' then 'cancelled'::queue_job_state
+                    when q.pending_refresh then 'ready'::queue_job_state
+                    when r.status in ('waiting','blocked') then 'parked'::queue_job_state else 'completed'::queue_job_state end,
+         options=case when q.pending_refresh and r.status<>'cancelled' then '{"refresh_link_discovery":true}'::jsonb else q.options end,
+         phase=case when q.pending_refresh and r.status<>'cancelled' then 'pre_downstream'::queue_job_phase else q.phase end,
+         pending_refresh=case when q.pending_refresh and r.status<>'cancelled' then false else q.pending_refresh end,
+         attempt=case when q.pending_refresh and r.status<>'cancelled' then 0 else q.attempt end,
+         available_at=case when q.pending_refresh and r.status<>'cancelled' then clock_timestamp() else q.available_at end,
+         lease_token=null,lease_owner=null,lease_expires_at=null,
+         last_error_code=case when q.pending_refresh and r.status<>'cancelled' then null else 'startup_run_terminal' end,
+         updated_at=clock_timestamp()
+         from runs r where r.id=q.run_id and q.state in ('ready','leased','retry_wait')
+         and r.status in ('waiting','blocked','succeeded','cancelled')
+         and (r.status='cancelled' or q.options<>'{"refresh_link_discovery":true}'::jsonb)`,
+      );
+      await client.query(
+        `update pipeline_queue_jobs q set state='operator_action',lease_token=null,lease_owner=null,
+         lease_expires_at=null,last_error_code='legacy_review_explicit_recovery',updated_at=clock_timestamp()
+         from runs r where r.id=q.run_id and q.state in ('ready','leased','retry_wait')
+         and r.status='retryable_failed'
+         and r.current_step in ('review_writing_style','review_information_gain','review_fact_checking','review_link_conversion')
+         and not exists(select 1 from review_operation_states o where o.run_id=r.id)
+         and q.options->'authorise_legacy_review_recovery' is distinct from 'true'::jsonb`,
+      );
+      await client.query(
+        `update pipeline_queue_jobs set state=case when attempt<3 then 'ready'::queue_job_state else 'operator_action'::queue_job_state end,
+         available_at=clock_timestamp(),lease_token=null,lease_owner=null,lease_expires_at=null,
+         last_error_code='startup_lease_expired',updated_at=clock_timestamp()
+         where state='leased' and lease_expires_at<=clock_timestamp()`,
+      );
+    });
+  }
+
+  async queueExecutionState(runId: string): Promise<{
+    run_status: string;
+    current_step: PipelineStepId | null;
+    ambiguous: boolean;
+    coordination_wait: boolean;
+  }> {
+    const result = await this.pool.query<{
+      status: string;
+      current_step: PipelineStepId | null;
+      ambiguous: boolean;
+    }>(
+      `select r.status,r.current_step,
+       (exists(select 1 from draft_operation_states d where d.run_id=r.id and d.status='provider_in_flight') or
+        exists(select 1 from review_operation_states w where w.run_id=r.id and w.status='provider_in_flight') or
+        exists(select 1 from revision_operation_states v where v.run_id=r.id and v.status='provider_in_flight') or
+        exists(select 1 from coherence_checkpoints c where c.run_id=r.id and c.status='provider_in_flight') or
+        exists(select 1 from export_operations x where x.run_id=r.id and x.status='pending' and x.external_document_id is not null)
+       ) ambiguous from runs r where r.id=$1`,
+      [runId],
+    );
+    const row = result.rows[0];
+    if (!row) throw new NotFoundError("The run was not found.");
+    const coordination = await this.pool.query(
+      `select 1 from step_executions where run_id=$1 and status in ('leased','running')
+       and lease_expires_at>clock_timestamp() limit 1`,
+      [runId],
+    );
+    return {
+      run_status: row.status,
+      current_step: row.current_step,
+      ambiguous: row.ambiguous,
+      coordination_wait: coordination.rowCount === 1,
+    };
+  }
+
+  private async enqueueRunClient(
+    client: PoolClient,
+    runId: string,
+    options: QueueOptions,
+  ): Promise<void> {
+    const parsed = QueueOptionsSchema.parse(options);
+    const run = await client.query<{ status: string; current_step: PipelineStepId | null }>(
+      "select status,current_step from runs where id=$1 for update",
+      [runId],
+    );
+    if (!run.rows[0]) throw new NotFoundError("The run was not found.");
+    if (["succeeded", "cancelled", "waiting", "blocked"].includes(run.rows[0].status))
+      throw new ConflictError("This run is not queueable in its current state.");
+    const legacyReview =
+      run.rows[0].status === "retryable_failed" &&
+      [
+        "review_writing_style",
+        "review_information_gain",
+        "review_fact_checking",
+        "review_link_conversion",
+      ].includes(run.rows[0].current_step ?? "");
+    if (legacyReview && options.authorise_legacy_review_recovery !== true)
+      throw new ConflictError(
+        "This historical review failure requires explicit operator recovery authorisation.",
+      );
+    const active = await client.query<{
+      id: string;
+      state: string;
+      options: QueueOptions;
+      pending_refresh: boolean;
+      pending_options: QueueOptions;
+      phase: "pre_downstream" | "downstream_started";
+    }>(
+      `select id,state,options,pending_refresh,pending_options,phase from pipeline_queue_jobs where run_id=$1 and state in ('ready','leased','retry_wait','parked','operator_action') for update`,
+      [runId],
+    );
+    if (active.rows[0]) {
+      if (["ready", "leased", "retry_wait"].includes(active.rows[0].state)) {
+        // Never mutate options observed by an active job. Refresh has no paid-step authority
+        // and is isolated from every recovery signal, including under concurrent requests.
+        const signal = Object.fromEntries(
+          Object.entries(parsed).filter(([, value]) => value),
+        ) as QueueOptions;
+        if (!Object.keys(signal).length) return;
+        const row = active.rows[0];
+        const sameRefresh =
+          signal.refresh_link_discovery === true &&
+          (row.pending_refresh || row.options.refresh_link_discovery === true);
+        const sameRecovery =
+          signal.refresh_link_discovery !== true &&
+          Object.keys(signal).every(
+            (key) =>
+              row.pending_options[key as keyof QueueOptions] ||
+              row.options[key as keyof QueueOptions],
+          );
+        const hasAuthority =
+          Object.values(row.options).some(Boolean) ||
+          row.pending_refresh ||
+          Object.keys(row.pending_options).length > 0;
+        if (hasAuthority && !sameRefresh && !sameRecovery)
+          throw new ConflictError("Queue authorities must be requested separately.");
+        if (sameRefresh || sameRecovery) return;
+        if (signal.refresh_link_discovery) {
+          if (row.phase === "downstream_started")
+            throw new ConflictError(
+              "Link refresh cannot be accepted after paid downstream processing has started.",
+            );
+          await client.query(
+            `update pipeline_queue_jobs set pending_refresh=true,updated_at=clock_timestamp()
+             where id=$1 and phase='pre_downstream'`,
+            [row.id],
+          );
+        } else
+          await client.query(
+            `update pipeline_queue_jobs set pending_options=$2::jsonb,updated_at=clock_timestamp() where id=$1`,
+            [row.id, JSON.stringify(signal)],
+          );
+        return;
+      }
+      if (legacyReview && active.rows[0].state !== "operator_action")
+        throw new ConflictError("Historical review recovery is not available for this queue job.");
+      await client.query(
+        `update pipeline_queue_jobs set state='ready',phase='pre_downstream',attempt=0,available_at=clock_timestamp(),options=$2::jsonb,
+         pending_refresh=false,pending_options='{}'::jsonb,last_error_code=null,updated_at=clock_timestamp() where id=$1`,
+        [active.rows[0].id, JSON.stringify(parsed)],
+      );
+      return;
+    }
+    await client.query(`insert into pipeline_queue_jobs(run_id,options) values($1,$2::jsonb)`, [
+      runId,
+      JSON.stringify(parsed),
+    ]);
+  }
+
+  async hasActiveQueueJob(runId: string): Promise<boolean> {
+    const result = await this.pool.query(
+      "select 1 from pipeline_queue_jobs where run_id=$1 and state in ('ready','leased','retry_wait') limit 1",
+      [runId],
+    );
+    return result.rowCount === 1;
+  }
+
   private async transaction<T>(operation: (client: PoolClient) => Promise<T>): Promise<T> {
     const client = await this.pool.connect();
     try {

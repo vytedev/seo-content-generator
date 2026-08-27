@@ -22,6 +22,7 @@ import {
 } from "./model-provider.js";
 import type { ReviewProvider } from "./review-provider.js";
 import { readBoundedResponseBody } from "./http-response.js";
+import { classifyInvalidSuccess, isJson } from "./structured-output-diagnostics.js";
 import {
   CompactReviewEnvelopeSchema,
   expandCompactReviewFinding,
@@ -814,7 +815,19 @@ export class ChatCompletionReviewProvider implements ReviewProvider {
                 suggested_fix:
                   "Explicitly accept or reject this warning during findings review; use the application verifier findings for claim decisions.",
               };
-      logModelProviderOutputInvalid(this.provider, "review", this.model, 1);
+      const content = first?.choices[0]?.message.content;
+      logModelProviderOutputInvalid(
+        this.provider,
+        "review",
+        this.model,
+        1,
+        classifyInvalidSuccess(
+          first !== null,
+          first?.choices[0]?.finish_reason,
+          content,
+          isJson(content),
+        ),
+      );
       return ReviewResponseSchema.parse({
         request_id: `review_${hashIdempotencyInput(request)}`,
         findings: [advisory],
@@ -835,11 +848,13 @@ export class ChatCompletionReviewProvider implements ReviewProvider {
         },
       });
     }
-    if (first?.choices[0]?.finish_reason === "length")
+    if (first?.choices[0]?.finish_reason === "length") {
+      logModelProviderOutputInvalid(this.provider, "review", this.model, 1, "truncation");
       throw new ReviewProviderError(
         "REVIEW_PROVIDER_TRUNCATED",
         "Review provider output reached the operation token limit",
       );
+    }
     const corrective = await this.callModel(
       [
         ...buildReviewMessages(request),
@@ -854,16 +869,30 @@ export class ChatCompletionReviewProvider implements ReviewProvider {
       request.temperature,
       request.step,
     );
-    if (corrective?.choices[0]?.finish_reason === "length")
+    if (corrective?.choices[0]?.finish_reason === "length") {
+      logModelProviderOutputInvalid(this.provider, "review", this.model, 2, "truncation");
       throw new ReviewProviderError(
         "REVIEW_PROVIDER_TRUNCATED",
         "Review provider output reached the operation token limit",
       );
+    }
     const retriedBody = corrective
       ? parseReviewBody(corrective.choices[0]?.message.content ?? "", request)
       : undefined;
     if (!corrective || !retriedBody) {
-      logModelProviderOutputInvalid(this.provider, "review", this.model, 2);
+      const content = corrective?.choices[0]?.message.content;
+      logModelProviderOutputInvalid(
+        this.provider,
+        "review",
+        this.model,
+        2,
+        classifyInvalidSuccess(
+          corrective !== null,
+          corrective?.choices[0]?.finish_reason,
+          content,
+          isJson(content),
+        ),
+      );
       throw new ReviewProviderError(
         "REVIEW_PROVIDER_UNPARSEABLE",
         "Review provider returned unparseable output after 2 attempts",
@@ -937,9 +966,15 @@ export class ChatCompletionReviewProvider implements ReviewProvider {
                     },
                   },
                   ...(this.provider === "openrouter"
-                    ? { provider: { require_parameters: true } }
+                    ? {
+                        provider: { require_parameters: true },
+                        reasoning: { effort: "none", exclude: true },
+                      }
                     : {}),
                 }
+              : {}),
+            ...(this.provider === "openrouter" && !(step && strictResponseFormat(step))
+              ? { reasoning: { effort: "none", exclude: true } }
               : {}),
           }),
           signal: controller.signal,

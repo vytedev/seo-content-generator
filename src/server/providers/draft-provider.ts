@@ -81,6 +81,8 @@ export function buildMockDraft(request: DraftProviderRequest): StructuredDraft {
 /** Server-only deterministic provider. No network or model invocation occurs. */
 export class MockDraftProvider implements DraftProvider {
   readonly provider = "mock";
+  readonly prompt = { template_id: "mobelaris.draft" as const, template_version: "mock-v1" };
+  readonly contractIdentity = "mock-draft-contract-v1";
   readonly calls: DraftProviderRequest[] = [];
 
   constructor(

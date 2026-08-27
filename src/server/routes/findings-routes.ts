@@ -4,12 +4,11 @@ import {
   FindingFiltersSchema,
   type MilestoneThreeRepository,
 } from "../../shared/milestone-three.js";
-import type { MilestoneFourOrchestrator } from "../pipeline/milestone-four.js";
 
 export function registerFindingsRoutes(
   app: Express,
   findingsRepository: MilestoneThreeRepository,
-  continuation?: MilestoneFourOrchestrator,
+  options: { testOnlyLegacyContinuation?: (runId: string) => Promise<void> } = {},
 ): void {
   app.get("/api/runs/:runId/findings", async (request, response, next) => {
     const parsed = FindingFiltersSchema.safeParse(request.query);
@@ -55,18 +54,19 @@ export function registerFindingsRoutes(
         request.params.runId!,
         parsed.data,
       );
-      if (result.continuation_required && continuation) {
+      if (result.continuation_required && options.testOnlyLegacyContinuation) {
         try {
-          await continuation.run(request.params.runId!);
+          await options.testOnlyLegacyContinuation(request.params.runId!);
           response.status(200).json({ ...result, continuation: "completed" });
         } catch {
-          // Decisions are already committed atomically. The client reconciles from
-          // run detail; retry uses the existing milestone-four recovery path.
           response.status(202).json({ ...result, continuation: "retryable_failed" });
         }
         return;
       }
-      response.status(200).json({ ...result, continuation: "not_started" });
+      response.status(result.continuation_required ? 202 : 200).json({
+        ...result,
+        continuation: result.continuation_required ? "queue_accepted" : "already_accepted",
+      });
     } catch (error) {
       next(error);
     }

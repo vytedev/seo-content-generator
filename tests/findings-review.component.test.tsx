@@ -2,6 +2,10 @@ import { cleanup, render, screen, waitFor, within } from "@testing-library/react
 import { userEvent } from "@testing-library/user-event";
 import { afterEach, expect, it, vi } from "vitest";
 import { FindingsReview } from "../src/client/features/findings/FindingsReview.js";
+import {
+  findingCategories,
+  findingCategoryLabels,
+} from "../src/client/features/findings/finding-category-labels.js";
 
 const findings = [
   {
@@ -11,7 +15,7 @@ const findings = [
     step_execution_id: "execution-1",
     step: "review_fact_checking",
     stable_key: "fact.provenance",
-    category: "Fact checking",
+    category: "fact_checking",
     rule_reference: "fact.provenance_required",
     severity: "blocker",
     location: { field: "body_markdown", section: "Origins", line_start: 12 },
@@ -40,7 +44,7 @@ const findings = [
     step_execution_id: "execution-2",
     step: "review_writing_style",
     stable_key: "style.wordy",
-    category: "Writing style",
+    category: "writing_style",
     rule_reference: "style.conciseness",
     severity: "warning",
     location: { field: "body_markdown", section: "Choosing well", line_start: 28 },
@@ -69,7 +73,7 @@ it("wraps long unbroken finding metadata and prose inside responsive review rows
   const longFinding = {
     ...findings[0],
     id: longText,
-    category: longText,
+    category: "content",
     rule_reference: longText,
     issue: longText,
     evidence: longText,
@@ -84,6 +88,98 @@ it("wraps long unbroken finding metadata and prose inside responsive review rows
   expect(container.firstElementChild).toHaveClass("min-w-0", "max-w-full");
   expect(rule).toHaveClass("min-w-0", "[overflow-wrap:anywhere]");
   expect(row).toHaveClass("min-w-0", "max-w-full");
+});
+
+it("shows exhaustive labels while filtering with unchanged category machine values", async () => {
+  const user = userEvent.setup();
+  expect(Object.keys(findingCategoryLabels)).toEqual(findingCategories);
+  const categoryFindings = findingCategories.map((category, index) => ({
+    ...findings[0],
+    id: `finding-category-${index}`,
+    step_execution_id: `execution-category-${index}`,
+    stable_key: `category.${index}`,
+    category,
+    severity: "warning" as const,
+    rule_reference: `category.rule.${index}`,
+    issue: `Finding ${index + 1}: ${findingCategoryLabels[category]}`,
+    evidence: undefined,
+    hard_flag: false,
+  }));
+  vi.spyOn(globalThis, "fetch").mockResolvedValue(jsonResponse({ findings: categoryFindings }));
+  render(<FindingsReview runId="run-categories" />);
+
+  const categoryTrigger = await screen.findByRole("combobox", { name: "Category" });
+  expect(categoryTrigger).toHaveTextContent("All categories");
+
+  const severityTrigger = screen.getByRole("combobox", { name: "Severity" });
+  await user.click(severityTrigger);
+  for (const label of ["All severities", "Blocker", "Warning", "Information"])
+    expect(screen.getByRole("option", { name: label })).toBeInTheDocument();
+  expect(document.querySelector('[data-slot="select-scroll-up-button"]')).toBeNull();
+  expect(document.querySelector('[data-slot="select-scroll-down-button"]')).toBeNull();
+  await user.keyboard("{Escape}");
+  expect(severityTrigger).toHaveFocus();
+
+  const dispositionTrigger = screen.getByRole("combobox", { name: "Disposition" });
+  await user.click(dispositionTrigger);
+  for (const label of ["All dispositions", "Pending", "Accepted", "Rejected"])
+    expect(screen.getByRole("option", { name: label })).toBeInTheDocument();
+  await user.keyboard("{Escape}");
+  expect(dispositionTrigger).toHaveFocus();
+
+  await user.click(categoryTrigger);
+  for (const category of findingCategories)
+    expect(
+      screen.getByRole("option", { name: findingCategoryLabels[category] }),
+    ).toBeInTheDocument();
+  expect(screen.queryByText("fact_advisory")).not.toBeInTheDocument();
+  expect(screen.queryByText("link_conversion")).not.toBeInTheDocument();
+
+  const content = document.querySelector<HTMLElement>('[data-slot="select-content"]');
+  expect(content).toHaveClass("overflow-hidden");
+  expect(content).not.toHaveClass("overflow-y-auto");
+  expect(document.querySelector('[data-slot="select-scroll-up-button"]')).toBeNull();
+  expect(document.querySelector('[data-slot="select-scroll-down-button"]')).toBeNull();
+
+  await user.click(screen.getByRole("option", { name: "Fact advisory" }));
+  expect(categoryTrigger).toHaveTextContent("Fact advisory");
+  expect(screen.getByText("Finding 4: Fact advisory")).toBeInTheDocument();
+  expect(screen.queryByText("Finding 10: Link and conversion")).not.toBeInTheDocument();
+
+  await user.click(categoryTrigger);
+  await user.click(screen.getByRole("option", { name: "Link and conversion" }));
+  expect(categoryTrigger).toHaveTextContent("Link and conversion");
+  expect(screen.getByText("Finding 10: Link and conversion")).toBeInTheDocument();
+  expect(screen.queryByText("Finding 4: Fact advisory")).not.toBeInTheDocument();
+
+  await user.click(categoryTrigger);
+  await user.click(screen.getByRole("option", { name: "All categories" }));
+  expect(categoryTrigger).toHaveTextContent("All categories");
+  expect(screen.getAllByLabelText(/^Select finding:/)).toHaveLength(findingCategories.length);
+
+  categoryTrigger.focus();
+  await user.keyboard(" ");
+  expect(screen.getByRole("listbox")).toBeInTheDocument();
+  await user.keyboard("w");
+  await user.keyboard("{Enter}");
+  expect(categoryTrigger).toHaveTextContent("Writing style");
+  expect(screen.getByText("Finding 15: Writing style")).toBeInTheDocument();
+});
+
+it("fails closed without displaying an unapproved raw category identifier", async () => {
+  vi.spyOn(globalThis, "fetch").mockResolvedValue(
+    jsonResponse({
+      findings: [{ ...findings[0], category: "unexpected_internal_value" }],
+    }),
+  );
+  render(<FindingsReview runId="run-unsupported-category" />);
+
+  await waitFor(() =>
+    expect(screen.getByRole("status")).toHaveTextContent(
+      "A finding category has no approved operator-facing label.",
+    ),
+  );
+  expect(screen.queryByText("unexpected_internal_value")).not.toBeInTheDocument();
 });
 
 it("shows the frozen review details, typed hard flag and explicit controls", async () => {

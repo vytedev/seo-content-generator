@@ -8,6 +8,7 @@ import {
 } from "../src/server/providers/chat-completion-revision-provider.js";
 const TEST_MODEL = "provider/configured-model";
 import type { StructuredDraft } from "../src/shared/milestone-two.js";
+import { applyCompactRevisionPlan } from "../src/server/providers/compact-model-contracts.js";
 
 const TOKEN = "openrouter_test_key_not_real";
 function validDraft(): StructuredDraft {
@@ -174,7 +175,9 @@ describe("ChatCompletionRevisionProvider.revise", () => {
     ];
     expect(url).toBe("https://openrouter.ai/api/v1/chat/completions");
     expect(init.headers.authorization).toBe(`Bearer ${TOKEN}`);
-    expect(JSON.parse(init.body).model).toBe(TEST_MODEL);
+    const requestBody = JSON.parse(init.body);
+    expect(requestBody.model).toBe(TEST_MODEL);
+    expect(requestBody.reasoning).toEqual({ effort: "none", exclude: true });
   });
 
   it("restores unauthorised structured-field drift and server-owned claims", async () => {
@@ -362,5 +365,148 @@ describe("revision prompt contract", () => {
       "use only these internal URLs",
     ])
       expect(user).toContain(requirement);
+  });
+});
+
+/**
+ * Multi-block readability authority reuses the existing compact contract: the
+ * application issues one row per authorised block, so ID discipline and
+ * reverse-order application are already enforced. These pin that the expanded
+ * ID set does not weaken any of it.
+ */
+describe("application-issued readability block IDs", () => {
+  const markdown = [
+    "# Guide", // 1
+    "", // 2
+    "Direct answer prose.", // 3
+    "", // 4
+    "## Section", // 5
+    "", // 6
+    "First hard paragraph.", // 7
+    "", // 8
+    "Untouched middle paragraph.", // 9
+    "", // 10
+    "Second hard paragraph.", // 11
+  ].join("\n");
+
+  function blockRequest(): RevisionRequest {
+    const base = validRequest();
+    return {
+      ...base,
+      current_document: { ...base.current_document, markdown },
+      accepted_findings: [7, 11].map((line, index) => ({
+        ...base.accepted_findings[0]!,
+        id: `finding-1::rb${index + 1}`,
+        rule_reference: "style.readability_grade_8",
+        severity: "blocker" as const,
+        location: { field: "body_markdown", line_start: line, line_end: line },
+      })),
+    };
+  }
+
+  const plan = (edits: Array<Record<string, unknown>>) => ({ edits });
+
+  it("sends only issued block IDs and their bounded source text", () => {
+    const messages = buildRevisionMessages(blockRequest());
+    const body = messages.map((message) => message.content).join("\n");
+    expect(body).toContain("finding-1::rb1");
+    expect(body).toContain("finding-1::rb2");
+    expect(body).toContain("First hard paragraph.");
+    expect(body).toContain("Second hard paragraph.");
+    // Prose no block authorises is never offered as an editable target.
+    const targets = /"current":\s*"Untouched middle paragraph\."/.test(body);
+    expect(targets).toBe(false);
+  });
+
+  it("applies several non-contiguous replacements without corrupting coordinates", () => {
+    const result = applyCompactRevisionPlan(
+      blockRequest(),
+      plan([
+        { id: "finding-1::rb1", st: "applied", why: "Simplified.", replacement: "Short one." },
+        { id: "finding-1::rb2", st: "applied", why: "Simplified.", replacement: "Short two." },
+      ]),
+    );
+    expect(result.document.markdown.split("\n")).toEqual([
+      "# Guide",
+      "",
+      "Direct answer prose.",
+      "",
+      "## Section",
+      "",
+      "Short one.",
+      "",
+      "Untouched middle paragraph.",
+      "",
+      "Short two.",
+    ]);
+    expect(result.finding_results.map((row) => row.status)).toEqual(["applied", "applied"]);
+  });
+
+  it("fails closed on an unknown block ID", () => {
+    expect(() =>
+      applyCompactRevisionPlan(
+        blockRequest(),
+        plan([
+          { id: "finding-1::rb1", st: "applied", why: "ok", replacement: "Short one." },
+          { id: "finding-1::rb9", st: "applied", why: "ok", replacement: "Short two." },
+        ]),
+      ),
+    ).toThrow(/does not cover accepted findings in order/);
+  });
+
+  it("fails closed on a duplicate block ID", () => {
+    expect(() =>
+      applyCompactRevisionPlan(
+        blockRequest(),
+        plan([
+          { id: "finding-1::rb1", st: "applied", why: "ok", replacement: "Short one." },
+          { id: "finding-1::rb1", st: "applied", why: "ok", replacement: "Short two." },
+        ]),
+      ),
+    ).toThrow(/does not cover accepted findings in order/);
+  });
+
+  it("fails closed on a missing block ID", () => {
+    expect(() =>
+      applyCompactRevisionPlan(
+        blockRequest(),
+        plan([{ id: "finding-1::rb1", st: "applied", why: "ok", replacement: "Short one." }]),
+      ),
+    ).toThrow(/does not cover accepted findings in order/);
+  });
+
+  it("fails closed on reordered block IDs", () => {
+    expect(() =>
+      applyCompactRevisionPlan(
+        blockRequest(),
+        plan([
+          { id: "finding-1::rb2", st: "applied", why: "ok", replacement: "Short two." },
+          { id: "finding-1::rb1", st: "applied", why: "ok", replacement: "Short one." },
+        ]),
+      ),
+    ).toThrow(/does not cover accepted findings in order/);
+  });
+
+  it("never lets a replacement reach prose outside its issued block", () => {
+    const result = applyCompactRevisionPlan(
+      blockRequest(),
+      plan([
+        {
+          id: "finding-1::rb1",
+          st: "applied",
+          why: "ok",
+          // Even a multi-line replacement only ever replaces its own block.
+          replacement: "Short one.\n\nSmuggled extra paragraph.",
+        },
+        { id: "finding-1::rb2", st: "unable", why: "Left alone.", replacement: null },
+      ]),
+    );
+    expect(result.document.markdown).toContain("Untouched middle paragraph.");
+    expect(result.document.markdown).toContain("Second hard paragraph.");
+    // The smuggled text lands inside the authorised block's own range, where the
+    // envelope's hunk ownership still governs it.
+    expect(result.document.markdown.indexOf("Smuggled extra paragraph.")).toBeLessThan(
+      result.document.markdown.indexOf("Untouched middle paragraph."),
+    );
   });
 });

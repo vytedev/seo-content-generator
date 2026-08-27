@@ -57,11 +57,26 @@ function detail(overrides: Record<string, unknown> = {}) {
     usage: { input_units: 1200, output_units: 500, cost_micros: 23500 },
     export: { status: "not_started", external_url: null },
     can_retry: true,
+    draft_recovery: "none",
     blocked_for_operator: false,
     block_reason: "unknown",
     block_counts: { deterministic_blockers: 0, coherence_blockers: 0 },
     ...overrides,
   };
+}
+
+function succeededStepsThrough(stepId: string) {
+  const end = PIPELINE_STEPS.findIndex((step) => step.id === stepId);
+  if (end < 0) throw new Error(`Unknown pipeline step: ${stepId}`);
+  return PIPELINE_STEPS.slice(0, end + 1).map((step, index) => ({
+    id: `succeeded-attempt-${index}`,
+    step: step.id,
+    number: step.number,
+    name: step.name,
+    attempt: 1,
+    status: "succeeded",
+    error: null,
+  }));
 }
 
 function summary(overrides: Record<string, unknown> = {}) {
@@ -175,15 +190,24 @@ describe("Blog Post page", () => {
   it("resumes milestone-two steps through the milestone-two endpoint", async () => {
     const fetchMock = stubFetch(
       { runs: [summary({ status: "retryable_failed", current_step: "draft" })] },
-      () => detail({ status: "retryable_failed", current_step: "draft" }),
+      () =>
+        detail({
+          status: "retryable_failed",
+          current_step: "draft",
+          draft_recovery: "legacy_confirmation_required",
+        }),
     );
     const user = userEvent.setup();
     render(<App authMode="test-bypass" />);
 
-    await user.click(await screen.findByRole("button", { name: "Resume safely" }));
+    await user.click(
+      await screen.findByRole("button", { name: "Authorise one new draft request" }),
+    );
     await waitFor(() =>
       expect(fetchMock).toHaveBeenCalledWith("/api/runs/run-m4-1/milestone-two/resume", {
         method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ authorise_legacy_draft_recovery: true }),
       }),
     );
   });
@@ -411,6 +435,68 @@ describe("Blog Post page", () => {
     resolveResume(response(running));
   });
 
+  it("polls a clean Step 1.11 completion into Step 1.12 without a hard refresh", async () => {
+    let resolveResume!: (value: Response) => void;
+    const resumeResponse = new Promise<Response>((resolve) => {
+      resolveResume = resolve;
+    });
+    let detailReads = 0;
+    const failedSteps = [
+      ...succeededStepsThrough("revision_pass"),
+      {
+        id: "rerun-failed-attempt",
+        step: "automated_checks_rerun",
+        number: "1.11",
+        name: "Automated checks re-run",
+        attempt: 2,
+        status: "retryable_failed",
+        error: "Pipeline operation failed safely",
+      },
+    ];
+    const failed = detail({
+      status: "retryable_failed",
+      current_step: "automated_checks_rerun",
+      updated_at: "2026-01-02T10:00:00.000Z",
+      steps: failedSteps,
+    });
+    const advanced = detail({
+      status: "running",
+      current_step: "final_coherence_export",
+      updated_at: "2026-01-02T10:01:00.000Z",
+      steps: succeededStepsThrough("automated_checks_rerun"),
+      block_reason: "unknown",
+      block_counts: { deterministic_blockers: 0, coherence_blockers: 0 },
+    });
+    vi.spyOn(globalThis, "fetch").mockImplementation(async (input, init) => {
+      const url = typeof input === "string" ? input : String((input as Request).url ?? "");
+      if (url.includes("/api/runs?"))
+        return runsResponse({
+          runs: [summary({ status: "retryable_failed", current_step: "automated_checks_rerun" })],
+        });
+      if (url.includes("/resume") && init?.method === "POST") return resumeResponse;
+      detailReads += 1;
+      return response(detailReads === 1 ? failed : advanced);
+    });
+    const user = userEvent.setup();
+    render(<App authMode="test-bypass" />);
+
+    const context = await screen.findByRole("complementary", { name: "Run context" });
+    await user.click(within(context).getByRole("button", { name: "Resume safely" }));
+    const articleStatus = within(context)
+      .getByRole("heading", { name: "Article status" })
+      .closest("section")!;
+    await waitFor(() => expect(within(articleStatus).getByText("Running")).toBeInTheDocument());
+    expect(within(articleStatus).getByText("Current step")).toBeInTheDocument();
+    expect(
+      within(articleStatus).getByText("1.12 · Final coherence review and export"),
+    ).toBeInTheDocument();
+    const pipeline = screen.getByRole("navigation", { name: "Twelve-step pipeline" });
+    const rerunRow = within(pipeline).getByText("Automated checks re-run").closest("li")!;
+    expect(within(rerunRow).getByText("Succeeded")).toBeInTheDocument();
+    expect(detailReads).toBeGreaterThan(1);
+    resolveResume(response(advanced));
+  });
+
   it("derives the needs-decision state from a waiting run, opening the findings screen automatically", async () => {
     const fetchMock = vi.spyOn(globalThis, "fetch").mockImplementation(async (input) => {
       const url = typeof input === "string" ? input : String((input as Request).url ?? "");
@@ -429,7 +515,7 @@ describe("Blog Post page", () => {
               step_execution_id: "execution-1",
               step: "review_writing_style",
               stable_key: "style.wordy",
-              category: "Writing style",
+              category: "writing_style",
               rule_reference: "style.conciseness",
               severity: "warning",
               location: { field: "body_markdown", line_start: 4 },
@@ -582,6 +668,72 @@ describe("Blog Post page", () => {
     expect(screen.queryByRole("button", { name: "Retry export" })).not.toBeInTheDocument();
   });
 
+  it("keeps a genuine later blocker while Step 1.11 remains succeeded", async () => {
+    stubFetch(
+      { runs: [summary({ status: "blocked", current_step: "final_coherence_export" })] },
+      () =>
+        detail({
+          status: "blocked",
+          current_step: "final_coherence_export",
+          steps: succeededStepsThrough("automated_checks_rerun"),
+          coherence_return_cycles: 2,
+          blocked_for_operator: true,
+          block_reason: "coherence_cycle_cap",
+          block_counts: { deterministic_blockers: 0, coherence_blockers: 1 },
+        }),
+    );
+    render(<App authMode="test-bypass" />);
+
+    const context = await screen.findByRole("complementary", { name: "Run context" });
+    const articleStatus = within(context)
+      .getByRole("heading", { name: "Article status" })
+      .closest("section")!;
+    expect(within(articleStatus).getByText("Blocked")).toBeInTheDocument();
+    expect(within(articleStatus).getByText("Current step")).toBeInTheDocument();
+    expect(
+      within(articleStatus).getByText("1.12 · Final coherence review and export"),
+    ).toBeInTheDocument();
+    expect(within(articleStatus).queryByText("Blocked after")).not.toBeInTheDocument();
+    const pipeline = screen.getByRole("navigation", { name: "Twelve-step pipeline" });
+    const rerunRow = within(pipeline).getByText("Automated checks re-run").closest("li")!;
+    expect(within(rerunRow).getByText("Succeeded")).toBeInTheDocument();
+    expect(screen.getByText(/final check still found 1 issue/)).toBeInTheDocument();
+  });
+
+  it("preserves a failed Step 1.11 retry state and guidance", async () => {
+    stubFetch(
+      { runs: [summary({ status: "retryable_failed", current_step: "automated_checks_rerun" })] },
+      () =>
+        detail({
+          status: "retryable_failed",
+          current_step: "automated_checks_rerun",
+          steps: [
+            ...succeededStepsThrough("revision_pass"),
+            {
+              id: "rerun-failed",
+              step: "automated_checks_rerun",
+              number: "1.11",
+              name: "Automated checks re-run",
+              attempt: 2,
+              status: "retryable_failed",
+              error: "Pipeline operation failed safely",
+            },
+          ],
+        }),
+    );
+    render(<App authMode="test-bypass" />);
+
+    const context = await screen.findByRole("complementary", { name: "Run context" });
+    const articleStatus = within(context)
+      .getByRole("heading", { name: "Article status" })
+      .closest("section")!;
+    expect(within(articleStatus).getByText("Retry available")).toBeInTheDocument();
+    expect(within(articleStatus).getByText("Current step")).toBeInTheDocument();
+    expect(within(articleStatus).getByText("1.11 · Automated checks re-run")).toBeInTheDocument();
+    expect(within(articleStatus).queryByText("Blocked after")).not.toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "Resume safely" })).toBeInTheDocument();
+  });
+
   it("shows the exact automatic deterministic-repair running copy", async () => {
     stubFetch({ runs: [summary()] }, () =>
       detail({
@@ -595,6 +747,39 @@ describe("Blog Post page", () => {
     expect(
       await screen.findByText("Automatically correcting required checks — cycle 2 of 2"),
     ).toHaveAttribute("role", "status");
+  });
+
+  it("shows a clean succeeded Step 1.11 at Step 1.12 after a hard refresh", async () => {
+    stubFetch(
+      { runs: [summary({ status: "running", current_step: "final_coherence_export" })] },
+      () =>
+        detail({
+          status: "running",
+          current_step: "final_coherence_export",
+          updated_at: "2026-01-02T10:01:00.000Z",
+          steps: succeededStepsThrough("automated_checks_rerun"),
+          block_reason: "unknown",
+          block_counts: { deterministic_blockers: 0, coherence_blockers: 0 },
+        }),
+    );
+    render(<App authMode="test-bypass" />);
+
+    const context = await screen.findByRole("complementary", { name: "Run context" });
+    const articleStatus = within(context)
+      .getByRole("heading", { name: "Article status" })
+      .closest("section")!;
+    expect(within(articleStatus).getByText("Running")).toBeInTheDocument();
+    expect(within(articleStatus).getByText("Current step")).toBeInTheDocument();
+    expect(
+      within(articleStatus).getByText("1.12 · Final coherence review and export"),
+    ).toBeInTheDocument();
+    expect(within(articleStatus).queryByText("Blocked after")).not.toBeInTheDocument();
+    const pipeline = screen.getByRole("navigation", { name: "Twelve-step pipeline" });
+    const rerunRow = within(pipeline).getByText("Automated checks re-run").closest("li")!;
+    expect(within(rerunRow).getByText("Succeeded")).toBeInTheDocument();
+    expect(
+      within(rerunRow).queryByText(/required items? still blocks? the article/),
+    ).not.toBeInTheDocument();
   });
 
   it("identifies a Step 1.11 deterministic block with exact remaining details", async () => {
@@ -639,6 +824,7 @@ describe("Blog Post page", () => {
         detail({
           status: "blocked",
           current_step: "automated_checks_rerun",
+          steps: succeededStepsThrough("automated_checks_rerun"),
           deterministic_repair_cycles: 2,
           blocked_for_operator: true,
           block_reason: "deterministic_blockers",
@@ -655,6 +841,21 @@ describe("Blog Post page", () => {
         }),
     );
     render(<App authMode="test-bypass" />);
+
+    const context = await screen.findByRole("complementary", { name: "Run context" });
+    const articleStatus = within(context)
+      .getByRole("heading", { name: "Article status" })
+      .closest("section")!;
+    expect(within(articleStatus).getByText("Blocked")).toBeInTheDocument();
+    expect(within(articleStatus).getByText("Blocked after")).toBeInTheDocument();
+    expect(within(articleStatus).queryByText("Current step")).not.toBeInTheDocument();
+    expect(within(articleStatus).getByText("1.11 · Automated checks re-run")).toBeInTheDocument();
+    const pipeline = screen.getByRole("navigation", { name: "Twelve-step pipeline" });
+    const rerunRow = within(pipeline).getByText("Automated checks re-run").closest("li")!;
+    expect(within(rerunRow).getByText("Succeeded")).toBeInTheDocument();
+    expect(
+      within(rerunRow).getByText(/1 required item still blocks the article/),
+    ).toBeInTheDocument();
 
     expect(await screen.findByRole("heading", { name: "What to do next" })).toBeInTheDocument();
     expect(screen.getByText("Review the item listed above.")).toBeInTheDocument();

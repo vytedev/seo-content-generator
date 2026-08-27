@@ -1,6 +1,6 @@
 import type { Express, Response } from "express";
 import { z } from "zod";
-import { ConflictError, UnprocessableError } from "../../shared/errors.js";
+import { ConflictError, ServiceUnavailableError, UnprocessableError } from "../../shared/errors.js";
 import type { RunDetail, RunSummary, UsageTotals } from "../../shared/contracts/run-detail.js";
 import {
   RunListQuerySchema,
@@ -12,6 +12,7 @@ import type { MilestoneFourOrchestrator } from "../pipeline/milestone-four.js";
 import type { MilestoneThreeOrchestrator } from "../pipeline/milestone-three.js";
 import type { EditorialCorrectionOrchestrator } from "../pipeline/editorial-correction.js";
 import type { MilestoneTwoOrchestrator } from "../pipeline/milestone-two.js";
+import type { PipelineQueueRepository, QueueOptions } from "../../shared/queue.js";
 
 export interface MilestoneFourRoutes {
   repository: MilestoneFourRepository;
@@ -41,6 +42,21 @@ export interface RunRouteOptions {
   milestoneTwo?: MilestoneTwoRoutes | undefined;
   milestoneThree?: MilestoneThreeRoutes | undefined;
   milestoneFour?: MilestoneFourRoutes | undefined;
+  queue?: PipelineQueueRepository | undefined;
+}
+
+/** Exact durable state in which the dedicated export retry action is permitted. */
+export function isExportRetryEligible(detail: RunDetail): boolean {
+  const finalAttempt = [...detail.steps]
+    .reverse()
+    .find((attempt) => attempt.step === "final_coherence_export");
+  return (
+    detail.status === "retryable_failed" &&
+    detail.current_step === "final_coherence_export" &&
+    detail.export.status === "failed" &&
+    finalAttempt?.status === "retryable_failed" &&
+    finalAttempt.error?.includes("STEP_1_12_FAILED;stage=google_docs_export;") === true
+  );
 }
 
 export function registerPipelineUnavailableRoutes(app: Express): void {
@@ -72,6 +88,15 @@ export function registerRunRoutes(app: Express, options: RunRouteOptions): void 
   function classifyPipelineError(error: unknown): unknown {
     if (error instanceof RevisionGuardError) return new UnprocessableError(error.message);
     return error;
+  }
+
+  const optionsQueue = options.queue;
+  async function enqueue(runId: string, queueOptions: QueueOptions = {}): Promise<void> {
+    if (!optionsQueue)
+      throw new ServiceUnavailableError(
+        "Pipeline continuation is unavailable because the durable queue is not configured.",
+      );
+    await optionsQueue.enqueueRun(runId, queueOptions);
   }
 
   async function respondWithDetail(
@@ -115,13 +140,7 @@ export function registerRunRoutes(app: Express, options: RunRouteOptions): void 
           });
           // Both a fresh authorisation and an idempotent replay are continuation signals. If the
           // client disconnected after the authorisation commit, replay must resume the durable run.
-          const detail = await milestoneFour.repository.getRunDetail(request.params.runId!);
-          if (
-            detail.status !== "succeeded" &&
-            detail.status !== "blocked" &&
-            detail.status !== "cancelled"
-          )
-            await milestoneFour.orchestrator.run(request.params.runId!);
+          await enqueue(request.params.runId!);
           await respondWithDetail(response, request.params.runId!, 200);
         } catch (error) {
           if (await respondWithDurableOutcome(response, request.params.runId!)) return;
@@ -145,26 +164,16 @@ export function registerRunRoutes(app: Express, options: RunRouteOptions): void 
       try {
         await assertNotCancelled(request.params.runId!);
         const body = z
-          .object({ refresh_link_discovery: z.boolean().optional() })
+          .object({
+            refresh_link_discovery: z.boolean().optional(),
+            authorise_legacy_draft_recovery: z.literal(true).optional(),
+          })
           .strict()
           .parse(request.body ?? {});
-        await milestoneTwo.orchestrator.run(request.params.runId!, "local-worker", {
-          refreshLinkDiscovery: body.refresh_link_discovery ?? false,
+        await enqueue(request.params.runId!, {
+          refresh_link_discovery: body.refresh_link_discovery ?? false,
+          authorise_legacy_draft_recovery: body.authorise_legacy_draft_recovery ?? false,
         });
-        // Recovering 1.2–1.3 continues straight into 1.4–1.9 so the run reaches
-        // the operator wait; a milestone-three failure is already persisted as
-        // retryable_failed at the failing step and is recoverable through its
-        // own resume route, so it must not fail this already-successful resume.
-        if (options.milestoneThree) {
-          try {
-            await options.milestoneThree.orchestrator.run(request.params.runId!);
-            if (options.milestoneFour)
-              await options.milestoneFour.orchestrator.run(request.params.runId!);
-          } catch (error) {
-            if (await respondWithDurableOutcome(response, request.params.runId!)) return;
-            throw error;
-          }
-        }
         await respondWithDetail(response, request.params.runId!, 200);
       } catch (error) {
         if (await respondWithDurableOutcome(response, request.params.runId!)) return;
@@ -200,15 +209,11 @@ export function registerRunRoutes(app: Express, options: RunRouteOptions): void 
     app.post("/api/runs/:runId/milestone-three/resume", async (request, response, next) => {
       try {
         await assertNotCancelled(request.params.runId!);
-        await milestoneThree.orchestrator.run(request.params.runId!);
-        if (options.milestoneFour) {
-          try {
-            await options.milestoneFour.orchestrator.run(request.params.runId!);
-          } catch (error) {
-            if (await respondWithDurableOutcome(response, request.params.runId!)) return;
-            throw error;
-          }
-        }
+        const body = z
+          .object({ authorise_legacy_review_recovery: z.literal(true).optional() })
+          .strict()
+          .parse(request.body ?? {});
+        await enqueue(request.params.runId!, body);
         await respondWithDetail(response, request.params.runId!, 200);
       } catch (error) {
         if (await respondWithDurableOutcome(response, request.params.runId!)) return;
@@ -232,7 +237,7 @@ export function registerRunRoutes(app: Express, options: RunRouteOptions): void 
               "Only a deterministic blocker with remaining correction budget can be resumed.",
             );
         }
-        await milestoneFour.orchestrator.run(request.params.runId!);
+        await enqueue(request.params.runId!);
         await respondWithDetail(response, request.params.runId!, 200);
       } catch (error) {
         // Revision guards retain their established 422 contract even though the failed attempt is
@@ -293,16 +298,25 @@ export function registerRunRoutes(app: Express, options: RunRouteOptions): void 
       try {
         await assertNotCancelled(request.params.runId!);
         const detail = await milestoneFour.repository.getRunDetail(request.params.runId!);
-        if (
-          detail.status === "blocked" ||
-          (detail.export.status !== "failed" && detail.status !== "retryable_failed")
-        )
+        if (!isExportRetryEligible(detail))
           throw new ConflictError("The export is not available for retry.");
-        await milestoneFour.orchestrator.run(request.params.runId!);
+        await enqueue(request.params.runId!);
         response
           .status(200)
           .json(await milestoneFour.repository.getRunDetail(request.params.runId!));
       } catch (error) {
+        // An invalid retry remains a typed 409 even when the run already has durable failure state.
+        if (error instanceof ConflictError) {
+          next(error);
+          return;
+        }
+        const refreshed = await milestoneFour.repository
+          .getRunDetail(request.params.runId!)
+          .catch(() => null);
+        if (refreshed && isExportRetryEligible(refreshed)) {
+          response.status(200).json(refreshed);
+          return;
+        }
         next(error);
       }
     });

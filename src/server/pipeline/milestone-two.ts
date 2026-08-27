@@ -5,10 +5,27 @@ import {
   type LinkDiscoveryMetadata,
   type MilestoneRepository,
 } from "../../shared/milestone-two.js";
+import { DraftProviderError } from "../providers/chat-completion-draft-provider.js";
 import type { DraftProvider } from "../providers/contracts.js";
 import { withHeartbeat } from "./lease-heartbeat.js";
+import { classifyError, logger } from "../logger.js";
 
-export type FailureBoundary = "after_link_persist" | "after_provider" | "after_draft_persist";
+export type FailureBoundary =
+  | "after_link_persist"
+  | "after_draft_reservation"
+  | "after_provider_return"
+  | "after_provider"
+  | "after_draft_persist";
+
+const UNDISPATCHED_DRAFT_CODES = new Set([
+  "DRAFT_PROVIDER_TOKEN_MISSING",
+  "DRAFT_PROVIDER_MODEL_INVALID",
+  "DRAFT_PROVIDER_MODEL_MISMATCH",
+]);
+
+function provablyUndispatchedDraftFailure(error: unknown): boolean {
+  return error instanceof DraftProviderError && UNDISPATCHED_DRAFT_CODES.has(error.code);
+}
 export interface FailureInjector {
   hit(boundary: FailureBoundary): void | Promise<void>;
 }
@@ -45,20 +62,38 @@ export class MilestoneTwoOrchestrator {
   async run(
     runId: string,
     owner = "local-worker",
-    options: { refreshLinkDiscovery?: boolean } = {},
+    options: { refreshLinkDiscovery?: boolean; operatorAuthorisedDraftRecovery?: boolean } = {},
   ): Promise<void> {
     if (!(await this.repository.stepSucceeded(runId, "ingest_handoff")))
       throw new Error("Step 1.1 must be completed by ingestHandoff first");
     await this.runLinks(runId, owner, options.refreshLinkDiscovery ?? false);
-    await this.runDraft(runId, owner);
+    await this.runDraft(runId, owner, options.operatorAuthorisedDraftRecovery ?? false);
   }
 
-  private async runLinks(runId: string, owner: string, refresh: boolean): Promise<void> {
-    if (await this.repository.stepSucceeded(runId, "internal_link_discovery")) return;
-    const lease = await this.repository.claimStep(runId, "internal_link_discovery", owner);
+  /** Isolated Step 1.2 refresh: never grants draft or any later-step authority. */
+  async refreshLinks(runId: string, owner = "local-worker"): Promise<void> {
+    if (!(await this.repository.stepSucceeded(runId, "ingest_handoff")))
+      throw new Error("Step 1.1 must be completed by ingestHandoff first");
+    await this.runLinks(runId, owner, true, true);
+  }
+
+  private async runLinks(
+    runId: string,
+    owner: string,
+    refresh: boolean,
+    preserveFailureProgress = false,
+  ): Promise<void> {
+    const alreadySucceeded = await this.repository.stepSucceeded(runId, "internal_link_discovery");
+    if (alreadySucceeded && !refresh) return;
+    const lease = await this.repository.claimStep(
+      runId,
+      "internal_link_discovery",
+      owner,
+      alreadySucceeded && refresh,
+    );
     try {
       let links = await this.repository.getLinks(runId);
-      if (!links) {
+      if (!links || refresh) {
         const handoff = await this.repository.getHandoff(runId);
         const discovered = await withHeartbeat(this.repository, lease, () =>
           this.links.discover(handoff.primary_keyword, { refresh }),
@@ -108,21 +143,38 @@ export class MilestoneTwoOrchestrator {
           // Persist immutable evidence that the local-only bypass was used. The
           // honest empty shortlist and every downstream/export gate remain unchanged.
         }
-        await this.repository.saveLinks(runId, lease.execution_id, lease.token, links, metadata);
-        await this.failures?.hit("after_link_persist");
+        if (alreadySucceeded) {
+          // Refresh cannot replace the shortlist already consumed by paid downstream steps.
+          // Persist only this attempt's evidence and cache CAS; downstream steps remain replay-safe.
+          if (metadata)
+            await this.repository.saveLinkDiscoveryEvidence(
+              runId,
+              lease.execution_id,
+              lease.token,
+              metadata,
+            );
+        } else {
+          await this.repository.saveLinks(runId, lease.execution_id, lease.token, links, metadata);
+          await this.failures?.hit("after_link_persist");
+        }
       }
-      await this.repository.completeStep(lease.execution_id, lease.token);
+      await this.repository.completeStep(lease.execution_id, lease.token, alreadySucceeded);
     } catch (error) {
       await this.repository.failStep(
         lease.execution_id,
         lease.token,
         error instanceof Error ? error.message : "Unknown failure",
+        preserveFailureProgress,
       );
       throw error;
     }
   }
 
-  private async runDraft(runId: string, owner: string): Promise<void> {
+  private async runDraft(
+    runId: string,
+    owner: string,
+    operatorAuthorisedDraftRecovery: boolean,
+  ): Promise<void> {
     if (await this.repository.stepSucceeded(runId, "draft")) return;
     const lease = await this.repository.claimStep(runId, "draft", owner);
     try {
@@ -140,23 +192,114 @@ export class MilestoneTwoOrchestrator {
           internal_links: links,
           model: this.drafts.model,
           reference_snapshots: referenceSnapshots,
-          prompt: { template_id: "mobelaris.draft" as const, template_version: "2.0.0" },
+          prompt: this.drafts.prompt,
         };
-        // Model generation can legitimately exceed the lease interval; renew
-        // the fencing lease while the provider call is genuinely in flight.
-        const response = DraftProviderResponseSchema.parse(
-          await withHeartbeat(this.repository, lease, () => this.drafts.generate(request)),
-        );
+        const operation = await this.repository.beginDraftOperation({
+          run_id: runId,
+          execution_id: lease.execution_id,
+          token: lease.token,
+          request,
+          provider: this.drafts.provider,
+          model: this.drafts.model,
+          contract_identity: this.drafts.contractIdentity,
+          purpose: operatorAuthorisedDraftRecovery ? "legacy_operator_recovery" : "initial",
+          operator_authorised: operatorAuthorisedDraftRecovery,
+        });
+        let response = operation.response;
+        if (response) {
+          logger.info("provider.replayed", {
+            run_id: runId,
+            operation_id: operation.identity.operation_id,
+            provider: this.drafts.provider,
+            context: "draft",
+            replayed: true,
+          });
+        }
+        if (!response) {
+          logger.info("provider.reserved", {
+            run_id: runId,
+            operation_id: operation.identity.operation_id,
+            provider: this.drafts.provider,
+            context: "draft",
+            state: "reserved",
+          });
+          // Commit the one-call reservation before the sole HTTP dispatch.
+          await this.repository.markDraftProviderInFlight({
+            run_id: runId,
+            execution_id: lease.execution_id,
+            token: lease.token,
+            identity: operation.identity,
+          });
+          logger.info("provider.dispatch_started", {
+            run_id: runId,
+            operation_id: operation.identity.operation_id,
+            provider: this.drafts.provider,
+            context: "draft",
+          });
+          await this.failures?.hit("after_draft_reservation");
+          try {
+            const rawResponse = await withHeartbeat(this.repository, lease, () =>
+              this.drafts.generate(request),
+            );
+            logger.info("provider.returned", {
+              run_id: runId,
+              operation_id: operation.identity.operation_id,
+              provider: this.drafts.provider,
+              context: "draft",
+            });
+            response = DraftProviderResponseSchema.parse(rawResponse);
+            logger.info("provider.response_validated", {
+              run_id: runId,
+              operation_id: operation.identity.operation_id,
+              provider: this.drafts.provider,
+              context: "draft",
+            });
+          } catch (error) {
+            logger.warn("provider.dispatch_failed", {
+              run_id: runId,
+              operation_id: operation.identity.operation_id,
+              provider: this.drafts.provider,
+              context: "draft",
+              ...classifyError(error),
+            });
+            if (provablyUndispatchedDraftFailure(error))
+              await this.repository.releaseDraftProviderFailure({
+                run_id: runId,
+                execution_id: lease.execution_id,
+                token: lease.token,
+                identity: operation.identity,
+              });
+            throw error;
+          }
+          await this.failures?.hit("after_provider_return");
+          await this.repository.checkpointDraftResponse({
+            run_id: runId,
+            execution_id: lease.execution_id,
+            token: lease.token,
+            identity: operation.identity,
+            response,
+          });
+          logger.info("provider.checkpointed", {
+            run_id: runId,
+            operation_id: operation.identity.operation_id,
+            provider: this.drafts.provider,
+            context: "draft",
+          });
+        }
         await this.failures?.hit("after_provider");
         persisted = await this.repository.saveDraft(
           runId,
           lease.execution_id,
           lease.token,
           response,
-          this.drafts.provider,
-          this.drafts.model,
-          request,
+          operation.identity,
         );
+        logger.info("provider.persistence_completed", {
+          run_id: runId,
+          operation_id: operation.identity.operation_id,
+          provider: this.drafts.provider,
+          context: "draft",
+        });
         await this.failures?.hit("after_draft_persist");
       }
       void persisted;

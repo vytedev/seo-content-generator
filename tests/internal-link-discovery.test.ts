@@ -13,6 +13,7 @@ import {
   mergeAndVerifyDetailed,
   type LinkDiscoveryConfig,
 } from "../src/server/providers/internal-link-discovery.js";
+import { isCanonicalProductRoute } from "../src/shared/product-route.js";
 import type { GoogleOAuthClient } from "../src/server/providers/google-oauth.js";
 
 const config: LinkDiscoveryConfig = {
@@ -331,7 +332,7 @@ describe("sitemap internal-link discovery", () => {
       sitemapUrl: config.sitemapUrl,
     }));
     const flatProducts = Array.from({ length: 30 }, (_, index) => ({
-      url: `https://www.example.com/en/designer-chair-${index}`,
+      url: `https://www.example.com/en/style-designer-chair-${index}`,
       sitemapUrl: config.sitemapUrl,
     }));
     const verifier = {
@@ -357,7 +358,8 @@ describe("sitemap internal-link discovery", () => {
     );
 
     expect(result.links).toHaveLength(25);
-    expect(result.links.every((link) => link.url.includes("/en/designer-chair-"))).toBe(true);
+    expect(result.links.every((link) => link.url.includes("/en/style-designer-chair-"))).toBe(true);
+    expect(result.links.every((link) => isCanonicalProductRoute(link.url))).toBe(true);
     expect(result.counts).toMatchObject({
       commercial: 130,
       verification_attempted: 100,
@@ -532,6 +534,46 @@ describe("sitemap internal-link discovery", () => {
     await expect(expired.read("internal-links:v2", "request-b")).resolves.toMatchObject({
       fresh: false,
     });
+  });
+
+  it("does not cache negative outcomes from degraded or incomplete sources", async () => {
+    const cases = [
+      {
+        configured: config,
+        sitemap: { listUrls: vi.fn().mockResolvedValue([]) },
+        gsc: { pages: vi.fn().mockRejectedValue(new Error("transport")) },
+      },
+      {
+        configured: config,
+        sitemap: { listUrls: vi.fn().mockRejectedValue(new Error("transport")) },
+        gsc: { pages: vi.fn().mockResolvedValue([]) },
+      },
+    ];
+    for (const item of cases) {
+      const result = await new LiveInternalLinkDiscoverer(
+        item.configured,
+        item.sitemap as never,
+        verifier(),
+        { read: vi.fn().mockResolvedValue(null) },
+        item.gsc as never,
+        now,
+      ).discover("chair");
+      expect(result.eligibility).toBe("blocked");
+      expect(result).not.toHaveProperty("cacheWrite");
+      expect(result.cache.expires_at).toBeNull();
+    }
+
+    const { gscSiteUrl: _gscSiteUrl, ...sitemapOnly } = config;
+    const complete = await new LiveInternalLinkDiscoverer(
+      sitemapOnly,
+      { listUrls: vi.fn().mockResolvedValue([]) } as never,
+      verifier(),
+      { read: vi.fn().mockResolvedValue(null) },
+      undefined,
+      now,
+    ).discover("chair");
+    expect(complete.reason).toBe("no_candidates");
+    expect(complete.cacheWrite).toBeDefined();
   });
 
   it("keeps valid sitemap links when GSC fails and falls back to valid GSC when sitemap fails", async () => {

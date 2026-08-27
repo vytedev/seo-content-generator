@@ -1,11 +1,22 @@
 # Step 1.12 — Google Docs export architecture
 
-> **Status: implemented.** The diagnosis below is retained because it explains why
-> the design is what it is. See "What was built" at the end.
+> **Status: Google Docs writer and coherence operation lifecycle implemented.** The
+> historical diagnosis below is retained because it explains why the reread-driven
+> writer exists. Step 1.12 durably reserves coherence before provider dispatch,
+> checkpoints the validated response, fails closed on ambiguous restart, and replays
+> checkpoints without another provider call. See “What was built” at the end.
 
-Inspection only. No code was changed, no Google call was made, the real run and
-database were not queried. Everything below is derived from the emitted logs and
-from reading the local source.
+## Current Step 1.12 gate
+
+Step 1.12 begins only when the current immutable document has a persisted Step 1.11 result with an exact document ID/content-hash match and zero retained or introduced deterministic blockers. A Step 1.11 history row marked `succeeded` is not sufficient by itself. Coherence findings remain restricted to exact changed locations, and Google export cannot start while deterministic or coherence blockers remain.
+
+The normal Google writer is idempotent and reread-driven as documented below. Coherence has revision-equivalent durable `provider_in_flight` ambiguity protection: only a provably undispatched configuration failure may release the reservation; transport, timeout, malformed-success and restart ambiguity never trigger a second paid call. Successful provider responses used by the bounded corrective request contribute their independently validated usage and cost to the one checkpointed operation total, including safe usage from a malformed successful envelope; malformed choices and content are never trusted.
+
+The export service repeats the final gate independently: the exact current document must have a checkpointed coherence response joined to its matching `final_coherence_export` provider operation and producing execution, and that execution must be the currently fenced Step 1.12 attempt. Any persisted Step 1.12 blocker for that document refuses export. Provider-operation existence alone is not completion evidence.
+
+The dedicated export retry route is narrower than general pipeline resume. It requires all of: `retryable_failed` run state at `final_coherence_export`, a latest Step 1.12 attempt in `retryable_failed` with the safe `stage=google_docs_export` diagnostic, and a persisted failed export operation. Enqueue-error fallback returns the durable detail only when a refreshed read still proves that exact predicate; coherence and other retryable failures remain typed conflicts.
+
+This change was verified without credentials or network access. **Live Google verification remains pending; no live Google call was made.** The real run and database were not queried.
 
 ## 1. What actually failed (run `67aa0ce9…`, document version `b497112e…`)
 

@@ -1,6 +1,7 @@
 import request from "supertest";
 import { describe, expect, it, vi } from "vitest";
 import { createApp } from "../src/server/app/create-app.js";
+import { logger } from "../src/server/logger.js";
 import {
   GOOGLE_SCOPES,
   type GoogleOAuthClient,
@@ -43,6 +44,28 @@ describe("Google OAuth API", () => {
     });
     await request(app).delete("/api/integrations/google").expect(204);
     expect(disconnect).toHaveBeenCalledOnce();
+  });
+
+  it("returns 204 and safely logs when only an unreadable local connection was cleared", async () => {
+    const disconnect = vi.fn().mockResolvedValue("local_only");
+    const warning = vi.spyOn(logger, "warn").mockImplementation(() => undefined);
+    const app = createApp({
+      serveClient: false,
+      googleOAuth: {
+        configured: true,
+        store: {} as GoogleTokenStore,
+        client: { disconnect } as unknown as GoogleOAuthClient,
+      },
+    });
+
+    await request(app).delete("/api/integrations/google").expect(204);
+
+    expect(warning).toHaveBeenCalledWith("google_oauth.disconnect_local_only", {
+      provider: "google",
+      outcome: "local_connection_cleared_without_remote_revoke",
+      reason_code: "stored_connection_unreadable",
+    });
+    warning.mockRestore();
   });
 
   it("binds state to a cross-site-callback-safe one-use cookie and rejects missing, mismatched, and replayed cookies", async () => {

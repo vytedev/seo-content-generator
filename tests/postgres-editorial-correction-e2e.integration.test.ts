@@ -268,6 +268,7 @@ function harness(
     new PostgresGoogleDocsExportService(pool!, new MockGoogleDocsAdapter()),
   );
   const app = createApp({
+    testOnlySynchronousPipeline: true,
     auth: { mode: "disabled" },
     serveClient: false,
     findingsRepository: repository,

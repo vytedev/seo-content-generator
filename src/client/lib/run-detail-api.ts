@@ -23,13 +23,23 @@ export function resumeEndpoint(runId: string, currentStep: string | null): strin
   return `/api/runs/${id}/milestone-four/resume`;
 }
 
-export function resumeRequest(currentStep: string | null): RequestInit {
-  if (currentStep !== "internal_link_discovery") return { method: "POST" };
-  return {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ refresh_link_discovery: true }),
-  };
+export function resumeRequest(
+  currentStep: string | null,
+  draftRecovery: RunDetail["draft_recovery"] = "none",
+): RequestInit {
+  if (currentStep === "internal_link_discovery")
+    return {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ refresh_link_discovery: true }),
+    };
+  if (currentStep === "draft" && draftRecovery === "legacy_confirmation_required")
+    return {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ authorise_legacy_draft_recovery: true }),
+    };
+  return { method: "POST" };
 }
 
 export function runDetailErrorMessage(body: unknown, fallback: string): string {

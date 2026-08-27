@@ -10,7 +10,8 @@ import {
   type GoogleDocsAdapter,
   type GoogleDocsExport,
 } from "../../shared/export.js";
-import { contentHash } from "../../shared/milestone-two.js";
+import { canonicalHash, contentHash } from "../../shared/milestone-two.js";
+import { CoherenceResponseSchema } from "../../shared/milestone-four.js";
 import { logger } from "../logger.js";
 import {
   DeterministicManifestSchema,
@@ -144,7 +145,8 @@ export class PostgresGoogleDocsExportService {
          from document_versions d
          join artifacts a on a.id=d.artifact_id and a.run_id=d.run_id
          join runs r on r.id=d.run_id
-         where d.id=$1 and d.run_id=$2`,
+         where d.id=$1 and d.run_id=$2
+         for update of r`,
         [input.document_version_id, input.run_id],
       );
       const documentRow = document.rows[0];
@@ -200,16 +202,89 @@ export class PostgresGoogleDocsExportService {
         retained_blockers: number;
         introduced_blockers: number;
         coherence_complete: boolean;
+        coherence_response: unknown;
+        coherence_response_hash: string | null;
+        coherence_blockers: number;
       }>(
         `select m.manifest,m.result baseline_result,d.result rerun_result,
            d.result_hash rerun_result_hash,d.baseline_manifest_hash,
            d.retained_blockers,d.introduced_blockers,
-           exists(select 1 from provider_operations p where p.run_id=d.run_id
-             and p.document_version_id=d.document_version_id
-             and p.operation='final_coherence_export') coherence_complete
+           exists(
+             select 1 from coherence_checkpoints c
+             join provider_operations p on p.operation_id=c.operation_id
+               and p.run_id=c.run_id and p.document_version_id=c.document_version_id
+               and p.step_execution_id=c.producing_step_execution_id
+               and p.operation='final_coherence_export' and p.content_hash=c.response_hash
+             join step_executions producer on producer.id=c.producing_step_execution_id
+               and producer.run_id=c.run_id and producer.step='final_coherence_export'
+             join step_executions current_execution on current_execution.id=$3
+               and current_execution.run_id=c.run_id
+               and current_execution.step='final_coherence_export'
+               and current_execution.status='running'
+               and current_execution.lease_token=$4
+               and current_execution.lease_expires_at>clock_timestamp()
+             join runs current_run on current_run.id=c.run_id
+               and current_run.current_step='final_coherence_export'
+               and current_run.status='running'
+             where c.run_id=d.run_id and c.document_version_id=d.document_version_id
+               and c.status='checkpointed'
+               and c.response is not null and c.response_hash is not null
+               and not exists(
+                 select 1 from step_executions newer
+                 where newer.run_id=current_execution.run_id
+                   and newer.step='final_coherence_export'
+                   and newer.attempt>current_execution.attempt
+               )
+               and not exists(
+                 select 1 from jsonb_array_elements(coalesce(c.response->'findings','[]'::jsonb)) finding
+                 where finding->>'severity'='blocker'
+               )
+               and (
+                 c.producing_step_execution_id=$3
+                 or exists(
+                   select 1 from coherence_recoveries recovery
+                   where recovery.operation_id=c.operation_id
+                     and recovery.run_id=c.run_id
+                     and recovery.document_version_id=c.document_version_id
+                     and recovery.producing_step_execution_id=c.producing_step_execution_id
+                     and recovery.recovery_step_execution_id=current_execution.id
+                     and recovery.outcome='export'
+                 )
+               )
+           ) coherence_complete,
+           (select c.response from coherence_checkpoints c
+             where c.run_id=d.run_id and c.document_version_id=d.document_version_id
+               and c.status='checkpointed' and (
+                 c.producing_step_execution_id=$3 or exists(
+                   select 1 from coherence_recoveries recovery
+                   where recovery.operation_id=c.operation_id and recovery.run_id=c.run_id
+                     and recovery.document_version_id=c.document_version_id
+                     and recovery.producing_step_execution_id=c.producing_step_execution_id
+                     and recovery.recovery_step_execution_id=$3 and recovery.outcome='export'
+                 )
+               )) coherence_response,
+           (select c.response_hash from coherence_checkpoints c
+             where c.run_id=d.run_id and c.document_version_id=d.document_version_id
+               and c.status='checkpointed' and (
+                 c.producing_step_execution_id=$3 or exists(
+                   select 1 from coherence_recoveries recovery
+                   where recovery.operation_id=c.operation_id and recovery.run_id=c.run_id
+                     and recovery.document_version_id=c.document_version_id
+                     and recovery.producing_step_execution_id=c.producing_step_execution_id
+                     and recovery.recovery_step_execution_id=$3 and recovery.outcome='export'
+                 )
+               )) coherence_response_hash,
+           (select count(*)::int from findings f
+             join step_executions e on e.id=f.step_execution_id and e.run_id=f.run_id
+             where f.run_id=d.run_id and f.document_version_id=d.document_version_id
+               and f.severity='blocker' and e.step='final_coherence_export') coherence_blockers
          from deterministic_reruns d join deterministic_manifests m on m.run_id=d.run_id
-         where d.run_id=$1 and d.document_version_id=$2`,
-        [input.run_id, input.document_version_id],
+         where d.run_id=$1 and d.document_version_id=$2
+           and d.document_version_id=(
+             select current_document.id from document_versions current_document
+             where current_document.run_id=d.run_id order by current_document.revision desc limit 1
+           )`,
+        [input.run_id, input.document_version_id, input.step_execution_id, input.fencing_token],
       );
       const finalGate = gate.rows[0];
       if (!finalGate) throw new Error("Final blocker gate does not permit export");
@@ -219,6 +294,13 @@ export class PostgresGoogleDocsExportService {
       );
       validateDeterministicBaseline(manifest, finalGate.baseline_result);
       const rerun = DeterministicRunResultSchema.parse(finalGate.rerun_result);
+      const parsedCoherenceResponse = CoherenceResponseSchema.safeParse(
+        finalGate.coherence_response,
+      );
+      const coherenceResponseValid =
+        parsedCoherenceResponse.success &&
+        finalGate.coherence_response_hash === canonicalHash(parsedCoherenceResponse.data) &&
+        parsedCoherenceResponse.data.findings.every((finding) => finding.severity !== "blocker");
       const { result_hash: _, ...rerunCore } = rerun;
       const rerunValid =
         rerun.result_hash === deterministicHash(rerunCore) &&
@@ -231,7 +313,9 @@ export class PostgresGoogleDocsExportService {
         rerun.document_hash === documentRow.content_hash;
       if (
         !rerunValid ||
+        !coherenceResponseValid ||
         !finalGate.coherence_complete ||
+        finalGate.coherence_blockers > 0 ||
         finalGate.retained_blockers > 0 ||
         finalGate.introduced_blockers > 0
       )

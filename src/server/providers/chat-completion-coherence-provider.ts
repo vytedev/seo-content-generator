@@ -17,6 +17,7 @@ import {
 import type { CoherenceProvider } from "./milestone-four-providers.js";
 import { prepareCoherenceWindows } from "./compact-model-contracts.js";
 import { readBoundedResponseBody } from "./http-response.js";
+import { classifyInvalidSuccess, isJson } from "./structured-output-diagnostics.js";
 
 /**
  * Server-only OpenRouter coherence client for step 1.11.
@@ -84,6 +85,15 @@ const WireResponseSchema = z.object({
     .optional(),
 });
 type WireResponse = z.infer<typeof WireResponseSchema>;
+const WireUsageSchema = z
+  .object({
+    prompt_tokens: z.number().int().nonnegative(),
+    completion_tokens: z.number().int().nonnegative(),
+    cost: z.number().nonnegative().optional(),
+  })
+  .strict();
+type WireUsage = z.infer<typeof WireUsageSchema>;
+type ModelAttempt = { wire: WireResponse | null; usage?: WireUsage };
 
 const COHERENCE_CATEGORIES = [
   "grammar",
@@ -260,17 +270,21 @@ export class ChatCompletionCoherenceProvider implements CoherenceProvider {
         "Coherence request model does not match pinned provider model",
       );
     const startedAt = Date.now();
-    const first = await this.callModel(buildCoherenceMessages(request), request.temperature);
-    if (first?.choices[0]?.finish_reason === "length")
+    const firstAttempt = await this.callModel(buildCoherenceMessages(request), request.temperature);
+    const first = firstAttempt.wire;
+    if (first?.choices[0]?.finish_reason === "length") {
+      logModelProviderOutputInvalid(this.provider, "coherence", this.model, 1, "truncation");
       throw new CoherenceProviderError(
         "COHERENCE_PROVIDER_TRUNCATED",
         "Coherence provider output reached the operation token limit",
       );
+    }
     const findings = first
       ? parseCoherenceBody(first.choices[0]?.message.content ?? "", request)
       : undefined;
-    if (first && findings) return this.toResponse(first, findings, startedAt);
-    const corrective = await this.callModel(
+    if (first && findings)
+      return this.toResponse(firstAttempt.usage ? [firstAttempt.usage] : [], findings, startedAt);
+    const correctiveAttempt = await this.callModel(
       [
         ...buildCoherenceMessages(request),
         {
@@ -281,55 +295,78 @@ export class ChatCompletionCoherenceProvider implements CoherenceProvider {
       ],
       request.temperature,
     );
-    if (corrective?.choices[0]?.finish_reason === "length")
+    const corrective = correctiveAttempt.wire;
+    if (corrective?.choices[0]?.finish_reason === "length") {
+      logModelProviderOutputInvalid(this.provider, "coherence", this.model, 2, "truncation");
       throw new CoherenceProviderError(
         "COHERENCE_PROVIDER_TRUNCATED",
         "Coherence provider output reached the operation token limit",
       );
+    }
     const retriedFindings = corrective
       ? parseCoherenceBody(corrective.choices[0]?.message.content ?? "", request)
       : undefined;
     if (!corrective || retriedFindings === undefined) {
-      logModelProviderOutputInvalid(this.provider, "coherence", this.model, 2);
+      const content = corrective?.choices[0]?.message.content;
+      logModelProviderOutputInvalid(
+        this.provider,
+        "coherence",
+        this.model,
+        2,
+        classifyInvalidSuccess(
+          corrective !== null,
+          corrective?.choices[0]?.finish_reason,
+          content,
+          isJson(content),
+        ),
+      );
       throw new CoherenceProviderError(
         "COHERENCE_PROVIDER_UNPARSEABLE",
         "Coherence provider returned unparseable output after 2 attempts",
       );
     }
-    return this.toResponse(corrective, retriedFindings, startedAt);
+    return this.toResponse(
+      [firstAttempt.usage, correctiveAttempt.usage].flatMap((usage) => (usage ? [usage] : [])),
+      retriedFindings,
+      startedAt,
+    );
   }
 
   private toResponse(
-    wire: WireResponse,
+    billableUsage: WireUsage[],
     findings: CoherenceFinding[],
     startedAt: number,
   ): CoherenceResponse {
+    const usage = billableUsage.reduce(
+      (total, usage) => {
+        const inputUnits = usage.prompt_tokens;
+        const outputUnits = usage.completion_tokens;
+        return {
+          input_units: total.input_units + inputUnits,
+          output_units: total.output_units + outputUnits,
+          // Prefer each response's provider-reported billed cost. Derive only when that
+          // successful response reports token usage; transport failures are never inferred.
+          cost_micros:
+            total.cost_micros +
+            (usage.cost !== undefined
+              ? Math.round(usage.cost * 1_000_000)
+              : computeCostMicros(this.model, inputUnits, outputUnits)),
+        };
+      },
+      { input_units: 0, output_units: 0, cost_micros: 0 },
+    );
     return CoherenceResponseSchema.parse({
       findings,
       usage: {
-        input_units: wire.usage?.prompt_tokens ?? 0,
-        output_units: wire.usage?.completion_tokens ?? 0,
+        ...usage,
         // Measured end-to-end latency across all attempts of this operation.
         latency_ms: Math.max(0, Date.now() - startedAt),
-        // Prefer the endpoint-reported billed cost (OpenRouter sends USD); fall
-        // back to deriving from real tokens and list prices.
-        cost_micros:
-          wire.usage?.cost !== undefined
-            ? Math.round(wire.usage.cost * 1_000_000)
-            : computeCostMicros(
-                this.model,
-                wire.usage?.prompt_tokens ?? 0,
-                wire.usage?.completion_tokens ?? 0,
-              ),
       },
     });
   }
 
   /** One bounded HTTP attempt loop: initial request plus at most 2 retries on 5xx/429/network. */
-  private async callModel(
-    messages: ChatMessage[],
-    temperature: number,
-  ): Promise<WireResponse | null> {
+  private async callModel(messages: ChatMessage[], temperature: number): Promise<ModelAttempt> {
     let lastError: CoherenceProviderError | undefined;
     for (let attempt = 0; attempt <= MAX_HTTP_RETRIES; attempt++) {
       const controller = new AbortController();
@@ -348,7 +385,12 @@ export class ChatCompletionCoherenceProvider implements CoherenceProvider {
             temperature,
             max_tokens: this.maxOutputTokens,
             response_format: { type: "json_schema", json_schema: COHERENCE_RESPONSE_JSON_SCHEMA },
-            ...(this.provider === "openrouter" ? { provider: { require_parameters: true } } : {}),
+            ...(this.provider === "openrouter"
+              ? {
+                  provider: { require_parameters: true },
+                  reasoning: { effort: "none", exclude: true },
+                }
+              : {}),
           }),
           signal: controller.signal,
         });
@@ -373,12 +415,20 @@ export class ChatCompletionCoherenceProvider implements CoherenceProvider {
         try {
           payload = JSON.parse((await readBoundedResponseBody(response)).trim());
         } catch {
-          return null;
+          return { wire: null };
         }
         const wire = WireResponseSchema.safeParse(payload);
-        // An unparseable envelope is a parse failure, not a retryable transport error;
-        // review() handles it through the bounded corrective attempt.
-        return wire.success ? wire.data : null;
+        const usage = WireUsageSchema.safeParse(
+          typeof payload === "object" && payload !== null
+            ? (payload as Record<string, unknown>).usage
+            : undefined,
+        );
+        // Usage is independently safe to retain from a successful malformed envelope. Choices and
+        // content remain all-or-nothing and can only drive findings after the full wire parse.
+        return {
+          wire: wire.success ? wire.data : null,
+          ...(usage.success ? { usage: usage.data } : {}),
+        };
       }
       const status = response.status;
       logModelProviderHttpFailure(this.provider, "coherence", this.model, status);

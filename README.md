@@ -4,6 +4,8 @@ A standalone editorial operations app that turns a validated keyword handoff int
 
 The app is built for Mobelaris blog posts, English (UK), and one operator. It is not an autonomous agent, publishing platform, translation tool, or keyword-research tool.
 
+The delivery baseline is the current product in this repository. Historical MM03-01 requirements provide context but do not override newer decisions or current checked-in contracts. Development now prioritises smooth operation and production readiness; see [`docs/current-product-production-readiness.md`](docs/current-product-production-readiness.md).
+
 ## What it does
 
 - Accepts a strict JSON content handoff
@@ -117,7 +119,7 @@ http://127.0.0.1:5173
 The local API runs at:
 
 ```text
-http://127.0.0.1:3100
+http://127.0.0.1:3110
 ```
 
 A configured local PostgreSQL database and the required `.env` values are needed for the full pipeline.
@@ -159,10 +161,16 @@ npm run format:check
 git diff --check
 ```
 
-When database invariants change, also apply all migrations to disposable PostgreSQL and run:
+PostgreSQL integration suites are opt-in and must use a separate disposable local database:
 
 ```bash
-psql "$DATABASE_URL" -v ON_ERROR_STOP=1 -f scripts/test-db-invariants.sql
+TEST_DATABASE_URL=postgresql://LOCAL_USER:LOCAL_PASSWORD@127.0.0.1:LOCAL_PORT/mm0301_test npm test
+```
+
+Never point `TEST_DATABASE_URL` at the operator, shared or deployed database. When database invariants change, also apply all migrations to disposable PostgreSQL and run:
+
+```bash
+psql "$TEST_DATABASE_URL" -v ON_ERROR_STOP=1 -f scripts/test-db-invariants.sql
 ```
 
 ## Project boundaries

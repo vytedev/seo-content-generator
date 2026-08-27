@@ -1,10 +1,10 @@
-import { readFile } from "node:fs/promises";
 import { createHash } from "node:crypto";
 import pg from "pg";
-import { afterAll, beforeEach, describe, expect, it } from "vitest";
-import { ingestHandoff } from "../src/shared/milestone-two.js";
+import { afterAll, beforeEach, describe, expect, it, vi } from "vitest";
+import { canonicalHash, ingestHandoff } from "../src/shared/milestone-two.js";
 import type { DeterministicFixture } from "../src/shared/milestone-three.js";
 import { MilestoneThreeOrchestrator } from "../src/server/milestone-three-orchestrator.js";
+import { PipelineQueueWorker } from "../src/server/pipeline/queue-worker.js";
 import { MilestoneTwoOrchestrator, MockLinkDiscoverer } from "../src/server/orchestrator.js";
 import { PostgresMilestoneRepository } from "../src/server/persistence/postgres-repository.js";
 import { MockDraftProvider } from "../src/server/providers/draft-provider.js";
@@ -12,7 +12,9 @@ import {
   MockReviewProvider,
   type ReviewProvider,
 } from "../src/server/providers/review-provider.js";
+import { ChatCompletionReviewProvider } from "../src/server/providers/chat-completion-review-provider.js";
 import { ConflictError } from "../src/shared/errors.js";
+import { NoNetworkFactVerifier } from "../src/server/providers/fact-verifier.js";
 import {
   REFERENCE_DOCUMENT_SEED_MANIFEST,
   generateReferenceSeedSql,
@@ -52,6 +54,52 @@ const draft = {
     { text: "It measures 80 cm", type: "dimension" as const, status: "unverified" as const },
   ],
 };
+
+function informationGainFinding() {
+  return {
+    stable_key: "useful-comparison",
+    category: "information_gain",
+    rule_reference: "value.comparison",
+    severity: "warning" as const,
+    location: { field: "body_markdown" as const },
+    issue: "The comparison does not yet explain the practical trade-off.",
+    suggested_fix: "Add one concrete, supportable comparison for the reader.",
+  };
+}
+
+function malformedInformationGainProvider(): {
+  provider: ReviewProvider;
+  fetcher: ReturnType<typeof vi.fn>;
+} {
+  const fetcher = vi.fn(
+    async () =>
+      new Response(
+        JSON.stringify({
+          id: "malformed-step-1-6",
+          choices: [{ message: { content: "{not-json" } }],
+        }),
+        { status: 200, headers: { "content-type": "application/json" } },
+      ),
+  );
+  const liveShape = new ChatCompletionReviewProvider({
+    token: "test_token_not_real",
+    model: "review-v1",
+    fetcher,
+    sleep: () => Promise.resolve(),
+  });
+  const otherSteps = new MockReviewProvider("review-v1");
+  return {
+    fetcher,
+    provider: {
+      provider: liveShape.provider,
+      model: liveShape.model,
+      review: (request) =>
+        request.step === "review_information_gain"
+          ? liveShape.review(request)
+          : otherSteps.review(request),
+    },
+  };
+}
 
 async function seedReferences() {
   await pool!.query(generateReferenceSeedSql());
@@ -168,9 +216,322 @@ integration("PostgreSQL milestone three", () => {
     expect(
       (await pool!.query("select status,current_step from runs where id=$1", [run.run_id])).rows[0],
     ).toEqual({ status: "running", current_step: "revision_pass" });
-    // The run is resting, waiting for an explicit resume trigger into
-    // milestone four — the operator must see a way to continue, not a dead end.
-    expect((await repository.getRunDetail(run.run_id)).can_retry).toBe(true);
+    expect(
+      (
+        await pool!.query(
+          "select state from pipeline_queue_jobs where run_id=$1 and state in ('ready','leased','retry_wait')",
+          [run.run_id],
+        )
+      ).rows,
+    ).toEqual([{ state: "ready" }]);
+    expect((await repository.getRunDetail(run.run_id)).can_retry).toBe(false);
+  });
+
+  it("rolls back the Step 1.9 transaction when queueing fails and permits retry", async () => {
+    const repository = new PostgresMilestoneRepository(pool!);
+    const run = await ingestHandoff(handoff, "m3-pg-disposition-queue-failure", repository);
+    await new MilestoneTwoOrchestrator(
+      repository,
+      new MockLinkDiscoverer(),
+      new MockDraftProvider("draft-v1", draft),
+    ).run(run.run_id);
+    await new MilestoneThreeOrchestrator(
+      repository,
+      fixture,
+      new MockReviewProvider("review-v1"),
+    ).run(run.run_id);
+    await pool!.query(
+      "update pipeline_queue_jobs set state='parked',last_error_code='operator_wait' where run_id=$1",
+      [run.run_id],
+    );
+    const queueBefore = (
+      await pool!.query(
+        `select state,attempt,phase,available_at,lease_token,lease_expires_at,options,
+                pending_refresh,resume_after_refresh,pending_options,last_error_code
+         from pipeline_queue_jobs where run_id=$1`,
+        [run.run_id],
+      )
+    ).rows;
+    const findings = await repository.listFindings(run.run_id, {});
+    const version = (await repository.getDraft(run.run_id))!.version;
+    const input = {
+      document_version_id: version.id,
+      idempotency_key: "m3-pg-disposition-queue-failure-key",
+      dispositions: findings.map((finding) => ({
+        finding_id: finding.id,
+        decision: "accepted" as const,
+      })),
+    };
+    const runtime = repository as unknown as {
+      enqueueRunClient: (...args: unknown[]) => Promise<void>;
+    };
+    const originalEnqueue = runtime.enqueueRunClient;
+    runtime.enqueueRunClient = vi.fn(async () => {
+      throw new Error("injected enqueue failure");
+    });
+    try {
+      await expect(repository.submitDispositions(run.run_id, input)).rejects.toThrow(
+        "injected enqueue failure",
+      );
+    } finally {
+      runtime.enqueueRunClient = originalEnqueue;
+    }
+
+    expect(
+      (
+        await pool!.query(
+          `select
+             (select count(*)::int from finding_review_submissions where run_id=$1) submissions,
+             (select count(*)::int from finding_dispositions where run_id=$1) dispositions`,
+          [run.run_id],
+        )
+      ).rows[0],
+    ).toEqual({ submissions: 0, dispositions: 0 });
+    expect(
+      (
+        await pool!.query(
+          `select r.status,r.current_step,r.block_reason,e.status execution_status
+           from runs r join step_executions e on e.run_id=r.id and e.step='findings_review'
+           where r.id=$1 order by e.attempt desc limit 1`,
+          [run.run_id],
+        )
+      ).rows[0],
+    ).toEqual({
+      status: "waiting",
+      current_step: "findings_review",
+      block_reason: null,
+      execution_status: "waiting",
+    });
+    expect(
+      (
+        await pool!.query(
+          `select state,attempt,phase,available_at,lease_token,lease_expires_at,options,
+                  pending_refresh,resume_after_refresh,pending_options,last_error_code
+           from pipeline_queue_jobs where run_id=$1`,
+          [run.run_id],
+        )
+      ).rows,
+    ).toEqual(queueBefore);
+
+    await expect(repository.submitDispositions(run.run_id, input)).resolves.toEqual({
+      completed: true,
+      submitted: findings.length,
+      continuation_required: true,
+    });
+    expect(
+      (
+        await pool!.query(
+          `select
+             (select count(*)::int from finding_review_submissions where run_id=$1) submissions,
+             (select count(*)::int from finding_dispositions where run_id=$1) dispositions,
+             (select state from pipeline_queue_jobs where run_id=$1) state`,
+          [run.run_id],
+        )
+      ).rows[0],
+    ).toEqual({ submissions: 1, dispositions: findings.length, state: "ready" });
+  });
+
+  it("serialises concurrent Step 1.9 replay and reactivates the parked queue exactly once", async () => {
+    const repository = new PostgresMilestoneRepository(pool!);
+    const run = await ingestHandoff(handoff, "m3-pg-disposition-concurrency", repository);
+    await new MilestoneTwoOrchestrator(
+      repository,
+      new MockLinkDiscoverer(),
+      new MockDraftProvider("draft-v1", draft),
+    ).run(run.run_id);
+    await new MilestoneThreeOrchestrator(
+      repository,
+      fixture,
+      new MockReviewProvider("review-v1"),
+    ).run(run.run_id);
+    await pool!.query(
+      "update pipeline_queue_jobs set state='parked',last_error_code='operator_wait' where run_id=$1",
+      [run.run_id],
+    );
+    const findings = await repository.listFindings(run.run_id, {});
+    const version = (await repository.getDraft(run.run_id))!.version;
+    const input = {
+      document_version_id: version.id,
+      idempotency_key: "m3-pg-concurrent-disposition-key",
+      dispositions: findings.map((finding) => ({
+        finding_id: finding.id,
+        decision: "accepted" as const,
+      })),
+    };
+
+    const results = await Promise.all([
+      repository.submitDispositions(run.run_id, input),
+      repository.submitDispositions(run.run_id, input),
+    ]);
+
+    expect(results).toEqual(
+      expect.arrayContaining([
+        { completed: true, submitted: findings.length, continuation_required: true },
+        { completed: true, submitted: findings.length, continuation_required: false },
+      ]),
+    );
+    expect(
+      (
+        await pool!.query(
+          `select
+             (select count(*)::int from finding_review_submissions where run_id=$1) submissions,
+             (select count(*)::int from finding_dispositions where run_id=$1) dispositions,
+             (select count(*)::int from pipeline_queue_jobs where run_id=$1) jobs,
+             (select state from pipeline_queue_jobs where run_id=$1) state`,
+          [run.run_id],
+        )
+      ).rows[0],
+    ).toEqual({ submissions: 1, dispositions: findings.length, jobs: 1, state: "ready" });
+  });
+
+  it("adopts a pre-dispatch Step 1.5 operation after process loss without duplicate review calls", async () => {
+    const repository = new PostgresMilestoneRepository(pool!);
+    const run = await ingestHandoff(handoff, "m3-pg-style-adoption", repository);
+    await new MilestoneTwoOrchestrator(
+      repository,
+      new MockLinkDiscoverer(),
+      new MockDraftProvider("draft-v1", draft),
+    ).run(run.run_id);
+    const base = new MockReviewProvider("review-v1");
+    const review = vi.fn(base.review.bind(base));
+    const provider = {
+      provider: base.provider,
+      model: base.model,
+      review,
+    } satisfies ReviewProvider;
+    let crashed = false;
+
+    await expect(
+      new MilestoneThreeOrchestrator(repository, fixture, provider, {
+        hit: (boundary) => {
+          if (!crashed && boundary === "after_review_begin") {
+            crashed = true;
+            throw new Error("simulated loss after durable review begin");
+          }
+        },
+      }).run(run.run_id),
+    ).rejects.toThrow("simulated loss after durable review begin");
+    expect(review).not.toHaveBeenCalled();
+
+    await new MilestoneThreeOrchestrator(repository, fixture, provider).run(run.run_id);
+    expect(review).toHaveBeenCalledTimes(4);
+    expect(
+      review.mock.calls.filter(([request]) => request.step === "review_writing_style"),
+    ).toHaveLength(1);
+    const operation = (
+      await pool!.query(
+        `select o.operation_id,o.producing_step_execution_id,e.status,e.attempt
+         from review_operation_states o join step_executions e on e.id=o.producing_step_execution_id
+         where o.run_id=$1 and o.step='review_writing_style'`,
+        [run.run_id],
+      )
+    ).rows[0];
+    const history = (
+      await pool!.query(
+        `select a.from_step_execution_id,a.to_step_execution_id,old.status old_status,
+                old.attempt old_attempt,new.status new_status,new.attempt new_attempt
+         from review_operation_adoptions a
+         join step_executions old on old.id=a.from_step_execution_id
+         join step_executions new on new.id=a.to_step_execution_id
+         where a.operation_id=$1`,
+        [operation.operation_id],
+      )
+    ).rows;
+    expect(history).toEqual([
+      expect.objectContaining({
+        old_status: "retryable_failed",
+        old_attempt: 1,
+        new_status: "succeeded",
+        new_attempt: 2,
+        to_step_execution_id: operation.producing_step_execution_id,
+      }),
+    ]);
+    expect(
+      (
+        await pool!.query(
+          `select step_execution_id from step_outputs
+           where run_id=$1 and step='review_writing_style'`,
+          [run.run_id],
+        )
+      ).rows,
+    ).toEqual([{ step_execution_id: operation.producing_step_execution_id }]);
+    expect(
+      (
+        await pool!.query(
+          `select step_execution_id from provider_usage
+           where run_id=$1 and operation='review_writing_style'`,
+          [run.run_id],
+        )
+      ).rows,
+    ).toEqual([{ step_execution_id: operation.producing_step_execution_id }]);
+    await expect(
+      pool!.query(
+        `insert into review_operation_adoptions(operation_id,run_id,from_step_execution_id,to_step_execution_id)
+         values($1,$2,$3,$4)`,
+        [
+          operation.operation_id,
+          run.run_id,
+          history[0]!.from_step_execution_id,
+          history[0]!.to_step_execution_id,
+        ],
+      ),
+    ).rejects.toThrow(/unique|duplicate/i);
+  });
+
+  it("reconstructs a checkpointed Step 1.5 response before save without provider recall or duplicate output", async () => {
+    const repository = new PostgresMilestoneRepository(pool!);
+    const run = await ingestHandoff(handoff, "m3-pg-style-checkpoint-replay", repository);
+    await milestoneTwo(repository).run(run.run_id);
+    const base = new MockReviewProvider("review-v1");
+    const review = vi.fn(base.review.bind(base));
+    let injected = false;
+    const crashingRepository = new Proxy(repository, {
+      get(target, property, receiver) {
+        if (property === "checkpointReviewResponse")
+          return async (
+            input: Parameters<PostgresMilestoneRepository["checkpointReviewResponse"]>[0],
+          ) => {
+            await target.checkpointReviewResponse(input);
+            if (!injected) {
+              injected = true;
+              throw new Error("simulated loss after response checkpoint");
+            }
+          };
+        return Reflect.get(target, property, receiver);
+      },
+    });
+    const provider = {
+      provider: base.provider,
+      model: base.model,
+      review,
+    } satisfies ReviewProvider;
+
+    await expect(
+      new MilestoneThreeOrchestrator(crashingRepository, fixture, provider).run(run.run_id),
+    ).rejects.toThrow("simulated loss after response checkpoint");
+    expect(review).toHaveBeenCalledTimes(1);
+    await new MilestoneThreeOrchestrator(repository, fixture, provider).run(run.run_id);
+    expect(
+      review.mock.calls.filter(([request]) => request.step === "review_writing_style"),
+    ).toHaveLength(1);
+    expect(
+      (
+        await pool!.query(
+          `select count(*)::int count from step_outputs
+           where run_id=$1 and step='review_writing_style'`,
+          [run.run_id],
+        )
+      ).rows[0]?.count,
+    ).toBe(1);
+    expect(
+      (
+        await pool!.query(
+          `select count(*)::int count from provider_usage
+           where run_id=$1 and operation='review_writing_style'`,
+          [run.run_id],
+        )
+      ).rows[0]?.count,
+    ).toBe(1);
   });
 
   it("persists and freezes Step 1.5 advisory-unavailable for operator disposition", async () => {
@@ -242,7 +603,426 @@ integration("PostgreSQL milestone three", () => {
     ).toEqual({ status: "waiting", current_step: "findings_review" });
   });
 
-  it("persists and freezes Step 1.6 advisory-unavailable for operator disposition", async () => {
+  it("adopts the exact Step 1.6 operation after begin, rejects its stale owner and persists once", async () => {
+    const repository = new PostgresMilestoneRepository(pool!);
+    const run = await ingestHandoff(handoff, "m3-pg-value-adoption", repository);
+    await milestoneTwo(repository).run(run.run_id);
+    const base = new MockReviewProvider("review-v1", {
+      review_information_gain: [informationGainFinding()],
+    });
+    const review = vi.fn(base.review.bind(base));
+    let begins = 0;
+
+    await expect(
+      new MilestoneThreeOrchestrator(
+        repository,
+        fixture,
+        {
+          provider: base.provider,
+          model: base.model,
+          review,
+        },
+        {
+          hit: (boundary) => {
+            if (boundary === "after_review_begin" && ++begins === 2)
+              throw new Error("simulated loss after Step 1.6 begin");
+          },
+        },
+      ).run(run.run_id, "first-owner"),
+    ).rejects.toThrow("simulated loss after Step 1.6 begin");
+    expect(
+      review.mock.calls.filter(([request]) => request.step === "review_information_gain"),
+    ).toHaveLength(0);
+
+    const stale = (
+      await pool!.query(
+        `select id,lease_token from step_executions
+         where run_id=$1 and step='review_information_gain' order by attempt`,
+        [run.run_id],
+      )
+    ).rows[0]!;
+    await new MilestoneThreeOrchestrator(repository, fixture, {
+      provider: base.provider,
+      model: base.model,
+      review,
+    }).run(run.run_id, "replacement-owner");
+
+    const operation = (
+      await pool!.query(
+        `select operation_id,producing_step_execution_id,request_hash,response_hash,status
+         from review_operation_states where run_id=$1 and step='review_information_gain'`,
+        [run.run_id],
+      )
+    ).rows[0]!;
+    expect(operation).toMatchObject({ status: "checkpointed" });
+    expect(
+      review.mock.calls.filter(([request]) => request.step === "review_information_gain"),
+    ).toHaveLength(1);
+    expect(
+      (
+        await pool!.query(
+          `select from_step_execution_id,to_step_execution_id from review_operation_adoptions
+           where operation_id=$1`,
+          [operation.operation_id],
+        )
+      ).rows,
+    ).toEqual([
+      {
+        from_step_execution_id: stale.id,
+        to_step_execution_id: operation.producing_step_execution_id,
+      },
+    ]);
+    await expect(
+      repository.markReviewProviderInFlight({
+        run_id: run.run_id,
+        execution_id: stale.id,
+        token: stale.lease_token ?? "revoked-stale-token",
+        operation_id: operation.operation_id,
+      }),
+    ).rejects.toThrow(/Stale|expired|fencing/i);
+
+    const counts = (
+      await pool!.query(
+        `select
+          (select count(*)::int from findings where run_id=$1 and step='review_information_gain') findings,
+          (select count(*)::int from provider_usage where run_id=$1 and operation='review_information_gain') usage,
+          (select count(*)::int from artifacts where step_execution_id=$2 and kind in ('review_request','review_response')) artifacts,
+          (select count(*)::int from step_outputs where run_id=$1 and step='review_information_gain') outputs`,
+        [run.run_id, operation.producing_step_execution_id],
+      )
+    ).rows[0];
+    expect(counts).toEqual({ findings: 1, usage: 1, artifacts: 2, outputs: 1 });
+    const artefacts = (
+      await pool!.query(
+        `select kind,body_text,content_hash from artifacts
+         where step_execution_id=$1 and kind in ('review_request','review_response')`,
+        [operation.producing_step_execution_id],
+      )
+    ).rows;
+    const requestArtifact = artefacts.find((item) => item.kind === "review_request")!;
+    const responseArtifact = artefacts.find((item) => item.kind === "review_response")!;
+    expect(operation.request_hash).toBe(canonicalHash(JSON.parse(requestArtifact.body_text)));
+    expect(operation.response_hash).toBe(canonicalHash(JSON.parse(responseArtifact.body_text)));
+    expect(
+      artefacts.every(
+        (item) => createHash("sha256").update(item.body_text).digest("hex") === item.content_hash,
+      ),
+    ).toBe(true);
+    await expect(
+      pool!.query("update review_operation_states set request_hash=$2 where operation_id=$1", [
+        operation.operation_id,
+        "0".repeat(64),
+      ]),
+    ).rejects.toThrow(/immutable/i);
+    await expect(
+      pool!.query("update review_operation_states set response_hash=$2 where operation_id=$1", [
+        operation.operation_id,
+        "0".repeat(64),
+      ]),
+    ).rejects.toThrow(/immutable/i);
+  });
+
+  it("does not recall Step 1.6 when provider_in_flight has no checkpoint", async () => {
+    const repository = new PostgresMilestoneRepository(pool!);
+    const run = await ingestHandoff(handoff, "m3-pg-value-ambiguous", repository);
+    await milestoneTwo(repository).run(run.run_id);
+    const base = new MockReviewProvider("review-v1");
+    const review = vi.fn(base.review.bind(base));
+    let returns = 0;
+    const provider = {
+      provider: base.provider,
+      model: base.model,
+      review,
+    } satisfies ReviewProvider;
+
+    await expect(
+      new MilestoneThreeOrchestrator(repository, fixture, provider, {
+        hit: (boundary) => {
+          if (boundary === "after_review_provider" && ++returns === 2)
+            throw new Error("simulated loss after Step 1.6 provider return");
+        },
+      }).run(run.run_id),
+    ).rejects.toThrow("simulated loss after Step 1.6 provider return");
+    await expect(
+      new MilestoneThreeOrchestrator(repository, fixture, provider).run(run.run_id),
+    ).rejects.toThrow("Review provider outcome is ambiguous");
+
+    expect(
+      review.mock.calls.filter(([request]) => request.step === "review_information_gain"),
+    ).toHaveLength(1);
+    expect(
+      (
+        await pool!.query(
+          `select o.status,
+            (select count(*)::int from findings where run_id=$1 and step='review_information_gain') findings,
+            (select count(*)::int from provider_usage where run_id=$1 and operation='review_information_gain') usage,
+            (select count(*)::int from step_outputs where run_id=$1 and step='review_information_gain') outputs
+           from review_operation_states o where o.run_id=$1 and o.step='review_information_gain'`,
+          [run.run_id],
+        )
+      ).rows,
+    ).toEqual([{ status: "provider_in_flight", findings: 0, usage: 0, outputs: 0 }]);
+  });
+
+  it("replays a checkpointed Step 1.6 response before save without recall or duplicates", async () => {
+    const repository = new PostgresMilestoneRepository(pool!);
+    const run = await ingestHandoff(handoff, "m3-pg-value-checkpoint", repository);
+    await milestoneTwo(repository).run(run.run_id);
+    const base = new MockReviewProvider("review-v1", {
+      review_information_gain: [informationGainFinding()],
+    });
+    const review = vi.fn(base.review.bind(base));
+    let injected = false;
+    const crashingRepository = new Proxy(repository, {
+      get(target, property, receiver) {
+        if (property === "checkpointReviewResponse")
+          return async (
+            input: Parameters<PostgresMilestoneRepository["checkpointReviewResponse"]>[0],
+          ) => {
+            await target.checkpointReviewResponse(input);
+            const operation = await pool!.query(
+              "select step from review_operation_states where operation_id=$1",
+              [input.operation_id],
+            );
+            if (!injected && operation.rows[0]?.step === "review_information_gain") {
+              injected = true;
+              throw new Error("simulated loss after Step 1.6 checkpoint");
+            }
+          };
+        return Reflect.get(target, property, receiver);
+      },
+    });
+    const provider = {
+      provider: base.provider,
+      model: base.model,
+      review,
+    } satisfies ReviewProvider;
+
+    await expect(
+      new MilestoneThreeOrchestrator(crashingRepository, fixture, provider).run(run.run_id),
+    ).rejects.toThrow("simulated loss after Step 1.6 checkpoint");
+    await new MilestoneThreeOrchestrator(repository, fixture, provider).run(run.run_id);
+    await new MilestoneThreeOrchestrator(repository, fixture, provider).run(run.run_id);
+
+    expect(
+      review.mock.calls.filter(([request]) => request.step === "review_information_gain"),
+    ).toHaveLength(1);
+    const producer = (
+      await pool!.query(
+        `select producing_step_execution_id from review_operation_states
+         where run_id=$1 and step='review_information_gain'`,
+        [run.run_id],
+      )
+    ).rows[0]!.producing_step_execution_id;
+    expect(
+      (
+        await pool!.query(
+          `select
+            (select count(*)::int from findings where run_id=$1 and step='review_information_gain') findings,
+            (select count(*)::int from provider_usage where run_id=$1 and operation='review_information_gain') usage,
+            (select count(*)::int from artifacts where step_execution_id=$2 and kind in ('review_request','review_response')) artifacts,
+            (select count(*)::int from step_outputs where run_id=$1 and step='review_information_gain') outputs`,
+          [run.run_id, producer],
+        )
+      ).rows[0],
+    ).toEqual({ findings: 1, usage: 1, artifacts: 2, outputs: 1 });
+  });
+
+  it("replays a provider-only Step 1.8 checkpoint with the new audit and one model dispatch", async () => {
+    const repository = new PostgresMilestoneRepository(pool!);
+    const linkedDraft = {
+      ...draft,
+      markdown:
+        "# Designer chair\n\nSee the [chair collection](https://www.mobelaris.com/chairs).\n\n## Conclusion\n\nChoose carefully.",
+    };
+    const run = await ingestHandoff(handoff, "m3-pg-link-checkpoint-replay", repository);
+    await new MilestoneTwoOrchestrator(
+      repository,
+      new MockLinkDiscoverer([
+        { url: "https://www.mobelaris.com/chairs", title: "Chairs", relevance: 1 },
+      ]),
+      new MockDraftProvider("draft-v1", linkedDraft),
+    ).run(run.run_id);
+    const base = new MockReviewProvider("review-v1", {
+      review_link_conversion: [informationGainFinding()],
+    });
+    const review = vi.fn(base.review.bind(base));
+    const provider = {
+      provider: base.provider,
+      model: base.model,
+      review,
+    } satisfies ReviewProvider;
+    let verifications = 0;
+    const verifier = {
+      verify: async () =>
+        ++verifications === 1
+          ? ({ outcome: "confirmed_non_200", method: "head", status: 404 } as const)
+          : ({
+              outcome: "redirect",
+              method: "head",
+              status: 301,
+              location: "/chairs-new",
+            } as const),
+    };
+    let injected = false;
+    const crashingRepository = new Proxy(repository, {
+      get(target, property, receiver) {
+        if (property === "checkpointReviewResponse")
+          return async (
+            input: Parameters<PostgresMilestoneRepository["checkpointReviewResponse"]>[0],
+          ) => {
+            await target.checkpointReviewResponse(input);
+            const operation = await pool!.query(
+              "select step from review_operation_states where operation_id=$1",
+              [input.operation_id],
+            );
+            if (!injected && operation.rows[0]?.step === "review_link_conversion") {
+              injected = true;
+              throw new Error("simulated loss after provider-only Step 1.8 checkpoint");
+            }
+          };
+        return Reflect.get(target, property, receiver);
+      },
+    }) as PostgresMilestoneRepository;
+
+    await expect(
+      new MilestoneThreeOrchestrator(
+        crashingRepository,
+        fixture,
+        provider,
+        undefined,
+        new NoNetworkFactVerifier(),
+        verifier,
+      ).run(run.run_id),
+    ).rejects.toThrow("simulated loss after provider-only Step 1.8 checkpoint");
+    await new MilestoneThreeOrchestrator(
+      repository,
+      fixture,
+      provider,
+      undefined,
+      new NoNetworkFactVerifier(),
+      verifier,
+    ).run(run.run_id);
+    await new MilestoneThreeOrchestrator(repository, fixture, provider).run(run.run_id);
+
+    expect(verifications).toBe(2);
+    expect(
+      review.mock.calls.filter(([request]) => request.step === "review_link_conversion"),
+    ).toHaveLength(1);
+    const operation = (
+      await pool!.query<{
+        operation_id: string;
+        response: { findings: Array<{ rule_reference: string }> };
+        response_hash: string;
+      }>(
+        "select operation_id,response,response_hash from review_operation_states where run_id=$1 and step='review_link_conversion'",
+        [run.run_id],
+      )
+    ).rows[0]!;
+    expect(operation.response.findings).toHaveLength(1);
+    expect(operation.response_hash).toBe(canonicalHash(operation.response));
+    const persisted = (
+      await pool!.query<{
+        body_text: string;
+        content_hash: string;
+        output_hash: string;
+        findings: number;
+        usage: number;
+        artifacts: number;
+      }>(
+        `select a.body_text,a.content_hash,o.content_hash output_hash,
+          (select count(*)::int from findings f join step_executions e on e.id=f.step_execution_id where f.run_id=$1 and e.step='review_link_conversion') findings,
+          (select count(*)::int from provider_usage u where u.run_id=$1 and u.operation='review_link_conversion') usage,
+          (select count(*)::int from artifacts x join step_executions e on e.id=x.step_execution_id where x.run_id=$1 and e.step='review_link_conversion') artifacts
+         from artifacts a join step_executions e on e.id=a.step_execution_id
+         join step_outputs o on o.step_execution_id=e.id
+         where a.run_id=$1 and e.step='review_link_conversion' and a.kind='review_response'`,
+        [run.run_id],
+      )
+    ).rows[0]!;
+    const merged = JSON.parse(persisted.body_text) as {
+      findings: Array<{ rule_reference: string }>;
+    };
+    expect(merged.findings.map((finding) => finding.rule_reference)).toContain(
+      "link.target_redirect",
+    );
+    expect(merged.findings.map((finding) => finding.rule_reference)).not.toContain(
+      "link.target_status",
+    );
+    expect(persisted.content_hash).toBe(
+      createHash("sha256").update(persisted.body_text).digest("hex"),
+    );
+    expect(persisted.output_hash).toBe(canonicalHash(merged));
+    expect(persisted).toMatchObject({ findings: 2, usage: 1, artifacts: 2 });
+    const stale = (
+      await pool!.query<{ id: string; lease_token: string | null }>(
+        "select id,lease_token from step_executions where run_id=$1 and step='review_link_conversion' order by attempt limit 1",
+        [run.run_id],
+      )
+    ).rows[0]!;
+    await expect(
+      repository.checkpointReviewResponse({
+        run_id: run.run_id,
+        execution_id: stale.id,
+        token: stale.lease_token ?? "revoked-stale-token",
+        operation_id: operation.operation_id,
+        response: operation.response as never,
+      }),
+    ).rejects.toThrow(/Stale|expired|fencing/i);
+    await expect(
+      pool!.query("update review_operation_states set response_hash=$2 where operation_id=$1", [
+        operation.operation_id,
+        "0".repeat(64),
+      ]),
+    ).rejects.toThrow(/immutable/i);
+    await expect(
+      pool!.query("update review_operation_states set operation_id=$2 where operation_id=$1", [
+        operation.operation_id,
+        "review-operation_mutated",
+      ]),
+    ).rejects.toThrow(/immutable/i);
+  });
+
+  it("rolls back Step 1.8 atomically for a wrong checkpointResponse", async () => {
+    const repository = new PostgresMilestoneRepository(pool!);
+    const run = await ingestHandoff(handoff, "m3-pg-link-wrong-checkpoint", repository);
+    await milestoneTwo(repository).run(run.run_id);
+    const saveReview = repository.saveReview.bind(repository);
+    const wrongRepository = new Proxy(repository, {
+      get(target, property, receiver) {
+        if (property === "saveReview")
+          return async (...args: Parameters<PostgresMilestoneRepository["saveReview"]>) => {
+            if (args[4] !== "review_link_conversion") return saveReview(...args);
+            const checkpoint = args[9]!;
+            args[9] = { ...checkpoint, request_id: `${checkpoint.request_id}-wrong` };
+            return saveReview(...args);
+          };
+        return Reflect.get(target, property, receiver);
+      },
+    }) as PostgresMilestoneRepository;
+
+    await expect(
+      new MilestoneThreeOrchestrator(
+        wrongRepository,
+        fixture,
+        new MockReviewProvider("review-v1"),
+      ).run(run.run_id),
+    ).rejects.toThrow("exact validated provider checkpoint");
+    expect(
+      (
+        await pool!.query(
+          `select
+            (select count(*)::int from findings f join step_executions e on e.id=f.step_execution_id where f.run_id=$1 and e.step='review_link_conversion') findings,
+            (select count(*)::int from provider_usage u where u.run_id=$1 and u.operation='review_link_conversion') usage,
+            (select count(*)::int from artifacts a join step_executions e on e.id=a.step_execution_id where a.run_id=$1 and e.step='review_link_conversion') artifacts,
+            (select count(*)::int from step_outputs o where o.run_id=$1 and o.step='review_link_conversion') outputs`,
+          [run.run_id],
+        )
+      ).rows[0],
+    ).toEqual({ findings: 0, usage: 0, artifacts: 0, outputs: 0 });
+  });
+
+  it("persists and freezes the real Step 1.6 malformed-output fallback for operator disposition", async () => {
     const repository = new PostgresMilestoneRepository(pool!);
     const run = await ingestHandoff(handoff, "m3-pg-value-fallback", repository);
     await new MilestoneTwoOrchestrator(
@@ -250,38 +1030,9 @@ integration("PostgreSQL milestone three", () => {
       new MockLinkDiscoverer(),
       new MockDraftProvider("draft-v1", draft),
     ).run(run.run_id);
-    const base = new MockReviewProvider("review-v1");
-    const provider: ReviewProvider = {
-      provider: base.provider,
-      model: base.model,
-      review: async (request) => {
-        const response = await base.review(request);
-        return request.step === "review_information_gain"
-          ? {
-              ...response,
-              findings: [
-                {
-                  stable_key: "value-advisory-unavailable",
-                  category: "information_gain_advisory_unavailable",
-                  rule_reference: "value.advisory_unavailable",
-                  severity: "warning",
-                  location: {
-                    field: "body_markdown",
-                    line_start: 1,
-                    line_end: 1,
-                    section: "Designer chair",
-                  },
-                  issue:
-                    "The optional information-gain advisory was unavailable because its response was unusable.",
-                  suggested_fix:
-                    "Explicitly accept or reject this warning during findings review before the run continues.",
-                },
-              ],
-            }
-          : response;
-      },
-    };
+    const { provider, fetcher } = malformedInformationGainProvider();
     await new MilestoneThreeOrchestrator(repository, fixture, provider).run(run.run_id);
+    expect(fetcher).toHaveBeenCalledOnce();
     const warning = (
       await pool!.query(
         `select f.id,f.rule_reference,f.severity,d.decision disposition
@@ -527,35 +1278,410 @@ integration("PostgreSQL milestone three", () => {
     expect(producers.rows[0]?.count).toBe(5);
   });
 
-  it("reconciles a deterministic output boundary to its producing attempt", async () => {
-    const repository = new PostgresMilestoneRepository(pool!);
-    const run = await ingestHandoff(handoff, "m3-deterministic-retry", repository);
-    await new MilestoneTwoOrchestrator(
+  function milestoneTwo(repository: PostgresMilestoneRepository) {
+    return new MilestoneTwoOrchestrator(
       repository,
       new MockLinkDiscoverer(),
       new MockDraftProvider("draft-v1", draft),
-    ).run(run.run_id);
-    let fired = false;
-    await expect(
-      new MilestoneThreeOrchestrator(repository, fixture, new MockReviewProvider("review-v1"), {
+    );
+  }
+
+  function stopAtStep15Provider() {
+    const base = new MockReviewProvider("review-v1");
+    return {
+      provider: base.provider,
+      model: base.model,
+      review: vi.fn(async () => {
+        throw new Error("stop safely at Step 1.5 test boundary");
+      }),
+    } satisfies ReviewProvider;
+  }
+
+  function productionWorker(
+    repository: PostgresMilestoneRepository,
+    milestoneThree: MilestoneThreeOrchestrator,
+    owner: string,
+  ) {
+    const m3Run = vi.spyOn(milestoneThree, "run");
+    const m4Run = vi.fn(async () => undefined);
+    return {
+      worker: new PipelineQueueWorker(
+        repository,
+        {
+          milestoneTwo: milestoneTwo(repository),
+          milestoneThree,
+          milestoneFour: { run: m4Run } as never,
+        },
+        owner,
+        5_000,
+        5,
+      ),
+      m3Run,
+      m4Run,
+    };
+  }
+
+  async function prepareCrashedStep14(key: string) {
+    const repository = new PostgresMilestoneRepository(pool!, 5_000);
+    const run = await ingestHandoff(handoff, key, repository);
+    await milestoneTwo(repository).run(run.run_id);
+    expect(await repository.stepSucceeded(run.run_id, "ingest_handoff")).toBe(true);
+    expect(await repository.stepSucceeded(run.run_id, "internal_link_discovery")).toBe(true);
+    expect(await repository.stepSucceeded(run.run_id, "draft")).toBe(true);
+    const queue = await repository.claimQueueJob("old-worker", 5_000);
+    expect(queue).not.toBeNull();
+    await repository.closeRefreshWindow(queue!.id, queue!.token);
+    const step = await repository.claimStep(run.run_id, "automated_checks", "old-worker");
+    return { repository, run, queue: queue!, step };
+  }
+
+  async function expireQueue(jobId: string) {
+    await pool!.query(
+      "update pipeline_queue_jobs set lease_expires_at=clock_timestamp()-interval '1 second' where id=$1",
+      [jobId],
+    );
+  }
+
+  async function expireStep(executionId: string) {
+    await pool!.query(
+      "update step_executions set lease_expires_at=clock_timestamp()-interval '1 second' where id=$1",
+      [executionId],
+    );
+  }
+
+  it("recovers a durable pre-persistence Step 1.4 process death through the production worker exactly once", async () => {
+    const crashed = await prepareCrashedStep14("m3-step14-pre-persistence-death");
+    const orphanSnapshots = await crashed.repository.snapshotReferences(
+      crashed.run.run_id,
+      crashed.step.execution_id,
+      crashed.step.token,
+    );
+    expect(orphanSnapshots.length).toBeGreaterThan(0);
+    expect(
+      (
+        await pool!.query(
+          `select
+             (select count(*)::int from deterministic_manifests where run_id=$1) manifests,
+             (select count(*)::int from step_outputs where run_id=$1 and step='automated_checks') outputs,
+             (select count(*)::int from findings f join step_executions e on e.id=f.step_execution_id where f.run_id=$1 and e.step='automated_checks') findings`,
+          [crashed.run.run_id],
+        )
+      ).rows[0],
+    ).toEqual({ manifests: 0, outputs: 0, findings: 0 });
+
+    await expireQueue(crashed.queue.id);
+    const reviewProvider = stopAtStep15Provider();
+    const replacement = productionWorker(
+      crashed.repository,
+      new MilestoneThreeOrchestrator(crashed.repository, fixture, reviewProvider),
+      "replacement-worker",
+    );
+    await replacement.worker.start();
+    await vi.waitFor(async () => {
+      expect(
+        (
+          await pool!.query(
+            "select state,attempt,last_error_code from pipeline_queue_jobs where id=$1",
+            [crashed.queue.id],
+          )
+        ).rows[0],
+      ).toEqual({
+        state: "retry_wait",
+        attempt: crashed.queue.attempt,
+        last_error_code: "step_lease_coordination_wait",
+      });
+    });
+    expect(replacement.m3Run).not.toHaveBeenCalled();
+    expect(
+      (
+        await pool!.query(
+          "select count(*)::int count from deterministic_manifests where run_id=$1",
+          [crashed.run.run_id],
+        )
+      ).rows[0]?.count,
+    ).toBe(0);
+    await replacement.worker.stop();
+
+    await expireStep(crashed.step.execution_id);
+    await pool!.query("select pg_sleep(1.05)");
+    const recovered = productionWorker(
+      crashed.repository,
+      new MilestoneThreeOrchestrator(crashed.repository, fixture, reviewProvider),
+      "replacement-worker-after-step-expiry",
+    );
+    await recovered.worker.start();
+    await vi.waitFor(async () => expect(recovered.m3Run).toHaveBeenCalledTimes(1), {
+      timeout: 2_000,
+    });
+    await vi.waitFor(async () => {
+      expect(
+        (await pool!.query("select state from pipeline_queue_jobs where id=$1", [crashed.queue.id]))
+          .rows[0]?.state,
+      ).toBe("operator_action");
+    });
+    await recovered.worker.stop();
+    expect(reviewProvider.review).toHaveBeenCalledTimes(1);
+    expect(recovered.m4Run).not.toHaveBeenCalled();
+
+    const baseline = await crashed.repository.getDeterministicManifest(crashed.run.run_id);
+    const executions = (
+      await pool!.query(
+        "select id,attempt,status from step_executions where run_id=$1 and step='automated_checks' order by attempt",
+        [crashed.run.run_id],
+      )
+    ).rows;
+    expect(executions).toEqual([
+      { id: crashed.step.execution_id, attempt: 1, status: "retryable_failed" },
+      { id: baseline.manifest.producing_execution_id, attempt: 2, status: "succeeded" },
+    ]);
+    const snapshots = (
+      await pool!.query(
+        `select s.step_execution_id,s.reference_document_id,s.reference_version_id,s.content_hash
+         from step_reference_snapshots s join step_executions e on e.id=s.step_execution_id
+         where e.run_id=$1 and e.step='automated_checks'
+         order by s.step_execution_id,s.reference_document_id`,
+        [crashed.run.run_id],
+      )
+    ).rows;
+    const orphan = snapshots.filter((row) => row.step_execution_id === crashed.step.execution_id);
+    const authoritative = snapshots.filter(
+      (row) => row.step_execution_id === baseline.manifest.producing_execution_id,
+    );
+    expect(orphan).toHaveLength(orphanSnapshots.length);
+    expect(authoritative).toHaveLength(baseline.manifest.references.length);
+    expect(
+      authoritative
+        .map(({ reference_version_id, content_hash }) => ({
+          version_id: reference_version_id,
+          content_hash,
+        }))
+        .sort((a, b) => a.version_id.localeCompare(b.version_id)),
+    ).toEqual(
+      baseline.manifest.references
+        .map(({ version_id, content_hash }) => ({ version_id, content_hash }))
+        .sort((a, b) => a.version_id.localeCompare(b.version_id)),
+    );
+    const records = (
+      await pool!.query(
+        `select m.manifest_hash,m.result_hash,o.content_hash,
+          count(distinct f.id)::int finding_count,count(distinct f.stable_key)::int stable_key_count
+         from deterministic_manifests m
+         join step_outputs o on o.run_id=m.run_id and o.step='automated_checks' and o.step_execution_id=m.step_execution_id
+         left join findings f on f.step_execution_id=m.step_execution_id
+         where m.run_id=$1 group by m.manifest_hash,m.result_hash,o.content_hash`,
+        [crashed.run.run_id],
+      )
+    ).rows;
+    expect(records).toEqual([
+      {
+        manifest_hash: baseline.manifest.manifest_hash,
+        result_hash: baseline.result.result_hash,
+        content_hash: baseline.result.result_hash,
+        finding_count: baseline.result.findings.length,
+        stable_key_count: baseline.result.findings.length,
+      },
+    ]);
+    expect(
+      (await pool!.query("select current_step from runs where id=$1", [crashed.run.run_id])).rows[0]
+        ?.current_step,
+    ).toBe("review_writing_style");
+  });
+
+  it("recovers a post-persistence process death without recomputing Step 1.4", async () => {
+    const repository = new PostgresMilestoneRepository(pool!, 5_000);
+    const run = await ingestHandoff(handoff, "m3-step14-post-persistence-death", repository);
+    const reviewProvider = stopAtStep15Provider();
+    let injected = false;
+    const original = productionWorker(
+      repository,
+      new MilestoneThreeOrchestrator(repository, fixture, reviewProvider, {
         hit: (boundary) => {
-          if (!fired && boundary === "after_deterministic_persist") {
-            fired = true;
-            throw new Error("injected");
+          if (!injected && boundary === "after_deterministic_persist") {
+            injected = true;
+            throw new Error("simulated process loss after atomic deterministic persistence");
           }
         },
-      }).run(run.run_id),
-    ).rejects.toThrow("injected");
-    await new MilestoneThreeOrchestrator(
-      repository,
-      fixture,
-      new MockReviewProvider("review-v1"),
-    ).run(run.run_id);
-    const output = await pool!.query(
-      `select e.status from step_outputs o join step_executions e on e.id=o.step_execution_id
-       where o.run_id=$1 and o.step='automated_checks'`,
-      [run.run_id],
+      }),
+      "original-worker",
     );
-    expect(output.rows).toEqual([{ status: "succeeded" }]);
+    await original.worker.start();
+    await vi.waitFor(async () => {
+      expect(
+        (await pool!.query("select state from pipeline_queue_jobs where run_id=$1", [run.run_id]))
+          .rows[0]?.state,
+      ).toBe("operator_action");
+    });
+    await original.worker.stop();
+    expect(original.m3Run).toHaveBeenCalledTimes(1);
+    expect(reviewProvider.review).not.toHaveBeenCalled();
+    expect(original.m4Run).not.toHaveBeenCalled();
+
+    const before = await repository.getDeterministicManifest(run.run_id);
+    const staleExecution = before.manifest.producing_execution_id;
+    const staleToken = (
+      await pool!.query("select lease_token from step_executions where id=$1", [staleExecution])
+    ).rows[0]?.lease_token as string;
+    const beforeCounts = (
+      await pool!.query(
+        `select
+          (select count(*)::int from step_executions where run_id=$1 and step='automated_checks') executions,
+          (select count(*)::int from deterministic_manifests where run_id=$1) manifests,
+          (select count(*)::int from step_outputs where run_id=$1 and step='automated_checks') outputs,
+          (select count(*)::int from findings f join step_executions e on e.id=f.step_execution_id where f.run_id=$1 and e.step='automated_checks') findings`,
+        [run.run_id],
+      )
+    ).rows[0];
+    await repository.enqueueRun(run.run_id);
+    const lostQueueLease = await repository.claimQueueJob("lost-process", 5_000);
+    expect(lostQueueLease).not.toBeNull();
+    await expireQueue(lostQueueLease!.id);
+
+    const replacementProvider = stopAtStep15Provider();
+    const replacement = productionWorker(
+      repository,
+      new MilestoneThreeOrchestrator(repository, fixture, replacementProvider),
+      "replacement-worker",
+    );
+    await replacement.worker.start();
+    await vi.waitFor(async () => expect(replacement.m3Run).toHaveBeenCalledTimes(1));
+    await vi.waitFor(async () => {
+      expect(
+        (await pool!.query("select state from pipeline_queue_jobs where run_id=$1", [run.run_id]))
+          .rows[0]?.state,
+      ).toBe("operator_action");
+    });
+    await replacement.worker.stop();
+    expect(replacementProvider.review).toHaveBeenCalledTimes(1);
+    expect(replacement.m4Run).not.toHaveBeenCalled();
+
+    expect(await repository.getDeterministicManifest(run.run_id)).toEqual(before);
+    expect(
+      (
+        await pool!.query(
+          `select
+            (select count(*)::int from step_executions where run_id=$1 and step='automated_checks') executions,
+            (select count(*)::int from deterministic_manifests where run_id=$1) manifests,
+            (select count(*)::int from step_outputs where run_id=$1 and step='automated_checks') outputs,
+            (select count(*)::int from findings f join step_executions e on e.id=f.step_execution_id where f.run_id=$1 and e.step='automated_checks') findings`,
+          [run.run_id],
+        )
+      ).rows[0],
+    ).toEqual(beforeCounts);
+
+    const progress = (
+      await pool!.query("select status,current_step from runs where id=$1", [run.run_id])
+    ).rows[0];
+    await expect(
+      repository.saveDeterministicBaseline({
+        run_id: run.run_id,
+        document_version_id: before.manifest.baseline_document.id,
+        execution_id: staleExecution,
+        token: staleToken,
+        manifest: before.manifest,
+        result: before.result,
+        findings: [],
+      }),
+    ).rejects.toThrow(/Stale|expired|fencing/i);
+    await expect(repository.completeStep(staleExecution, staleToken)).rejects.toThrow(
+      /Stale|expired|fencing/i,
+    );
+    expect(
+      (await pool!.query("select status,current_step from runs where id=$1", [run.run_id])).rows[0],
+    ).toEqual(progress);
+  });
+
+  it("fails closed on an immutable Step 1.4 conflict and preserves the authoritative baseline", async () => {
+    const repository = new PostgresMilestoneRepository(pool!, 5_000);
+    const run = await ingestHandoff(handoff, "m3-step14-immutable-conflict", repository);
+    let baselinePersisted = false;
+    const baselineWorker = productionWorker(
+      repository,
+      new MilestoneThreeOrchestrator(repository, fixture, new MockReviewProvider("review-v1"), {
+        hit: (boundary) => {
+          if (!baselinePersisted && boundary === "after_deterministic_persist") {
+            baselinePersisted = true;
+            throw new Error("stop safely after Step 1.4 persistence");
+          }
+        },
+      }),
+      "baseline-worker",
+    );
+    await baselineWorker.worker.start();
+    await vi.waitFor(async () => expect(baselineWorker.m3Run).toHaveBeenCalledTimes(1));
+    await vi.waitFor(async () => {
+      expect(
+        (await pool!.query("select state from pipeline_queue_jobs where run_id=$1", [run.run_id]))
+          .rows[0]?.state,
+      ).toBe("operator_action");
+    });
+    await baselineWorker.worker.stop();
+    const baseline = await repository.getDeterministicManifest(run.run_id);
+    const recordsBefore = (
+      await pool!.query(
+        `select
+          (select count(*)::int from deterministic_manifests where run_id=$1) manifests,
+          (select count(*)::int from step_outputs where run_id=$1 and step='automated_checks') outputs,
+          (select count(*)::int from findings f join step_executions e on e.id=f.step_execution_id where f.run_id=$1 and e.step='automated_checks') findings`,
+        [run.run_id],
+      )
+    ).rows[0];
+
+    const conflictingRepository = new Proxy(repository, {
+      get(target, property, receiver) {
+        if (property === "stepSucceeded")
+          return async (runId: string, step: string) =>
+            step === "automated_checks" ? false : target.stepSucceeded(runId, step as never);
+        if (property === "claimStep")
+          return async (...args: Parameters<PostgresMilestoneRepository["claimStep"]>) =>
+            target.claimStep(args[0], args[1], args[2], true);
+        if (property === "hasStepOutput") return async () => false;
+        if (property === "saveDeterministicBaseline")
+          return async (
+            input: Parameters<PostgresMilestoneRepository["saveDeterministicBaseline"]>[0],
+          ) =>
+            target.saveDeterministicBaseline({
+              ...input,
+              manifest: { ...input.manifest, manifest_hash: "0".repeat(64) },
+            });
+        return Reflect.get(target, property, receiver);
+      },
+    });
+    await repository.enqueueRun(run.run_id);
+    const conflictWorker = productionWorker(
+      conflictingRepository,
+      new MilestoneThreeOrchestrator(
+        conflictingRepository,
+        fixture,
+        new MockReviewProvider("review-v1"),
+      ),
+      "conflict-worker",
+    );
+    await conflictWorker.worker.start();
+    await vi.waitFor(async () => expect(conflictWorker.m3Run).toHaveBeenCalledTimes(1));
+    await vi.waitFor(async () => {
+      expect(
+        (
+          await pool!.query(
+            "select state,last_error_code from pipeline_queue_jobs where run_id=$1",
+            [run.run_id],
+          )
+        ).rows[0],
+      ).toEqual({ state: "operator_action", last_error_code: "unsafe_pipeline_failure" });
+    });
+    await conflictWorker.worker.stop();
+    expect(conflictWorker.m4Run).not.toHaveBeenCalled();
+    expect(await repository.getDeterministicManifest(run.run_id)).toEqual(baseline);
+    expect(
+      await pool!.query(
+        `select
+          (select count(*)::int from deterministic_manifests where run_id=$1) manifests,
+          (select count(*)::int from step_outputs where run_id=$1 and step='automated_checks') outputs,
+          (select count(*)::int from findings f join step_executions e on e.id=f.step_execution_id where f.run_id=$1 and e.step='automated_checks') findings`,
+        [run.run_id],
+      ),
+    ).toMatchObject({ rows: [recordsBefore] });
+    expect(
+      (await pool!.query("select status,current_step from runs where id=$1", [run.run_id])).rows[0],
+    ).toEqual({ status: "retryable_failed", current_step: "automated_checks" });
   });
 });

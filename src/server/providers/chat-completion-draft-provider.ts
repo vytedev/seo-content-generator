@@ -5,11 +5,13 @@ import {
   type DraftProviderResponse,
 } from "../../shared/milestone-two.js";
 import { hashIdempotencyInput } from "../../shared/worker-contracts.js";
+import { canonicalHash } from "../../shared/milestone-two.js";
 import { computeCostMicros } from "./model-pricing.js";
 import { z } from "zod";
 import type { DraftProvider } from "./contracts.js";
 import { formatDeterministicEditorialRubric } from "./editorial-rubric.js";
 import { readBoundedResponseBody } from "./http-response.js";
+import { classifyInvalidSuccess, isJson } from "./structured-output-diagnostics.js";
 import {
   logModelProviderHttpFailure,
   logModelProviderOperationStarted,
@@ -28,11 +30,16 @@ import {
  */
 
 const TIMEOUT_MS = 60_000;
-const MAX_HTTP_RETRIES = 2;
-const RETRY_BACKOFF_MS = 250;
 /** Drafts produce a full structured article; cap generous enough for ~2000 words + JSON shell. */
 const DEFAULT_MAX_OUTPUT_TOKENS = 6_000;
-export const DRAFT_PROMPT_VERSION = "mobelaris.draft.v1";
+export const DRAFT_PROMPT = {
+  template_id: "mobelaris.draft" as const,
+  template_version: "3.0.0-single-dispatch",
+};
+export const DRAFT_PROMPT_VERSION = `${DRAFT_PROMPT.template_id}@${DRAFT_PROMPT.template_version}`;
+const DRAFT_REASONING_POLICY = "openrouter:none-excluded;compatible:unspecified";
+const DRAFT_RETRY_POLICY = "single-http-dispatch-no-corrective-request-v1";
+const DRAFT_TOKEN_POLICY = `max-output-tokens-env-v1:${DEFAULT_MAX_OUTPUT_TOKENS}`;
 
 export const DRAFT_RESPONSE_JSON_SCHEMA = {
   name: "mobelaris_draft_v1",
@@ -123,6 +130,24 @@ export const DRAFT_RESPONSE_JSON_SCHEMA = {
   },
 } as const;
 
+export const DRAFT_CONTRACT_IDENTITY = canonicalHash({
+  prompt: DRAFT_PROMPT,
+  response_schema: DRAFT_RESPONSE_JSON_SCHEMA,
+  reasoning_policy: DRAFT_REASONING_POLICY,
+  retry_policy: DRAFT_RETRY_POLICY,
+  token_policy: DRAFT_TOKEN_POLICY,
+});
+
+function draftContractIdentity(maxOutputTokens: number): string {
+  return canonicalHash({
+    prompt: DRAFT_PROMPT,
+    response_schema: DRAFT_RESPONSE_JSON_SCHEMA,
+    reasoning_policy: DRAFT_REASONING_POLICY,
+    retry_policy: DRAFT_RETRY_POLICY,
+    token_policy: `${DRAFT_TOKEN_POLICY};effective:${maxOutputTokens}`,
+  });
+}
+
 /** Env override shared by all model providers (MODEL_MAX_OUTPUT_TOKENS). */
 export function envMaxOutputTokens(env: NodeJS.ProcessEnv = process.env, fallback: number): number {
   const raw = env.MODEL_MAX_OUTPUT_TOKENS?.trim();
@@ -161,6 +186,7 @@ export interface ChatCompletionDraftProviderOptions {
   /** Injectable for tests; unit tests must stub this rather than touch the network. */
   readonly fetcher?: typeof fetch;
   readonly timeoutMs?: number;
+  /** Retained only as a source-compatible test option; Step 1.3 never sleeps or retries. */
   readonly sleep?: (ms: number) => Promise<void>;
   /** Hard ceiling on generated output tokens; bounds latency and spend. */
   readonly maxOutputTokens?: number;
@@ -276,7 +302,8 @@ export class ChatCompletionDraftProvider implements DraftProvider {
   private readonly fetcher: typeof fetch;
   private readonly timeoutMs: number;
   private readonly maxOutputTokens: number;
-  private readonly sleep: (ms: number) => Promise<void>;
+  readonly prompt = DRAFT_PROMPT;
+  readonly contractIdentity: string;
 
   constructor(options: ChatCompletionDraftProviderOptions = {}) {
     const token = options.token ?? process.env.OPENROUTER_API_KEY;
@@ -301,7 +328,7 @@ export class ChatCompletionDraftProvider implements DraftProvider {
     this.timeoutMs = options.timeoutMs ?? TIMEOUT_MS;
     this.maxOutputTokens =
       options.maxOutputTokens ?? envMaxOutputTokens(process.env, DEFAULT_MAX_OUTPUT_TOKENS);
-    this.sleep = options.sleep ?? ((ms) => new Promise((resolve) => setTimeout(resolve, ms)));
+    this.contractIdentity = draftContractIdentity(this.maxOutputTokens);
   }
 
   async generate(input: DraftProviderRequest): Promise<DraftProviderResponse> {
@@ -314,35 +341,32 @@ export class ChatCompletionDraftProvider implements DraftProvider {
       );
     const startedAt = Date.now();
     const first = await this.callModel(buildDraftMessages(request));
-    if (first?.choices[0]?.finish_reason === "length")
+    if (first?.choices[0]?.finish_reason === "length") {
+      logModelProviderOutputInvalid(this.provider, "draft", this.model, 1, "truncation");
       throw new DraftProviderError(
         "DRAFT_PROVIDER_TRUNCATED",
         "Draft provider output reached the operation token limit",
-      );
-    const draft = first ? this.extractDraft(first) : undefined;
-    if (first && draft) return this.toResponse(request, first, draft, startedAt);
-    const corrective = await this.callModel([
-      ...buildDraftMessages(request),
-      {
-        role: "user",
-        content:
-          "Your previous reply was not a single valid JSON object of the required shape. Reply again with exactly one JSON object of the same shape, with no fences and no other text.",
-      },
-    ]);
-    if (corrective?.choices[0]?.finish_reason === "length")
-      throw new DraftProviderError(
-        "DRAFT_PROVIDER_TRUNCATED",
-        "Draft provider output reached the operation token limit",
-      );
-    const retriedDraft = corrective ? this.extractDraft(corrective) : undefined;
-    if (!corrective || !retriedDraft) {
-      logModelProviderOutputInvalid(this.provider, "draft", this.model, 2);
-      throw new DraftProviderError(
-        "DRAFT_PROVIDER_UNPARSEABLE",
-        "Draft provider returned unparseable output after 2 attempts",
       );
     }
-    return this.toResponse(request, corrective, retriedDraft, startedAt);
+    const draft = first ? this.extractDraft(first) : undefined;
+    if (first && draft) return this.toResponse(request, first, draft, startedAt);
+    const content = first?.choices[0]?.message.content;
+    logModelProviderOutputInvalid(
+      this.provider,
+      "draft",
+      this.model,
+      1,
+      classifyInvalidSuccess(
+        first !== null,
+        first?.choices[0]?.finish_reason,
+        content,
+        isJson(content),
+      ),
+    );
+    throw new DraftProviderError(
+      "DRAFT_PROVIDER_UNPARSEABLE",
+      "Draft provider returned unparseable output; no automatic second request was made",
+    );
   }
 
   private toResponse(
@@ -393,67 +417,55 @@ export class ChatCompletionDraftProvider implements DraftProvider {
     return parsed.success ? parsed.data : undefined;
   }
 
-  /** One bounded HTTP attempt loop: initial request plus at most 2 retries on 5xx/429/network. */
+  /** Exactly one HTTP dispatch. No network, 429, 5xx, or output-correction retry is safe here. */
   private async callModel(messages: ChatMessage[]): Promise<WireResponse | null> {
-    let lastError: DraftProviderError | undefined;
-    for (let attempt = 0; attempt <= MAX_HTTP_RETRIES; attempt++) {
-      const controller = new AbortController();
-      const timer = setTimeout(() => controller.abort(), this.timeoutMs);
-      let response: Response;
-      try {
-        response = await this.fetcher(this.baseUrl, {
-          method: "POST",
-          headers: {
-            "content-type": "application/json",
-            authorization: `Bearer ${this.token}`,
-          },
-          body: JSON.stringify({
-            model: this.model,
-            messages,
-            max_tokens: this.maxOutputTokens,
-            response_format: { type: "json_schema", json_schema: DRAFT_RESPONSE_JSON_SCHEMA },
-            ...(this.provider === "openrouter" ? { provider: { require_parameters: true } } : {}),
-          }),
-          signal: controller.signal,
-        });
-      } catch (error) {
-        if (isAbort(error))
-          throw new DraftProviderError(
-            "DRAFT_PROVIDER_TIMEOUT",
-            "Draft provider request timed out",
-          );
-        lastError = new DraftProviderError(
-          "DRAFT_PROVIDER_NETWORK",
-          "Draft provider request failed at network level",
-        );
-        if (attempt === MAX_HTTP_RETRIES) throw lastError;
-        await this.sleep(RETRY_BACKOFF_MS * (attempt + 1));
-        continue;
-      } finally {
-        clearTimeout(timer);
-      }
-      if (response.ok) {
-        const wire = WireResponseSchema.safeParse(
-          extractJsonObject(await readBoundedResponseBody(response)),
-        );
-        // An unparseable envelope is a parse failure, not a retryable transport error;
-        // generate() handles it through the bounded corrective attempt.
-        return wire.success ? wire.data : null;
-      }
-      const status = response.status;
-      logModelProviderHttpFailure(this.provider, "draft", this.model, status);
-      lastError = new DraftProviderError(
-        "DRAFT_PROVIDER_HTTP_STATUS",
-        status === 402
-          ? "Draft provider account has no billing configured for model usage"
-          : `Draft provider request failed with HTTP ${status}`,
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(), this.timeoutMs);
+    let response: Response;
+    try {
+      response = await this.fetcher(this.baseUrl, {
+        method: "POST",
+        headers: {
+          "content-type": "application/json",
+          authorization: `Bearer ${this.token}`,
+        },
+        body: JSON.stringify({
+          model: this.model,
+          messages,
+          max_tokens: this.maxOutputTokens,
+          response_format: { type: "json_schema", json_schema: DRAFT_RESPONSE_JSON_SCHEMA },
+          ...(this.provider === "openrouter"
+            ? {
+                provider: { require_parameters: true },
+                reasoning: { effort: "none", exclude: true },
+              }
+            : {}),
+        }),
+        signal: controller.signal,
+      });
+    } catch (error) {
+      if (isAbort(error))
+        throw new DraftProviderError("DRAFT_PROVIDER_TIMEOUT", "Draft provider request timed out");
+      throw new DraftProviderError(
+        "DRAFT_PROVIDER_NETWORK",
+        "Draft provider request failed at network level",
       );
-      if (status !== 429 && status < 500) throw lastError;
-      if (attempt === MAX_HTTP_RETRIES) throw lastError;
-      await this.sleep(RETRY_BACKOFF_MS * (attempt + 1));
+    } finally {
+      clearTimeout(timer);
     }
-    throw (
-      lastError ?? new DraftProviderError("DRAFT_PROVIDER_NETWORK", "Draft provider request failed")
+    if (response.ok) {
+      const wire = WireResponseSchema.safeParse(
+        extractJsonObject(await readBoundedResponseBody(response)),
+      );
+      return wire.success ? wire.data : null;
+    }
+    const status = response.status;
+    logModelProviderHttpFailure(this.provider, "draft", this.model, status);
+    throw new DraftProviderError(
+      "DRAFT_PROVIDER_HTTP_STATUS",
+      status === 402
+        ? "Draft provider account has no billing configured for model usage"
+        : `Draft provider request failed with HTTP ${status}`,
     );
   }
 }

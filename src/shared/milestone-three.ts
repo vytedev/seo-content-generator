@@ -354,6 +354,29 @@ export interface MilestoneThreeRepository {
     /** When false the producing attempt stays open, so the same lease may park the wait. */
     complete?: boolean,
   ): Promise<void>;
+  beginReviewOperation(input: {
+    run_id: string;
+    document_version_id: string;
+    execution_id: string;
+    token: string;
+    step: ReviewStep;
+    request: ReviewRequest;
+    provider: string;
+    model: string;
+  }): Promise<{ operation_id: string; response: PersistedReviewResponse | null }>;
+  markReviewProviderInFlight(input: {
+    run_id: string;
+    execution_id: string;
+    token: string;
+    operation_id: string;
+  }): Promise<void>;
+  checkpointReviewResponse(input: {
+    run_id: string;
+    execution_id: string;
+    token: string;
+    operation_id: string;
+    response: PersistedReviewResponse;
+  }): Promise<void>;
   saveReview(
     runId: string,
     documentVersionId: string,
@@ -364,6 +387,8 @@ export interface MilestoneThreeRepository {
     response: PersistedReviewResponse,
     provider: string,
     model: string,
+    /** Provider-owned checkpoint when the final response also includes application-owned findings. */
+    checkpointResponse?: PersistedReviewResponse,
   ): Promise<void>;
   waitForFindings(runId: string, executionId: string, token: string): Promise<void>;
   /**

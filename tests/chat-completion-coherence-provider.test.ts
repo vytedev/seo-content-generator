@@ -100,7 +100,10 @@ function completion(body: unknown, init?: ResponseInit) {
   });
 }
 
-function wire(content: string, usage?: { prompt_tokens: number; completion_tokens: number }) {
+function wire(
+  content: string,
+  usage?: { prompt_tokens: number; completion_tokens: number; cost?: number },
+) {
   return {
     id: "openrouter-chatcmpl-test",
     choices: [{ message: { content } }],
@@ -180,7 +183,9 @@ describe("ChatCompletionCoherenceProvider.review", () => {
     ];
     expect(url).toBe("https://openrouter.ai/api/v1/chat/completions");
     expect(init.headers.authorization).toBe(`Bearer ${TOKEN}`);
-    expect(JSON.parse(init.body).model).toBe(TEST_MODEL);
+    const requestBody = JSON.parse(init.body);
+    expect(requestBody.model).toBe(TEST_MODEL);
+    expect(requestBody.reasoning).toEqual({ effort: "none", exclude: true });
   });
 
   it("preserves the exact persisted markdown field on app-owned targets", async () => {
@@ -211,13 +216,35 @@ describe("ChatCompletionCoherenceProvider.review", () => {
     expect(fetcher).toHaveBeenCalledTimes(2);
   });
 
-  it("succeeds on the single bounded corrective re-request after invalid JSON", async () => {
+  it("aggregates provider-reported usage and cost across the invalid response and correction", async () => {
     const fetcher = vi
       .fn<() => Promise<Response>>()
-      .mockResolvedValueOnce(completion(wire("prose without any object")))
-      .mockResolvedValueOnce(completion(wire(JSON.stringify({ f: [modelFinding()] }))));
+      .mockResolvedValueOnce(
+        completion(
+          wire("prose without any object", {
+            prompt_tokens: 10,
+            completion_tokens: 4,
+            cost: 0.000012,
+          }),
+        ),
+      )
+      .mockResolvedValueOnce(
+        completion(
+          wire(JSON.stringify({ f: [modelFinding()] }), {
+            prompt_tokens: 20,
+            completion_tokens: 6,
+            cost: 0.000023,
+          }),
+        ),
+      );
     const response = await makeProvider(fetcher).review(validRequest());
     expect(response.findings).toHaveLength(1);
+    expect(response.usage).toEqual({
+      input_units: 30,
+      output_units: 10,
+      cost_micros: 35,
+      latency_ms: expect.any(Number),
+    });
     expect(fetcher).toHaveBeenCalledTimes(2);
     const secondBody = JSON.parse(
       (fetcher.mock.calls[1] as unknown as [{}, { body: string }])[1].body,
@@ -227,6 +254,37 @@ describe("ChatCompletionCoherenceProvider.review", () => {
         /previous reply was invalid/.test(m.content),
       ),
     ).toBe(true);
+  });
+
+  it("preserves safe usage from a malformed successful envelope before corrective success", async () => {
+    const fetcher = vi
+      .fn<() => Promise<Response>>()
+      .mockResolvedValueOnce(
+        completion({
+          choices: "malformed and never trusted",
+          usage: { prompt_tokens: 12, completion_tokens: 5, cost: 0.000019 },
+        }),
+      )
+      .mockResolvedValueOnce(
+        completion(
+          wire(JSON.stringify({ f: [] }), {
+            prompt_tokens: 20,
+            completion_tokens: 3,
+            cost: 0.000011,
+          }),
+        ),
+      );
+
+    const response = await makeProvider(fetcher).review(validRequest());
+
+    expect(response.findings).toEqual([]);
+    expect(response.usage).toEqual({
+      input_units: 32,
+      output_units: 8,
+      cost_micros: 30,
+      latency_ms: expect.any(Number),
+    });
+    expect(fetcher).toHaveBeenCalledTimes(2);
   });
 
   it("throws a typed redacted error when all attempts return unparseable output", async () => {

@@ -254,6 +254,16 @@ export function applyRevisionEnvelope(input: {
   results: FindingResult[];
   rejected_locations?: FindingLocation[];
   verified_fact_locations?: FindingLocation[];
+  /**
+   * Extra exact source ranges one finding authorises, keyed by finding id.
+   *
+   * A document-global rule such as `style.readability_grade_8` cannot be fixed
+   * inside one paragraph, so it may own several non-contiguous blocks. Each
+   * range stays an exact immutable source location — this never widens a
+   * finding to whole-`body_markdown` authority, and it never merges the blocks
+   * into one broad span that would swallow the unauthorised prose between them.
+   */
+  additional_authority?: Readonly<Record<string, ReadonlyArray<readonly [number, number]>>>;
 }): { document: StructuredDraft; audits: RevisionAudit[]; manifest_hash: string } {
   if (
     input.results.length !== input.findings.length ||
@@ -311,8 +321,14 @@ export function applyRevisionEnvelope(input: {
       if (!markdownField(finding.location)) return [];
       // Markdown authority must be an app-issued exact block range. A section label is context only.
       if (finding.location.line_start === undefined) return [];
-      const range = locationRange(input.current.markdown, finding.location);
-      return range && overlaps(range, hunk) ? [index] : [];
+      const primary = locationRange(input.current.markdown, finding.location);
+      const ranges = [
+        ...(primary ? [primary] : []),
+        ...(input.additional_authority?.[finding.id] ?? []).map(
+          ([start, end]) => [start, end] as [number, number],
+        ),
+      ];
+      return ranges.some((range) => overlaps(range, hunk)) ? [index] : [];
     });
     if (candidates.length !== 1) continue;
     const owner = candidates[0]!,

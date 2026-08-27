@@ -47,6 +47,26 @@ export function friendlyFailure(
     };
   }
 
+  if (/draft provider outcome is ambiguous/.test(message))
+    return {
+      title: "The draft request needs technical review",
+      explanation:
+        "The app cannot prove whether the AI processed the previous request before the connection or process stopped.",
+      protection: "The app will not automatically make another potentially paid request.",
+      action:
+        "Do not keep selecting Resume. Ask the technical owner to review this reserved draft operation and explicitly authorise a separate recovery operation if another paid request is acceptable.",
+    };
+
+  if (/pre-checkpoint draft failure requires explicit operator authorisation/.test(message))
+    return {
+      title: "This earlier draft attempt needs confirmation",
+      explanation:
+        "This run failed before durable draft checkpoints were available, so no reusable AI response was stored.",
+      protection: "No new AI request is made until you explicitly continue this historical run.",
+      action:
+        "Selecting ‘Resume safely’ once explicitly authorises one new draft request for this historical run.",
+    };
+
   if (/locked after 2 failed executions/.test(message)) {
     return {
       title: "This revision setup is paused",
