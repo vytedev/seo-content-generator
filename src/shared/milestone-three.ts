@@ -13,6 +13,7 @@ import {
   type PipelineStepId,
 } from "./pipeline.js";
 import { LinkReviewContextSchema } from "./link-conversion-review.js";
+import { HardFlagReasonSchema } from "./hard-flags.js";
 import type { DeterministicManifest, DeterministicRunResult } from "./deterministic-run.js";
 import {
   InternalLinkSchema,
@@ -113,10 +114,22 @@ export const ReviewFindingSchema = z
   })
   .strict();
 export type ReviewFinding = z.infer<typeof ReviewFindingSchema>;
-export const PersistedReviewFindingSchema = ReviewFindingSchema.extend({
+const PersistedReviewFindingObjectSchema = ReviewFindingSchema.extend({
   /** Required application-owned classification; provider payloads cannot supply it. */
   hard_flag: z.boolean(),
+  /** Persisted additively from S2; absent on historical rows. */
+  hard_flag_reason: HardFlagReasonSchema.nullable().optional(),
 }).strict();
+export const PersistedReviewFindingSchema = PersistedReviewFindingObjectSchema.superRefine(
+  (finding, context) => {
+    if (!finding.hard_flag && finding.hard_flag_reason)
+      context.addIssue({
+        code: "custom",
+        path: ["hard_flag_reason"],
+        message: "A non-hard-flagged finding cannot have a mandatory-review reason.",
+      });
+  },
+);
 export type PersistedReviewFinding = z.infer<typeof PersistedReviewFindingSchema>;
 
 export const FactInventoryItemSchema = z
@@ -212,6 +225,8 @@ export const ReviewedClaimSchema = z
     status: z.enum(["verified", "unverified", "contradicted"]),
     location: FindingLocationSchema,
     hard_flag: z.boolean(),
+    /** Persisted additively from S2; absent on historical rows. */
+    hard_flag_reason: HardFlagReasonSchema.nullable().optional(),
     source_key: text,
     inventory_key: text.optional(),
   })
@@ -222,6 +237,12 @@ export const ReviewedClaimSchema = z
         code: "custom",
         path: ["hard_flag"],
         message: "Provenance claims are always hard flagged.",
+      });
+    if (!claim.hard_flag && claim.hard_flag_reason)
+      context.addIssue({
+        code: "custom",
+        path: ["hard_flag_reason"],
+        message: "A non-hard-flagged claim cannot have a mandatory-review reason.",
       });
   });
 export const ReviewResponseSchema = z
@@ -252,7 +273,7 @@ export const EvidenceSourceProjectionSchema = z
   .strict();
 export type EvidenceSourceProjection = z.infer<typeof EvidenceSourceProjectionSchema>;
 
-export const FindingRecordSchema = PersistedReviewFindingSchema.extend({
+export const FindingRecordSchema = PersistedReviewFindingObjectSchema.extend({
   id: text,
   run_id: text,
   document_version_id: text,
@@ -262,7 +283,16 @@ export const FindingRecordSchema = PersistedReviewFindingSchema.extend({
   rationale: z.string().nullable(),
   /** Optional for historical/non-fact findings; never contains raw HTML. */
   evidence_sources: z.array(EvidenceSourceProjectionSchema).optional(),
-}).strict();
+})
+  .strict()
+  .superRefine((finding, context) => {
+    if (!finding.hard_flag && finding.hard_flag_reason)
+      context.addIssue({
+        code: "custom",
+        path: ["hard_flag_reason"],
+        message: "A non-hard-flagged finding cannot have a mandatory-review reason.",
+      });
+  });
 export type FindingRecord = z.infer<typeof FindingRecordSchema>;
 
 export const FindingFiltersSchema = z

@@ -6,6 +6,7 @@ import type { Root, Content, PhrasingContent } from "mdast";
 import { StructuredDraftSchema, assertExactImagePlacements, contentHash } from "./milestone-two.js";
 import { normaliseHttpUrl } from "./checker/contracts.js";
 import { assertEditoriallyExportable } from "./editorial-integrity.js";
+import { HardFlagReasonSchema } from "./hard-flags.js";
 
 const text = z.string().trim().min(1);
 const hash = z.string().regex(/^[a-f0-9]{64}$/);
@@ -37,12 +38,22 @@ export const ExportClaimSchema = z
     ]),
     status: z.enum(["verified", "unverified", "contradicted"]),
     hard_flag: z.boolean(),
+    /** Persisted additively from S2; absent on historical rows. */
+    hard_flag_reason: HardFlagReasonSchema.nullable().optional(),
     location: z.record(z.string(), z.unknown()),
     product_identifier: text.optional(),
     claim_hash: hash,
     sources: z.array(ExportSourceSchema),
   })
-  .strict();
+  .strict()
+  .superRefine((claim, context) => {
+    if (!claim.hard_flag && claim.hard_flag_reason)
+      context.addIssue({
+        code: "custom",
+        path: ["hard_flag_reason"],
+        message: "A non-hard-flagged export claim cannot have a mandatory-review reason.",
+      });
+  });
 export type ExportClaim = z.infer<typeof ExportClaimSchema>;
 export const ExportRejectedFindingSchema = z
   .object({
