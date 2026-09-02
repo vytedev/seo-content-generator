@@ -400,6 +400,13 @@ export interface MilestoneThreeRepository {
     token: string;
     operation_id: string;
   }): Promise<void>;
+  releaseReviewProviderFailure(input: {
+    run_id: string;
+    execution_id: string;
+    token: string;
+    operation_id: string;
+    reason: import("./paid-operation.js").PaidOperationReleaseReason;
+  }): Promise<void>;
   checkpointReviewResponse(input: {
     run_id: string;
     execution_id: string;

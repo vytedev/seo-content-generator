@@ -359,12 +359,14 @@ export interface MilestoneFourRepository {
     execution_id: string;
     token: string;
     operation_id: string;
+    reason: import("./paid-operation.js").PaidOperationReleaseReason;
   }): Promise<void>;
   releaseRevisionProviderFailure(input: {
     run_id: string;
     execution_id: string;
     token: string;
     operation_id: string;
+    reason: import("./paid-operation.js").PaidOperationReleaseReason;
   }): Promise<void>;
   checkpointRevisionResponse(input: {
     run_id: string;

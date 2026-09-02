@@ -1,14 +1,15 @@
 import {
   DraftProviderResponseSchema,
   InternalLinkSchema,
+  type DraftProviderResponse,
   type InternalLink,
   type LinkDiscoveryMetadata,
   type MilestoneRepository,
 } from "../../shared/milestone-two.js";
-import { DraftProviderError } from "../providers/chat-completion-draft-provider.js";
 import type { DraftProvider } from "../providers/contracts.js";
 import { withHeartbeat } from "./lease-heartbeat.js";
 import { classifyError, logger } from "../logger.js";
+import { executePaidOperation } from "../providers/paid-operation-lifecycle.js";
 
 export type FailureBoundary =
   | "after_link_persist"
@@ -17,15 +18,6 @@ export type FailureBoundary =
   | "after_provider"
   | "after_draft_persist";
 
-const UNDISPATCHED_DRAFT_CODES = new Set([
-  "DRAFT_PROVIDER_TOKEN_MISSING",
-  "DRAFT_PROVIDER_MODEL_INVALID",
-  "DRAFT_PROVIDER_MODEL_MISMATCH",
-]);
-
-function provablyUndispatchedDraftFailure(error: unknown): boolean {
-  return error instanceof DraftProviderError && UNDISPATCHED_DRAFT_CODES.has(error.code);
-}
 export interface FailureInjector {
   hit(boundary: FailureBoundary): void | Promise<void>;
 }
@@ -205,7 +197,7 @@ export class MilestoneTwoOrchestrator {
           purpose: operatorAuthorisedDraftRecovery ? "legacy_operator_recovery" : "initial",
           operator_authorised: operatorAuthorisedDraftRecovery,
         });
-        let response = operation.response;
+        let response: DraftProviderResponse | null = operation.response;
         if (response) {
           logger.info("provider.replayed", {
             run_id: runId,
@@ -223,36 +215,59 @@ export class MilestoneTwoOrchestrator {
             context: "draft",
             state: "reserved",
           });
-          // Commit the one-call reservation before the sole HTTP dispatch.
-          await this.repository.markDraftProviderInFlight({
+          const command = {
             run_id: runId,
             execution_id: lease.execution_id,
             token: lease.token,
             identity: operation.identity,
-          });
-          logger.info("provider.dispatch_started", {
-            run_id: runId,
-            operation_id: operation.identity.operation_id,
-            provider: this.drafts.provider,
-            context: "draft",
-          });
-          await this.failures?.hit("after_draft_reservation");
+          };
           try {
-            const rawResponse = await withHeartbeat(this.repository, lease, () =>
-              this.drafts.generate(request),
-            );
-            logger.info("provider.returned", {
-              run_id: runId,
-              operation_id: operation.identity.operation_id,
-              provider: this.drafts.provider,
-              context: "draft",
-            });
-            response = DraftProviderResponseSchema.parse(rawResponse);
-            logger.info("provider.response_validated", {
-              run_id: runId,
-              operation_id: operation.identity.operation_id,
-              provider: this.drafts.provider,
-              context: "draft",
+            response = await executePaidOperation<
+              typeof command,
+              Awaited<ReturnType<DraftProvider["generate"]>>,
+              DraftProviderResponse
+            >({
+              kind: "draft",
+              command,
+              adapter: {
+                markInFlight: async (value) => {
+                  await this.repository.markDraftProviderInFlight(value);
+                  await this.failures?.hit("after_draft_reservation");
+                },
+                release: (value, reason) =>
+                  this.repository.releaseDraftProviderFailure({ ...value, reason }),
+                checkpoint: (value, checked) =>
+                  this.repository.checkpointDraftResponse({ ...value, response: checked }),
+              },
+              dispatch: async () => {
+                logger.info("provider.dispatch_started", {
+                  run_id: runId,
+                  operation_id: operation.identity.operation_id,
+                  provider: this.drafts.provider,
+                  context: "draft",
+                });
+                const raw = await withHeartbeat(this.repository, lease, () =>
+                  this.drafts.generate(request),
+                );
+                logger.info("provider.returned", {
+                  run_id: runId,
+                  operation_id: operation.identity.operation_id,
+                  provider: this.drafts.provider,
+                  context: "draft",
+                });
+                await this.failures?.hit("after_provider_return");
+                return raw;
+              },
+              validate: (raw) => {
+                const checked = DraftProviderResponseSchema.parse(raw);
+                logger.info("provider.response_validated", {
+                  run_id: runId,
+                  operation_id: operation.identity.operation_id,
+                  provider: this.drafts.provider,
+                  context: "draft",
+                });
+                return checked;
+              },
             });
           } catch (error) {
             logger.warn("provider.dispatch_failed", {
@@ -262,23 +277,8 @@ export class MilestoneTwoOrchestrator {
               context: "draft",
               ...classifyError(error),
             });
-            if (provablyUndispatchedDraftFailure(error))
-              await this.repository.releaseDraftProviderFailure({
-                run_id: runId,
-                execution_id: lease.execution_id,
-                token: lease.token,
-                identity: operation.identity,
-              });
             throw error;
           }
-          await this.failures?.hit("after_provider_return");
-          await this.repository.checkpointDraftResponse({
-            run_id: runId,
-            execution_id: lease.execution_id,
-            token: lease.token,
-            identity: operation.identity,
-            response,
-          });
           logger.info("provider.checkpointed", {
             run_id: runId,
             operation_id: operation.identity.operation_id,
@@ -286,6 +286,7 @@ export class MilestoneTwoOrchestrator {
             context: "draft",
           });
         }
+        if (!response) throw new Error("Draft operation did not produce a response");
         await this.failures?.hit("after_provider");
         persisted = await this.repository.saveDraft(
           runId,

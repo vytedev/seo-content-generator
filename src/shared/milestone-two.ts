@@ -331,7 +331,11 @@ export interface MilestoneRepository extends IngestStore {
   }): Promise<{ identity: DraftOperationIdentity; response: DraftProviderResponse | null }>;
   markDraftProviderInFlight(input: DraftOperationCommand): Promise<void>;
   /** Narrow release for a provider failure proven to have occurred before HTTP dispatch. */
-  releaseDraftProviderFailure(input: DraftOperationCommand): Promise<void>;
+  releaseDraftProviderFailure(
+    input: DraftOperationCommand & {
+      reason: import("./paid-operation.js").PaidOperationReleaseReason;
+    },
+  ): Promise<void>;
   checkpointDraftResponse(
     input: DraftOperationCommand & {
       response: DraftProviderResponse;

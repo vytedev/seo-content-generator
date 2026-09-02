@@ -108,6 +108,8 @@ import {
   type MilestoneRepository,
 } from "../../shared/milestone-two.js";
 import { QueueOptionsSchema, type QueueLease, type QueueOptions } from "../../shared/queue.js";
+import { PaidOperationProjectionSchema } from "../../shared/paid-operation.js";
+import { paidOperationAmbiguity } from "../providers/paid-operation-lifecycle.js";
 import {
   CommandSubmissionResultSchema,
   commandPayloadHash,
@@ -889,20 +891,26 @@ export class PostgresMilestoneRepository
     await this.transaction(async (client) => {
       await this.assertDraftCommand(client, input);
       const changed = await client.query(
-        `update draft_operation_states set status='provider_in_flight'
+        `update draft_operation_states set status='provider_in_flight',release_reason=null,
+           ambiguity_reason='provider_in_flight_without_checkpoint'
          where operation_id=$1 and run_id=$2 and status='started' and response is null`,
         [input.identity.operation_id, input.run_id],
       );
       if (changed.rowCount !== 1) throw new Error("Draft operation cannot start a provider call");
     });
   }
-  async releaseDraftProviderFailure(input: DraftOperationCommand): Promise<void> {
+  async releaseDraftProviderFailure(
+    input: DraftOperationCommand & {
+      reason: import("../../shared/paid-operation.js").PaidOperationReleaseReason;
+    },
+  ): Promise<void> {
     await this.transaction(async (client) => {
       await this.assertDraftCommand(client, input);
       const changed = await client.query(
-        `update draft_operation_states set status='started'
+        `update draft_operation_states set status='started',ambiguity_reason=null,
+           release_reason=$3
          where operation_id=$1 and run_id=$2 and status='provider_in_flight' and response is null`,
-        [input.identity.operation_id, input.run_id],
+        [input.identity.operation_id, input.run_id, input.reason],
       );
       if (changed.rowCount !== 1)
         throw new Error("Draft operation has no releasable provider reservation");
@@ -917,7 +925,7 @@ export class PostgresMilestoneRepository
       await this.assertDraftCommand(client, input);
       const changed = await client.query(
         `update draft_operation_states
-         set response=$2::jsonb,response_hash=$3,status='checkpointed',checkpointed_at=clock_timestamp()
+         set response=$2::jsonb,response_hash=$3,status='checkpointed',ambiguity_reason=null,checkpointed_at=clock_timestamp()
          where operation_id=$1 and run_id=$4 and status='provider_in_flight' and response is null`,
         [input.identity.operation_id, JSON.stringify(response), responseHash, input.run_id],
       );
@@ -1317,10 +1325,30 @@ export class PostgresMilestoneRepository
     await this.transaction(async (client) => {
       await this.assertFence(client, input.run_id, input.execution_id, input.token);
       const changed = await client.query(
-        "update review_operation_states set status='provider_in_flight' where operation_id=$1 and run_id=$2 and status='started' and producing_step_execution_id=$3",
+        "update review_operation_states set status='provider_in_flight',release_reason=null,ambiguity_reason='provider_in_flight_without_checkpoint' where operation_id=$1 and run_id=$2 and status='started' and producing_step_execution_id=$3",
         [input.operation_id, input.run_id, input.execution_id],
       );
       if (changed.rowCount !== 1) throw new Error("Review operation is not ready for dispatch");
+    });
+  }
+
+  async releaseReviewProviderFailure(input: {
+    run_id: string;
+    execution_id: string;
+    token: string;
+    operation_id: string;
+    reason: import("../../shared/paid-operation.js").PaidOperationReleaseReason;
+  }): Promise<void> {
+    await this.transaction(async (client) => {
+      await this.assertFence(client, input.run_id, input.execution_id, input.token);
+      const changed = await client.query(
+        `update review_operation_states set status='started',release_reason=$1,ambiguity_reason=null
+         where operation_id=$2 and run_id=$3 and producing_step_execution_id=$4
+           and status='provider_in_flight' and response is null`,
+        [input.reason, input.operation_id, input.run_id, input.execution_id],
+      );
+      if (changed.rowCount !== 1)
+        throw new Error("Review operation has no releasable provider reservation");
     });
   }
 
@@ -1336,7 +1364,7 @@ export class PostgresMilestoneRepository
     await this.transaction(async (client) => {
       await this.assertFence(client, input.run_id, input.execution_id, input.token);
       const changed = await client.query(
-        `update review_operation_states set status='checkpointed',response=$2::jsonb,response_hash=$3,checkpointed_at=clock_timestamp()
+        `update review_operation_states set status='checkpointed',response=$2::jsonb,response_hash=$3,ambiguity_reason=null,checkpointed_at=clock_timestamp()
          where operation_id=$1 and run_id=$4 and status='provider_in_flight' and producing_step_execution_id=$5`,
         [input.operation_id, JSON.stringify(response), hash, input.run_id, input.execution_id],
       );
@@ -2184,7 +2212,8 @@ export class PostgresMilestoneRepository
     await this.transaction(async (client) => {
       await this.assertFence(client, input.run_id, input.execution_id, input.token);
       const changed = await client.query(
-        `update revision_operation_states set status='provider_in_flight'
+        `update revision_operation_states set status='provider_in_flight',release_reason=null,
+           ambiguity_reason='provider_in_flight_without_checkpoint'
          where operation_id=$1 and run_id=$2 and status='started' and response is null`,
         [input.operation_id, input.run_id],
       );
@@ -2198,13 +2227,14 @@ export class PostgresMilestoneRepository
     execution_id: string;
     token: string;
     operation_id: string;
+    reason: import("../../shared/paid-operation.js").PaidOperationReleaseReason;
   }): Promise<void> {
     await this.transaction(async (client) => {
       await this.assertFence(client, input.run_id, input.execution_id, input.token);
       await client.query(
-        `update revision_operation_states set status='started'
+        `update revision_operation_states set status='started',ambiguity_reason=null,release_reason=$3
          where operation_id=$1 and run_id=$2 and status='provider_in_flight' and response is null`,
-        [input.operation_id, input.run_id],
+        [input.operation_id, input.run_id, input.reason],
       );
     });
   }
@@ -2221,7 +2251,7 @@ export class PostgresMilestoneRepository
     await this.transaction(async (client) => {
       await this.assertFence(client, input.run_id, input.execution_id, input.token);
       const result = await client.query(
-        `update revision_operation_states set response=$2::jsonb,response_hash=$3,status='response_validated',checkpointed_at=clock_timestamp() where operation_id=$1 and run_id=$4 and response is null`,
+        `update revision_operation_states set response=$2::jsonb,response_hash=$3,status='checkpointed',ambiguity_reason=null,checkpointed_at=clock_timestamp() where operation_id=$1 and run_id=$4 and response is null`,
         [input.operation_id, JSON.stringify(response), responseHash, input.run_id],
       );
       if (result.rowCount !== 1) {
@@ -2920,7 +2950,8 @@ export class PostgresMilestoneRepository
     await this.transaction(async (client) => {
       await this.assertFence(client, input.run_id, input.execution_id, input.token);
       const changed = await client.query(
-        `update coherence_checkpoints set status=$$provider_in_flight$$
+        `update coherence_checkpoints set status=$$provider_in_flight$$,release_reason=null,
+           ambiguity_reason='provider_in_flight_without_checkpoint'
          where operation_id=$1 and run_id=$2 and status=$$started$$ and response is null and response_hash is null`,
         [input.operation_id, input.run_id],
       );
@@ -2934,13 +2965,14 @@ export class PostgresMilestoneRepository
     execution_id: string;
     token: string;
     operation_id: string;
+    reason: import("../../shared/paid-operation.js").PaidOperationReleaseReason;
   }): Promise<void> {
     await this.transaction(async (client) => {
       await this.assertFence(client, input.run_id, input.execution_id, input.token);
       const changed = await client.query(
-        `update coherence_checkpoints set status=$$started$$
+        `update coherence_checkpoints set status=$$started$$,ambiguity_reason=null,release_reason=$3
          where operation_id=$1 and run_id=$2 and status=$$provider_in_flight$$ and response is null and response_hash is null`,
-        [input.operation_id, input.run_id],
+        [input.operation_id, input.run_id, input.reason],
       );
       if (changed.rowCount !== 1)
         throw new Error("Coherence release requires an in-flight provider operation");
@@ -2959,7 +2991,7 @@ export class PostgresMilestoneRepository
     await this.transaction(async (client) => {
       await this.assertFence(client, input.run_id, input.execution_id, input.token);
       const result = await client.query(
-        `update coherence_checkpoints set response=$2::jsonb,response_hash=$3,status=$$checkpointed$$,checkpointed_at=clock_timestamp()
+        `update coherence_checkpoints set response=$2::jsonb,response_hash=$3,status=$$checkpointed$$,ambiguity_reason=null,checkpointed_at=clock_timestamp()
          where operation_id=$1 and run_id=$4 and status=$$provider_in_flight$$ and response is null and response_hash is null`,
         [input.operation_id, JSON.stringify(response), responseHash, input.run_id],
       );
@@ -3454,6 +3486,34 @@ export class PostgresMilestoneRepository
         [runId],
       )
     ).rows[0];
+    const paidOperationRows = (
+      await this.pool.query<{
+        operation_id: string;
+        kind: "draft" | "review" | "revision" | "coherence";
+        owner: string;
+      }>(
+        `select d.operation_id,'draft' kind,'step_execution:'||d.producing_step_execution_id::text owner
+           from draft_operation_states d left join step_executions e on e.id=d.producing_step_execution_id
+          where d.run_id=$1 and d.status='provider_in_flight'
+         union all
+         select o.operation_id,'review','step_execution:'||o.producing_step_execution_id::text
+           from review_operation_states o
+          where o.run_id=$1 and o.status='provider_in_flight'
+         union all
+         select v.operation_id,'revision','step_execution:'||v.producing_step_execution_id::text
+           from revision_operation_states v
+          where v.run_id=$1 and v.status='provider_in_flight'
+         union all
+         select c.operation_id,'coherence','step_execution:'||c.producing_step_execution_id::text
+           from coherence_checkpoints c
+          where c.run_id=$1 and c.status='provider_in_flight'
+         order by kind,operation_id`,
+        [runId],
+      )
+    ).rows;
+    const paidOperationAmbiguities = paidOperationRows.map((row) =>
+      PaidOperationProjectionSchema.parse(paidOperationAmbiguity(row)),
+    );
     const draftRecovery =
       run.status === "retryable_failed" && run.current_step === "draft" && !current
         ? draftOperation?.status === "provider_in_flight"
@@ -3570,7 +3630,8 @@ export class PostgresMilestoneRepository
           )) ||
         (exported?.status === "failed" && run.status !== "blocked"),
       draft_recovery: draftRecovery,
-      blocked_for_operator: run.status === "blocked",
+      blocked_for_operator: run.status === "blocked" || paidOperationAmbiguities.length > 0,
+      paid_operation_ambiguities: paidOperationAmbiguities,
       can_recover_deterministic_block:
         run.status === "blocked" &&
         blockReason === "deterministic_blockers" &&

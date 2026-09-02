@@ -11,6 +11,7 @@ import { z } from "zod";
 import type { DraftProvider } from "./contracts.js";
 import { formatDeterministicEditorialRubric } from "./editorial-rubric.js";
 import { readBoundedResponseBody } from "./http-response.js";
+import { markPreDispatchProviderFailure } from "./paid-operation-lifecycle.js";
 import { classifyInvalidSuccess, isJson } from "./structured-output-diagnostics.js";
 import {
   logModelProviderHttpFailure,
@@ -166,6 +167,8 @@ export class DraftProviderError extends Error {
     message: string,
   ) {
     super(message);
+    if (/_(?:TOKEN_MISSING|MODEL_INVALID|MODEL_MISMATCH)$/.test(code))
+      markPreDispatchProviderFailure(this);
   }
 }
 

@@ -532,6 +532,13 @@ describe("milestone two", () => {
         ),
       ).rejects.toThrow("Draft provider outcome is ambiguous");
       expect(provider.calls).toHaveLength(boundary === "after_provider_return" ? 1 : 0);
+      const ambiguity = (await repository.getRunDetail(result.run_id)).paid_operation_ambiguities;
+      expect(ambiguity).toHaveLength(1);
+      expect(ambiguity[0]).toMatchObject({
+        kind: "draft",
+        owner: expect.stringMatching(/^step_execution:/),
+      });
+      expect(ambiguity[0]!.owner).not.toContain("technical-owner");
       expect(await repository.getDraft(result.run_id)).toBeNull();
       expect(repository.providerUsage).toHaveLength(0);
     });

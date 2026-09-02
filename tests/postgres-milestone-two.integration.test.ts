@@ -259,6 +259,18 @@ integration("PostgreSQL milestone two contracts", () => {
     expect(state.rows).toEqual([
       { status: "provider_in_flight", response: null, response_hash: null },
     ]);
+    const execution = (
+      await pool!.query<{ producing_step_execution_id: string }>(
+        "select producing_step_execution_id from draft_operation_states where run_id=$1",
+        [run.run_id],
+      )
+    ).rows[0]!;
+    expect((await repository.getRunDetail(run.run_id)).paid_operation_ambiguities).toEqual([
+      expect.objectContaining({
+        kind: "draft",
+        owner: `step_execution:${execution.producing_step_execution_id}`,
+      }),
+    ]);
     await expect(
       new MilestoneTwoOrchestrator(repository, new MockLinkDiscoverer(), provider).run(
         run.run_id,

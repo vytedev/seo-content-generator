@@ -22,6 +22,7 @@ import {
 } from "./model-provider.js";
 import type { ReviewProvider } from "./review-provider.js";
 import { readBoundedResponseBody } from "./http-response.js";
+import { markPreDispatchProviderFailure } from "./paid-operation-lifecycle.js";
 import { classifyInvalidSuccess, isJson } from "./structured-output-diagnostics.js";
 import {
   CompactReviewEnvelopeSchema,
@@ -74,6 +75,8 @@ export class ReviewProviderError extends Error {
     message: string,
   ) {
     super(message);
+    if (/_(?:TOKEN_MISSING|MODEL_INVALID|MODEL_MISMATCH)$/.test(code))
+      markPreDispatchProviderFailure(this);
   }
 }
 

@@ -750,6 +750,19 @@ integration("PostgreSQL milestone three", () => {
     expect(
       review.mock.calls.filter(([request]) => request.step === "review_information_gain"),
     ).toHaveLength(1);
+    const reviewOwner = (
+      await pool!.query<{ producing_step_execution_id: string }>(
+        `select producing_step_execution_id from review_operation_states
+         where run_id=$1 and step='review_information_gain'`,
+        [run.run_id],
+      )
+    ).rows[0]!;
+    expect((await repository.getRunDetail(run.run_id)).paid_operation_ambiguities).toEqual([
+      expect.objectContaining({
+        kind: "review",
+        owner: `step_execution:${reviewOwner.producing_step_execution_id}`,
+      }),
+    ]);
     expect(
       (
         await pool!.query(

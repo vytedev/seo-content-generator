@@ -32,6 +32,8 @@ import {
   assertCoherenceBlockerEligibility,
   type FinalExportService,
   type MilestoneFourRepository,
+  type CoherenceResponse,
+  type RevisionResponse,
   type RevisionSafeFailureCategory,
 } from "../../shared/milestone-four.js";
 import type { DeterministicManifest } from "../../shared/deterministic-run.js";
@@ -39,10 +41,10 @@ import type { StructuredDraft } from "../../shared/contracts/content.js";
 import type { FindingLocation, FindingResult } from "../../shared/revision-application.js";
 import type { RevisionFinding } from "../../shared/milestone-four.js";
 import { RevisionProviderError } from "../providers/chat-completion-revision-provider.js";
-import { CoherenceProviderError } from "../providers/chat-completion-coherence-provider.js";
 import type { CoherenceProvider, RevisionProvider } from "../providers/milestone-four-providers.js";
 import { classifyError, logger } from "../logger.js";
 import { withHeartbeat } from "./lease-heartbeat.js";
+import { executePaidOperation } from "../providers/paid-operation-lifecycle.js";
 
 // Version 2.2.0 starts a new immutable provider operation after the Step 1.8
 // occurrence-scoped contract change. Earlier provider_in_flight reservations
@@ -102,22 +104,6 @@ export function revisionOperationId(input: {
         ]
       : []),
   );
-}
-
-/**
- * Configuration and request-validation failures raised before the coherence
- * provider issues its HTTP request. Transport, status, timeout and unparseable
- * outcomes are deliberately excluded: upstream may already have processed a
- * paid request, so those must stay ambiguous and fail closed.
- */
-const UNDISPATCHED_COHERENCE_CODES = new Set([
-  "COHERENCE_PROVIDER_TOKEN_MISSING",
-  "COHERENCE_PROVIDER_MODEL_INVALID",
-  "COHERENCE_PROVIDER_MODEL_MISMATCH",
-]);
-
-function provablyUndispatchedCoherenceFailure(error: unknown): boolean {
-  return error instanceof CoherenceProviderError && UNDISPATCHED_COHERENCE_CODES.has(error.code);
 }
 
 function coherenceEligibilityReason(error: unknown): string | undefined {
@@ -441,7 +427,7 @@ export class MilestoneFourOrchestrator {
         model_count: modelFindings.length,
         unable_count: plan.filter((item) => item.route === "unable").length,
       });
-      let response = await this.repository.beginRevisionOperation({
+      let response: RevisionResponse | null = await this.repository.beginRevisionOperation({
         run_id: runId,
         execution_id: lease.execution_id,
         token: lease.token,
@@ -472,7 +458,12 @@ export class MilestoneFourOrchestrator {
           prompt_version: request.prompt.template_version,
           planning_version: REVISION_PLANNING_VERSION,
         };
-        let modelResponse: Awaited<ReturnType<RevisionProvider["revise"]>> | undefined;
+        const operationCommand = {
+          run_id: runId,
+          execution_id: lease.execution_id,
+          token: lease.token,
+          operation_id: operationId,
+        };
         if (modelFindings.length > 0) {
           const locked = await this.repository.getRevisionFailureLock(runId, failureIdentity);
           if (locked?.failures && locked.failures >= 2) {
@@ -490,12 +481,6 @@ export class MilestoneFourOrchestrator {
             );
           }
           const modelRequest = { ...request, accepted_findings: modelFindings };
-          await this.repository.markRevisionProviderInFlight({
-            run_id: runId,
-            execution_id: lease.execution_id,
-            token: lease.token,
-            operation_id: operationId,
-          });
           logger.info("provider.dispatch_started", {
             run_id: runId,
             operation_id: operationId,
@@ -503,22 +488,53 @@ export class MilestoneFourOrchestrator {
             context: "revision",
           });
           try {
-            const rawResponse = await withHeartbeat(this.repository, lease, () =>
-              this.revisions.revise(modelRequest),
-            );
-            logger.info("provider.returned", {
-              run_id: runId,
-              operation_id: operationId,
-              provider: this.revisions.provider,
-              context: "revision",
-            });
-            await this.failures?.hit("after_revision_provider_return");
-            modelResponse = RevisionResponseSchema.parse(rawResponse);
-            logger.info("provider.response_validated", {
-              run_id: runId,
-              operation_id: operationId,
-              provider: this.revisions.provider,
-              context: "revision",
+            response = await executePaidOperation<
+              typeof operationCommand,
+              Awaited<ReturnType<RevisionProvider["revise"]>>,
+              RevisionResponse
+            >({
+              kind: "revision",
+              command: operationCommand,
+              adapter: {
+                markInFlight: (command) => this.repository.markRevisionProviderInFlight(command),
+                release: (command, reason) =>
+                  this.repository.releaseRevisionProviderFailure({ ...command, reason }),
+                checkpoint: (command, checked) =>
+                  this.repository.checkpointRevisionResponse({ ...command, response: checked }),
+              },
+              dispatch: async () => {
+                const raw = await withHeartbeat(this.repository, lease, () =>
+                  this.revisions.revise(modelRequest),
+                );
+                logger.info("provider.returned", {
+                  run_id: runId,
+                  operation_id: operationId,
+                  provider: this.revisions.provider,
+                  context: "revision",
+                });
+                await this.failures?.hit("after_revision_provider_return");
+                return raw;
+              },
+              validate: (raw) => {
+                const modelResponse = RevisionResponseSchema.parse(raw);
+                logger.info("provider.response_validated", {
+                  run_id: runId,
+                  operation_id: operationId,
+                  provider: this.revisions.provider,
+                  context: "revision",
+                });
+                const merged = mergeRevisionPlan({
+                  request,
+                  plan,
+                  modelDocument: modelResponse.document,
+                  modelResults: modelResponse.finding_results,
+                });
+                return RevisionResponseSchema.parse({
+                  document: merged.document,
+                  finding_results: merged.results,
+                  usage: modelResponse.usage,
+                });
+              },
             });
           } catch (error) {
             logger.warn("provider.dispatch_failed", {
@@ -528,16 +544,10 @@ export class MilestoneFourOrchestrator {
               context: "revision",
               ...classifyError(error),
             });
-            // Once provider_in_flight is durable, an exception cannot prove that the paid
-            // request was never dispatched. Preserve the reservation and fail closed so a
-            // resume cannot duplicate a request that upstream may already have processed.
             const category: RevisionSafeFailureCategory =
               error instanceof RevisionProviderError ? error.category : "guard_rejected";
             await this.repository.recordRevisionFailure({
-              run_id: runId,
-              execution_id: lease.execution_id,
-              token: lease.token,
-              operation_id: operationId,
+              ...operationCommand,
               identity: failureIdentity,
               category,
             });
@@ -549,29 +559,22 @@ export class MilestoneFourOrchestrator {
             });
             throw error;
           }
+        } else {
+          // Preserve the revision operation transition contract for deterministic-only plans.
+          // No provider is called, but checkpointing still requires the reserved operation
+          // to enter its durable processing stage first.
+          await this.repository.markRevisionProviderInFlight(operationCommand);
+          const merged = mergeRevisionPlan({ request, plan });
+          response = RevisionResponseSchema.parse({
+            document: merged.document,
+            finding_results: merged.results,
+            usage: { input_units: 0, output_units: 0, cost_micros: 0 },
+          });
+          await this.repository.checkpointRevisionResponse({
+            ...operationCommand,
+            response,
+          });
         }
-        const merged = mergeRevisionPlan({
-          request,
-          plan,
-          ...(modelResponse
-            ? {
-                modelDocument: modelResponse.document,
-                modelResults: modelResponse.finding_results,
-              }
-            : {}),
-        });
-        response = RevisionResponseSchema.parse({
-          document: merged.document,
-          finding_results: merged.results,
-          usage: modelResponse?.usage ?? { input_units: 0, output_units: 0, cost_micros: 0 },
-        });
-        await this.repository.checkpointRevisionResponse({
-          run_id: runId,
-          execution_id: lease.execution_id,
-          token: lease.token,
-          operation_id: operationId,
-          response,
-        });
         logger.info("provider.checkpointed", {
           run_id: runId,
           operation_id: operationId,
@@ -579,6 +582,7 @@ export class MilestoneFourOrchestrator {
           context: "revision",
         });
       }
+      if (!response) throw new Error("Revision operation did not produce a response");
       await this.failures?.hit("after_revision_provider");
       // Reject any provider attempt to mutate server-owned claims before controlled reconstruction.
       if (JSON.stringify(response.document.claims) !== JSON.stringify(current.draft.claims))
@@ -944,7 +948,7 @@ export class MilestoneFourOrchestrator {
       if (persisted) outcome = persisted.gate.outcome;
       else {
         stage = "coherence_operation";
-        let response = await this.repository.beginCoherenceOperation({
+        let response: CoherenceResponse | null = await this.repository.beginCoherenceOperation({
           run_id: runId,
           execution_id: lease.execution_id,
           token: lease.token,
@@ -969,29 +973,68 @@ export class MilestoneFourOrchestrator {
             context: "coherence",
             state: "reserved",
           });
-          // Durably reserve the single paid call before dispatch. Once this
-          // commits, an exception can no longer prove the request was never
-          // sent, so a resume fails closed instead of paying twice.
-          stage = "coherence_provider_reservation";
-          await this.repository.markCoherenceProviderInFlight({
+          const command = {
             run_id: runId,
             execution_id: lease.execution_id,
             token: lease.token,
             operation_id: request.operation_id,
-          });
-          logger.info("provider.dispatch_started", {
-            run_id: runId,
-            operation_id: request.operation_id,
-            provider: this.coherence.provider,
-            context: "coherence",
-          });
-          await this.failures?.hit("after_coherence_reservation");
-          stage = "coherence_provider";
-          let rawCoherence: Awaited<ReturnType<CoherenceProvider["review"]>>;
+          };
           try {
-            rawCoherence = await withHeartbeat(this.repository, lease, () =>
-              this.coherence.review(request),
-            );
+            response = await executePaidOperation<
+              typeof command,
+              Awaited<ReturnType<CoherenceProvider["review"]>>,
+              CoherenceResponse
+            >({
+              kind: "coherence",
+              command,
+              adapter: {
+                markInFlight: async (value) => {
+                  stage = "coherence_provider_reservation";
+                  await this.repository.markCoherenceProviderInFlight(value);
+                  await this.failures?.hit("after_coherence_reservation");
+                },
+                release: (value, reason) =>
+                  this.repository.releaseCoherenceProviderFailure({ ...value, reason }),
+                checkpoint: async (value, checked) => {
+                  stage = "coherence_checkpoint";
+                  await this.repository.checkpointCoherenceResponse({
+                    ...value,
+                    response: checked,
+                  });
+                },
+              },
+              dispatch: async () => {
+                logger.info("provider.dispatch_started", {
+                  run_id: runId,
+                  operation_id: request.operation_id,
+                  provider: this.coherence.provider,
+                  context: "coherence",
+                });
+                stage = "coherence_provider";
+                const raw = await withHeartbeat(this.repository, lease, () =>
+                  this.coherence.review(request),
+                );
+                logger.info("provider.returned", {
+                  run_id: runId,
+                  operation_id: request.operation_id,
+                  provider: this.coherence.provider,
+                  context: "coherence",
+                });
+                await this.failures?.hit("after_coherence_provider_return");
+                return raw;
+              },
+              validate: (raw) => {
+                stage = "coherence_response_validation";
+                const checked = CoherenceResponseSchema.parse(raw);
+                logger.info("provider.response_validated", {
+                  run_id: runId,
+                  operation_id: request.operation_id,
+                  provider: this.coherence.provider,
+                  context: "coherence",
+                });
+                return checked;
+              },
+            });
           } catch (error) {
             logger.warn("provider.dispatch_failed", {
               run_id: runId,
@@ -1000,40 +1043,8 @@ export class MilestoneFourOrchestrator {
               context: "coherence",
               ...classifyError(error),
             });
-            // Only a provider error that proves nothing was dispatched may
-            // release the reservation; anything else stays ambiguous.
-            if (provablyUndispatchedCoherenceFailure(error))
-              await this.repository.releaseCoherenceProviderFailure({
-                run_id: runId,
-                execution_id: lease.execution_id,
-                token: lease.token,
-                operation_id: request.operation_id,
-              });
             throw error;
           }
-          logger.info("provider.returned", {
-            run_id: runId,
-            operation_id: request.operation_id,
-            provider: this.coherence.provider,
-            context: "coherence",
-          });
-          await this.failures?.hit("after_coherence_provider_return");
-          stage = "coherence_response_validation";
-          response = CoherenceResponseSchema.parse(rawCoherence);
-          logger.info("provider.response_validated", {
-            run_id: runId,
-            operation_id: request.operation_id,
-            provider: this.coherence.provider,
-            context: "coherence",
-          });
-          stage = "coherence_checkpoint";
-          await this.repository.checkpointCoherenceResponse({
-            run_id: runId,
-            execution_id: lease.execution_id,
-            token: lease.token,
-            operation_id: request.operation_id,
-            response,
-          });
           logger.info("provider.checkpointed", {
             run_id: runId,
             operation_id: request.operation_id,
@@ -1041,6 +1052,7 @@ export class MilestoneFourOrchestrator {
             context: "coherence",
           });
         }
+        if (!response) throw new Error("Coherence operation did not produce a response");
         // Validate both fresh provider output and a response recovered from an immutable checkpoint.
         stage = "coherence_eligibility";
         coherenceResponse = response;

@@ -769,6 +769,12 @@ describe("milestone three", () => {
     expect(provider.calls.filter((call) => call.step === "review_information_gain")).toHaveLength(
       1,
     );
+    expect((await repository.getRunDetail(run.run_id)).paid_operation_ambiguities).toEqual([
+      expect.objectContaining({
+        kind: "review",
+        owner: expect.stringMatching(/^step_execution:/),
+      }),
+    ]);
     expect(
       repository.findings.filter((item) => item.step === "review_information_gain"),
     ).toHaveLength(0);

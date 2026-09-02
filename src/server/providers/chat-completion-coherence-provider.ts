@@ -17,6 +17,7 @@ import {
 import type { CoherenceProvider } from "./milestone-four-providers.js";
 import { prepareCoherenceWindows } from "./compact-model-contracts.js";
 import { readBoundedResponseBody } from "./http-response.js";
+import { markPreDispatchProviderFailure } from "./paid-operation-lifecycle.js";
 import { classifyInvalidSuccess, isJson } from "./structured-output-diagnostics.js";
 
 /**
@@ -44,6 +45,8 @@ export class CoherenceProviderError extends Error {
     message: string,
   ) {
     super(message);
+    if (/_(?:TOKEN_MISSING|MODEL_INVALID|MODEL_MISMATCH)$/.test(code))
+      markPreDispatchProviderFailure(this);
   }
 }
 

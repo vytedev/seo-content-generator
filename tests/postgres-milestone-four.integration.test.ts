@@ -17,7 +17,10 @@ import {
   MockRevisionProvider,
 } from "../src/server/providers/milestone-four-providers.js";
 import { MockReviewProvider } from "../src/server/providers/review-provider.js";
-import { RevisionProviderError } from "../src/server/providers/chat-completion-revision-provider.js";
+import {
+  ChatCompletionRevisionProvider,
+  RevisionProviderError,
+} from "../src/server/providers/chat-completion-revision-provider.js";
 import { ingestHandoff } from "../src/shared/milestone-two.js";
 import type { DeterministicFixture, ReviewFinding } from "../src/shared/milestone-three.js";
 import { resetPostgresFixtures } from "./helpers/postgres-reset.js";
@@ -797,7 +800,7 @@ integration("PostgreSQL milestone four", () => {
     });
     expect(states[1]).toMatchObject({
       operation_id: delegate.calls[0]!.operation_id,
-      status: "response_validated",
+      status: "checkpointed",
       response_hash: expect.stringMatching(/^[a-f0-9]{64}$/),
     });
     expect(
@@ -808,6 +811,66 @@ integration("PostgreSQL milestone four", () => {
       ).rows[0].count,
     ).toBe(2);
     expect((await repository.getRunDetail(run.run_id)).status).toBe("succeeded");
+  });
+
+  it("persists revision model-mismatch release and safely retries the same operation", async () => {
+    const { repository, run } = await setup("m4-pg-revision-model-mismatch");
+    const fetcher = vi.fn();
+    const pinned = new ChatCompletionRevisionProvider({
+      token: "test-token",
+      model: "pinned-model",
+      fetcher,
+    });
+    const mismatch = {
+      provider: pinned.provider,
+      model: "request-model",
+      revise: pinned.revise.bind(pinned),
+    };
+    await expect(
+      orchestrator(
+        repository,
+        new MockCoherenceProvider("coherence-v1"),
+        undefined,
+        fixture,
+        mismatch,
+      ).run(run.run_id),
+    ).rejects.toThrow("does not match");
+    expect(fetcher).not.toHaveBeenCalled();
+
+    const released = (
+      await pool!.query(
+        "select status,release_reason,ambiguity_reason from revision_operation_states where run_id=$1",
+        [run.run_id],
+      )
+    ).rows[0];
+    expect(released).toEqual({
+      status: "started",
+      release_reason: "configuration_before_dispatch",
+      ambiguity_reason: null,
+    });
+
+    const retry = new MockRevisionProvider("request-model");
+    const retryProvider = {
+      provider: mismatch.provider,
+      model: mismatch.model,
+      revise: retry.revise.bind(retry),
+    };
+    await orchestrator(
+      repository,
+      new MockCoherenceProvider("coherence-v1"),
+      undefined,
+      fixture,
+      retryProvider,
+    ).run(run.run_id);
+    expect(retry.calls).toHaveLength(1);
+    expect(
+      (
+        await pool!.query(
+          "select status,release_reason,ambiguity_reason from revision_operation_states where run_id=$1",
+          [run.run_id],
+        )
+      ).rows[0],
+    ).toMatchObject({ status: "checkpointed", ambiguity_reason: null });
   });
 
   it("fails closed across the exact provider-return/checkpoint crash gap", async () => {
@@ -842,11 +905,16 @@ integration("PostgreSQL milestone four", () => {
     expect(retry.calls).toHaveLength(0);
     expect(
       (
-        await pool!.query("select status from revision_operation_states where run_id=$1", [
-          run.run_id,
-        ])
+        await pool!.query(
+          "select status,release_reason,ambiguity_reason from revision_operation_states where run_id=$1",
+          [run.run_id],
+        )
       ).rows[0],
-    ).toEqual({ status: "provider_in_flight" });
+    ).toEqual({
+      status: "provider_in_flight",
+      release_reason: null,
+      ambiguity_reason: "provider_in_flight_without_checkpoint",
+    });
   });
 
   it("checkpoints a validated revision response and fences concurrent recovery without provider recall", async () => {
@@ -897,7 +965,7 @@ integration("PostgreSQL milestone four", () => {
     ).rows;
     expect(state).toHaveLength(1);
     expect(state[0]).toMatchObject({
-      status: "response_validated",
+      status: "checkpointed",
       response_hash: expect.stringMatching(/^[a-f0-9]{64}$/),
     });
   });

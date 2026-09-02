@@ -48,6 +48,7 @@ function repository(): MilestoneThreeRepository &
     saveFindings: async () => {},
     beginReviewOperation: async () => ({ operation_id: "operation", response: null }),
     markReviewProviderInFlight: async () => {},
+    releaseReviewProviderFailure: async () => {},
     checkpointReviewResponse: async () => {},
     saveReview: async () => {},
     waitForFindings: async () => {},

@@ -15,6 +15,8 @@ import {
   UnprocessableError,
 } from "../../shared/errors.js";
 import { QueueOptionsSchema, type QueueLease, type QueueOptions } from "../../shared/queue.js";
+import { PaidOperationProjectionSchema } from "../../shared/paid-operation.js";
+import { paidOperationAmbiguity } from "../providers/paid-operation-lifecycle.js";
 import {
   CommandSubmissionResultSchema,
   commandPayloadHash,
@@ -599,6 +601,9 @@ export class InMemoryMilestoneRepository
     if (existing && existing !== serialisedIdentity)
       throw new Error("Immutable draft operation conflict");
     this.outputKeys.set(key, serialisedIdentity);
+    this.outputKeys.set(`${key}:run-id`, input.run_id);
+    if (!this.outputKeys.has(`${key}:producer`))
+      this.outputKeys.set(`${key}:producer`, input.execution_id);
     const responseText = this.outputKeys.get(`${key}:response`);
     if (!responseText && this.outputKeys.get(`${key}:status`) === "provider_in_flight")
       throw new Error(
@@ -626,12 +631,18 @@ export class InMemoryMilestoneRepository
     if (this.outputKeys.get(`${key}:status`) !== "started")
       throw new Error("Draft operation is not ready for provider dispatch");
     this.outputKeys.set(`${key}:status`, "provider_in_flight");
+    this.outputKeys.set(`${key}:owner`, `step_execution:${input.execution_id}`);
   }
-  async releaseDraftProviderFailure(input: DraftOperationCommand): Promise<void> {
+  async releaseDraftProviderFailure(
+    input: DraftOperationCommand & {
+      reason: import("../../shared/paid-operation.js").PaidOperationReleaseReason;
+    },
+  ): Promise<void> {
     const key = this.assertDraftCommand(input);
     if (this.outputKeys.get(`${key}:status`) !== "provider_in_flight")
       throw new Error("Draft operation has no releasable provider reservation");
     this.outputKeys.set(`${key}:status`, "started");
+    this.outputKeys.set(`${key}:release-reason`, input.reason);
   }
   async checkpointDraftResponse(
     input: DraftOperationCommand & { response: DraftProviderResponse },
@@ -890,6 +901,7 @@ export class InMemoryMilestoneRepository
     const existing = this.outputKeys.get(key);
     if (existing && existing !== identity) throw new Error("Immutable review operation conflict");
     this.outputKeys.set(key, identity);
+    this.outputKeys.set(`${key}:run-id`, input.run_id);
     const status = this.outputKeys.get(`${key}:status`) ?? "started";
     if (status === "provider_in_flight")
       throw new Error("Review provider outcome is ambiguous; operator action is required");
@@ -940,6 +952,25 @@ export class InMemoryMilestoneRepository
     )
       throw new Error("Review operation is not ready for dispatch");
     this.outputKeys.set(`${key}:status`, "provider_in_flight");
+    this.outputKeys.set(`${key}:owner`, `step_execution:${input.execution_id}`);
+  }
+
+  async releaseReviewProviderFailure(input: {
+    run_id: string;
+    execution_id: string;
+    token: string;
+    operation_id: string;
+    reason: import("../../shared/paid-operation.js").PaidOperationReleaseReason;
+  }): Promise<void> {
+    this.assertFence(input.run_id, input.execution_id, input.token);
+    const key = `review-operation:${input.operation_id}`;
+    if (
+      this.outputKeys.get(`${key}:status`) !== "provider_in_flight" ||
+      this.outputKeys.has(`${key}:response`)
+    )
+      throw new Error("Review operation has no releasable provider reservation");
+    this.outputKeys.set(`${key}:status`, "started");
+    this.outputKeys.set(`${key}:release-reason`, input.reason);
   }
 
   async checkpointReviewResponse(input: {
@@ -1621,6 +1652,9 @@ export class InMemoryMilestoneRepository
     const existing = this.outputKeys.get(key);
     if (existing && existing !== identity) throw new Error("Immutable revision operation conflict");
     this.outputKeys.set(key, identity);
+    this.outputKeys.set(`${key}:run-id`, input.run_id);
+    if (!this.outputKeys.has(`${key}:producer`))
+      this.outputKeys.set(`${key}:producer`, input.execution_id);
     const response = this.outputKeys.get(`${key}:response`);
     if (!response && this.outputKeys.get(`${key}:status`) === "provider_in_flight")
       throw new Error(
@@ -1640,6 +1674,7 @@ export class InMemoryMilestoneRepository
     const key = `revision-state:${input.operation_id}`;
     if (!this.outputKeys.has(key)) throw new Error("Revision operation is missing");
     this.outputKeys.set(`${key}:status`, "provider_in_flight");
+    this.outputKeys.set(`${key}:owner`, `step_execution:${input.execution_id}`);
   }
 
   async releaseRevisionProviderFailure(input: {
@@ -1647,10 +1682,14 @@ export class InMemoryMilestoneRepository
     execution_id: string;
     token: string;
     operation_id: string;
+    reason: import("../../shared/paid-operation.js").PaidOperationReleaseReason;
   }): Promise<void> {
     this.assertFence(input.run_id, input.execution_id, input.token);
     const key = `revision-state:${input.operation_id}:status`;
-    if (this.outputKeys.get(key) === "provider_in_flight") this.outputKeys.set(key, "started");
+    if (this.outputKeys.get(key) === "provider_in_flight") {
+      this.outputKeys.set(key, "started");
+      this.outputKeys.set(`revision-state:${input.operation_id}:release-reason`, input.reason);
+    }
   }
 
   async checkpointRevisionResponse(input: {
@@ -2046,6 +2085,9 @@ export class InMemoryMilestoneRepository
     if (existing && existing !== identity)
       throw new Error("Immutable coherence operation conflict");
     this.outputKeys.set(key, identity);
+    this.outputKeys.set(`${key}:run-id`, input.run_id);
+    if (!this.outputKeys.has(`${key}:producer`))
+      this.outputKeys.set(`${key}:producer`, input.execution_id);
     const statusKey = `${key}:status`;
     // A newly inserted checkpoint starts in the pre-dispatch state. Keep an
     // existing state untouched so retries observe the durable transition.
@@ -2074,12 +2116,14 @@ export class InMemoryMilestoneRepository
     if (status !== "started")
       throw new Error("Coherence operation is not ready for provider dispatch");
     this.outputKeys.set(`${key}:status`, "provider_in_flight");
+    this.outputKeys.set(`${key}:owner`, `step_execution:${input.execution_id}`);
   }
   async releaseCoherenceProviderFailure(input: {
     run_id: string;
     execution_id: string;
     token: string;
     operation_id: string;
+    reason: import("../../shared/paid-operation.js").PaidOperationReleaseReason;
   }): Promise<void> {
     this.assertFence(input.run_id, input.execution_id, input.token);
     const key = `coherence-state:${input.operation_id}`;
@@ -2088,6 +2132,7 @@ export class InMemoryMilestoneRepository
     if (this.outputKeys.get(`${key}:status`) !== "provider_in_flight")
       throw new Error("Coherence release requires an in-flight provider operation");
     this.outputKeys.set(`${key}:status`, "started");
+    this.outputKeys.set(`${key}:release-reason`, input.reason);
   }
   async checkpointCoherenceResponse(input: {
     run_id: string;
@@ -2533,6 +2578,41 @@ export class InMemoryMilestoneRepository
     const draftOperationStatus = [...this.outputKeys.entries()].find(
       ([key, value]) => key.startsWith("draft-state:") && value.includes(`\"run_id\":\"${runId}\"`),
     );
+    const paidOperationAmbiguities = [...this.outputKeys.entries()]
+      .filter(([key, value]) => key.endsWith(":status") && value === "provider_in_flight")
+      .flatMap(([statusKey]) => {
+        const key = statusKey.slice(0, -":status".length);
+        const identity = this.outputKeys.get(key);
+        if (
+          this.outputKeys.get(`${key}:run-id`) !== runId &&
+          !identity?.includes(`\"run_id\":\"${runId}\"`)
+        )
+          return [];
+        const kind = key.startsWith("draft-state:")
+          ? "draft"
+          : key.startsWith("review-operation:")
+            ? "review"
+            : key.startsWith("revision-state:")
+              ? "revision"
+              : key.startsWith("coherence-state:")
+                ? "coherence"
+                : null;
+        if (!kind) return [];
+        return [
+          PaidOperationProjectionSchema.parse(
+            paidOperationAmbiguity({
+              operation_id: key.slice(key.indexOf(":") + 1),
+              kind,
+              owner:
+                this.outputKeys.get(`${key}:owner`) ??
+                `step_execution:${this.outputKeys.get(`${key}:producer`) ?? "unknown"}`,
+            }),
+          ),
+        ];
+      })
+      .sort((left, right) =>
+        `${left.kind}:${left.operation_id}`.localeCompare(`${right.kind}:${right.operation_id}`),
+      );
     const draftRecovery =
       run.status === "retryable_failed" && run.currentStep === "draft" && !current
         ? draftOperationStatus
@@ -2589,7 +2669,8 @@ export class InMemoryMilestoneRepository
             (candidate) => candidate.step === "findings_review" && candidate.status === "succeeded",
           )),
       draft_recovery: draftRecovery,
-      blocked_for_operator: run.status === "blocked",
+      blocked_for_operator: run.status === "blocked" || paidOperationAmbiguities.length > 0,
+      paid_operation_ambiguities: paidOperationAmbiguities,
       can_recover_deterministic_block:
         run.status === "blocked" &&
         run.blockReason === "deterministic_blockers" &&

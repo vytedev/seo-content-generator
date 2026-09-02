@@ -32,7 +32,10 @@ import {
 import type { RevisionFinding, RevisionRequest } from "../src/shared/milestone-four.js";
 import request from "supertest";
 import { logger } from "../src/server/logger.js";
-import { RevisionProviderError } from "../src/server/providers/chat-completion-revision-provider.js";
+import {
+  ChatCompletionRevisionProvider,
+  RevisionProviderError,
+} from "../src/server/providers/chat-completion-revision-provider.js";
 
 const handoff = {
   plane_ticket: "MOB-M4",
@@ -1138,6 +1141,60 @@ describe("milestone four", () => {
     expect((await repository.getRunDetail(run.run_id)).status).toBe("succeeded");
   });
 
+  it("releases a revision model mismatch and safely retries the same operation", async () => {
+    const { repository, run } = await setup();
+    let providerCalls = 0;
+    const fetcher = vi.fn();
+    const pinned = new ChatCompletionRevisionProvider({
+      token: "test-token",
+      model: "pinned-model",
+      fetcher,
+    });
+    const mismatch = {
+      provider: pinned.provider,
+      model: "request-model",
+      revise: pinned.revise.bind(pinned),
+    };
+    await expect(
+      new MilestoneFourOrchestrator(
+        repository,
+        fixture,
+        mismatch,
+        new MockCoherenceProvider("coherence-v1"),
+        repository,
+      ).run(run.run_id),
+    ).rejects.toThrow("does not match");
+    expect(fetcher).not.toHaveBeenCalled();
+
+    const operationId = repository.revisionFailures[0]!.operation_id;
+    expect((repository as any).outputKeys.get(`revision-state:${operationId}:status`)).toBe(
+      "started",
+    );
+    expect((repository as any).outputKeys.get(`revision-state:${operationId}:release-reason`)).toBe(
+      "configuration_before_dispatch",
+    );
+    expect((await repository.getRunDetail(run.run_id)).paid_operation_ambiguities).toEqual([]);
+
+    const retry = new MockRevisionProvider("revision-v1");
+    const countedRetry = {
+      provider: mismatch.provider,
+      model: mismatch.model,
+      async revise(request: RevisionRequest) {
+        providerCalls += 1;
+        return retry.revise(request);
+      },
+    };
+    await new MilestoneFourOrchestrator(
+      repository,
+      fixture,
+      countedRetry,
+      new MockCoherenceProvider("coherence-v1"),
+      repository,
+    ).run(run.run_id);
+    expect(providerCalls).toBe(1);
+    expect(retry.calls).toHaveLength(1);
+  });
+
   it("keeps a timed-out dispatched request reserved and gives safe resume guidance", async () => {
     const { repository, run } = await setup();
     let calls = 0;
@@ -1197,7 +1254,14 @@ describe("milestone four", () => {
 
     await expect(make().run(run.run_id)).rejects.toThrow("outcome is ambiguous");
     expect(provider.calls).toHaveLength(1);
-    expect((await repository.getRunDetail(run.run_id)).status).toBe("retryable_failed");
+    const detail = await repository.getRunDetail(run.run_id);
+    expect(detail.status).toBe("retryable_failed");
+    expect(detail.paid_operation_ambiguities).toEqual([
+      expect.objectContaining({
+        kind: "revision",
+        owner: expect.stringMatching(/^step_execution:/),
+      }),
+    ]);
   });
 
   it("recovers only a block backed by the current persisted rerun and its blocker", async () => {
@@ -2208,9 +2272,12 @@ describe("coherence pre-dispatch ambiguity protection", () => {
     await expect(repository.markCoherenceProviderInFlight(input)).rejects.toThrow(
       "cannot start a provider call",
     );
-    await expect(repository.releaseCoherenceProviderFailure(input)).rejects.toThrow(
-      "cannot be released",
-    );
+    await expect(
+      repository.releaseCoherenceProviderFailure({
+        ...input,
+        reason: "configuration_before_dispatch",
+      }),
+    ).rejects.toThrow("cannot be released");
 
     const releasedInput = {
       ...input,
@@ -2219,7 +2286,10 @@ describe("coherence pre-dispatch ambiguity protection", () => {
     };
     await expect(repository.beginCoherenceOperation(releasedInput)).resolves.toBeNull();
     await repository.markCoherenceProviderInFlight(releasedInput);
-    await repository.releaseCoherenceProviderFailure(releasedInput);
+    await repository.releaseCoherenceProviderFailure({
+      ...releasedInput,
+      reason: "configuration_before_dispatch",
+    });
     await expect(repository.beginCoherenceOperation(releasedInput)).resolves.toBeNull();
     await expect(
       repository.checkpointCoherenceResponse({ ...releasedInput, response }),

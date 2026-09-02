@@ -18,6 +18,7 @@ import {
 import type { RevisionProvider } from "./milestone-four-providers.js";
 import { formatDeterministicEditorialRubric } from "./editorial-rubric.js";
 import { readBoundedResponseBody } from "./http-response.js";
+import { markPreDispatchProviderFailure } from "./paid-operation-lifecycle.js";
 import { classifyInvalidSuccess, isJson } from "./structured-output-diagnostics.js";
 
 /**
@@ -45,6 +46,8 @@ export class RevisionProviderError extends Error {
     readonly category: RevisionSafeFailureCategory = "configuration",
   ) {
     super(message);
+    if (/_(?:TOKEN_MISSING|MODEL_INVALID|MODEL_MISMATCH)$/.test(code))
+      markPreDispatchProviderFailure(this);
   }
 }
 
