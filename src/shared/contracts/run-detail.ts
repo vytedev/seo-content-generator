@@ -119,6 +119,9 @@ export const RunDetailSchema = z
       })
       .strict(),
     can_retry: z.boolean(),
+    draft_recovery: z
+      .enum(["none", "legacy_confirmation_required", "ambiguous_technical_review"])
+      .default("none"),
     blocked_for_operator: z.boolean(),
     /** Narrow recovery for legacy deterministic blocks with correction budget remaining. */
     can_recover_deterministic_block: z.boolean().default(false),

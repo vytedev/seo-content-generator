@@ -210,3 +210,141 @@ describe("controlled revision application", () => {
     ).toThrow(/exactly match/);
   });
 });
+
+describe("locationless findings bound to exact authority", () => {
+  /**
+   * Regression for the silent revert: the checker emits `keyword.primary.h2`
+   * with a field and no line range, the planner produced a correct H2 edit,
+   * and the envelope then discarded it because no accepted location could own
+   * the resulting hunk. The shared binding supplies that exact authority, so
+   * the edit must now survive.
+   */
+  it("keeps a bound keyword.primary.h2 edit instead of silently discarding it", () => {
+    const bound: RevisionFinding = {
+      ...finding("h2", "body_markdown"),
+      rule_reference: "keyword.primary.h2",
+      severity: "blocker",
+      location: { field: "body_markdown", line_start: 5, line_end: 5 },
+    };
+    const proposed = {
+      ...structuredClone(current),
+      markdown: current.markdown.replace("## Care", "## Care: walnut table guide"),
+    };
+    const result = applyRevisionEnvelope({
+      current,
+      proposed,
+      findings: [bound],
+      results: [{ finding_id: "h2", status: "applied", reason: "Applied frozen policy." }],
+    });
+    expect(result.audits[0]).toMatchObject({ status: "applied", changed: true });
+    expect(result.audits[0]!.hunks).toHaveLength(1);
+    expect(result.document.markdown).toContain("## Care: walnut table guide");
+  });
+
+  it("still refuses the same edit while the finding carries no exact authority", () => {
+    const unbound: RevisionFinding = {
+      ...finding("h2", "body_markdown"),
+      rule_reference: "keyword.primary.h2",
+      severity: "blocker",
+    };
+    const proposed = {
+      ...structuredClone(current),
+      markdown: current.markdown.replace("## Care", "## Care: walnut table guide"),
+    };
+    const result = applyRevisionEnvelope({
+      current,
+      proposed,
+      findings: [unbound],
+      results: [{ finding_id: "h2", status: "applied", reason: "Applied frozen policy." }],
+    });
+    expect(result.audits[0]).toMatchObject({ status: "unable", changed: false });
+    expect(result.document.markdown).toBe(current.markdown);
+  });
+});
+
+describe("bounded multi-block authority", () => {
+  const multi = {
+    ...current,
+    markdown: [
+      "# Walnut table guide", // 1
+      "", // 2
+      "Direct answer prose.", // 3
+      "", // 4
+      "## Care", // 5
+      "", // 6
+      "First hard paragraph.", // 7
+      "", // 8
+      "Untouched middle paragraph.", // 9
+      "", // 10
+      "Second hard paragraph.", // 11
+    ].join("\n"),
+  };
+  const readability: RevisionFinding = {
+    ...finding("readability", "body_markdown"),
+    rule_reference: "style.readability_grade_8",
+    severity: "blocker",
+    location: { field: "body_markdown", line_start: 7, line_end: 7 },
+  };
+  const authority = {
+    readability: [
+      [7, 7],
+      [11, 11],
+    ] as ReadonlyArray<readonly [number, number]>,
+  };
+
+  it("owns several non-contiguous hunks under one audit", () => {
+    const result = applyRevisionEnvelope({
+      current: multi,
+      proposed: {
+        ...multi,
+        markdown: multi.markdown
+          .replace("First hard paragraph.", "Short one.")
+          .replace("Second hard paragraph.", "Short two."),
+      },
+      findings: [readability],
+      results: [{ finding_id: "readability", status: "applied", reason: "Simplified." }],
+      additional_authority: authority,
+    });
+    expect(result.audits[0]).toMatchObject({ status: "applied", changed: true });
+    expect(result.audits[0]!.hunks).toHaveLength(2);
+    expect(result.document.markdown).toContain("Short one.");
+    expect(result.document.markdown).toContain("Short two.");
+    expect(result.document.markdown).toContain("Untouched middle paragraph.");
+  });
+
+  it("discards a change outside every authorised block", () => {
+    const result = applyRevisionEnvelope({
+      current: multi,
+      proposed: {
+        ...multi,
+        markdown: multi.markdown
+          .replace("First hard paragraph.", "Short one.")
+          .replace("Untouched middle paragraph.", "Smuggled rewrite."),
+      },
+      findings: [readability],
+      results: [{ finding_id: "readability", status: "applied", reason: "Simplified." }],
+      additional_authority: authority,
+    });
+    // The authorised block lands; the unauthorised one never does.
+    expect(result.document.markdown).toContain("Short one.");
+    expect(result.document.markdown).toContain("Untouched middle paragraph.");
+    expect(result.document.markdown).not.toContain("Smuggled rewrite.");
+    expect(result.audits[0]!.hunks).toHaveLength(1);
+  });
+
+  it("grants no authority at all without an exact primary location", () => {
+    const unbound: RevisionFinding = {
+      ...readability,
+      location: { field: "body_markdown" },
+    };
+    const result = applyRevisionEnvelope({
+      current: multi,
+      proposed: { ...multi, markdown: multi.markdown.replace("First hard paragraph.", "Short.") },
+      findings: [unbound],
+      results: [{ finding_id: "readability", status: "applied", reason: "Simplified." }],
+      additional_authority: authority,
+    });
+    expect(result.audits[0]).toMatchObject({ status: "unable", changed: false });
+    expect(result.document.markdown).toBe(multi.markdown);
+  });
+});

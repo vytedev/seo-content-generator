@@ -4,6 +4,7 @@ import {
   HUGGING_FACE_CHAT_COMPLETIONS_URL,
   OPENROUTER_CHAT_COMPLETIONS_URL,
   logModelProviderHttpFailure,
+  logModelProviderOutputInvalid,
   modelProviderOptionsFromEnv,
 } from "../src/server/providers/model-provider.js";
 
@@ -85,7 +86,21 @@ describe("modelProviderOptionsFromEnv", () => {
   });
 });
 
-describe("logModelProviderHttpFailure", () => {
+describe("safe model-provider diagnostics", () => {
+  it("logs the precise invalid-success reason and no unsafe response data", () => {
+    const warn = vi.spyOn(logger, "warn").mockImplementation(() => undefined);
+    logModelProviderOutputInvalid("openrouter", "review", "provider/model", 2, "invalid_json");
+
+    expect(warn).toHaveBeenCalledWith("model_provider.output_invalid", {
+      provider: "openrouter",
+      context: "review",
+      model: "provider/model",
+      attempts: 2,
+      category: "structured_output_invalid",
+      reason: "invalid_json",
+    });
+  });
+
   afterEach(() => vi.restoreAllMocks());
 
   it("logs only the safe, documented field set — never a token, prompt, header or body", () => {

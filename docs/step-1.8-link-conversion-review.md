@@ -33,9 +33,23 @@ It never receives an application status judgement. A strict findings-only JSON s
 
 ## Persistence and ownership
 
-Step 1.8 runs the deterministic audit and model call under the same lease heartbeat, merges both finding lists, and persists them through the existing fenced atomic `saveReview` operation.
+Step 1.8 runs the deterministic audit before the model call under the same lease heartbeat. Its durable state sequence is explicit:
 
-External URL and model calls are unavoidably at least once. If the process dies after a provider responds but before `saveReview` commits, a retry can repeat those calls because there is no distributed transaction with the providers. Stable request identities let providers deduplicate where supported, but the application does not claim exactly-once external execution. It deliberately does not partially persist a response before the atomic fenced save: durable findings, request/response artefacts, usage, sources, claims and step completion remain one operation, so retries create no duplicate durable records and never mutate the draft.
+1. `beginReviewOperation` commits `started` with the stable operation identity.
+2. A retry may adopt that exact `started` operation to its fresh, fenced step execution before dispatch; the adoption is immutable and the previous execution can no longer dispatch, checkpoint or save.
+3. `markReviewProviderInFlight` commits `provider_in_flight` before the external call.
+4. The validated provider-only response is committed as `checkpointed` with its provider-response hash.
+5. The current audit is merged immediately before fenced, atomic `saveReview`; findings, request/merged-response artefacts, usage, sources, claims, step output and completion commit together.
+
+The stable operation/request identity is derived from the run id, document-version id, step id, canonical request hash, provider and model. Audit outcomes are deliberately absent from that identity: they are refreshed on replay, while the provider request projection and provider-only checkpoint remain stable. Any identity mismatch fails as an immutable operation conflict rather than creating or reinterpreting a response.
+
+The operation checkpoint hash identifies only the provider response. The merged response artefact content hash and step-output hash identify the final response containing the fresh deterministic audit plus provider findings. A checkpointed model response is replayed without another model dispatch. A post-dispatch crash before that checkpoint is ambiguous and fails closed rather than recalling the model. URL verification has different timing: the deterministic audit runs once before the model in every execution, including a checkpoint replay, so replay uses current verification outcomes. A fresh execution does not perform a second live verification during merge or save.
+
+All three state-changing boundaries—pre-dispatch reservation, checkpoint and final save—require the current unexpired lease token and adopted producing execution. Stale owners cannot dispatch, checkpoint or save. Retries create no duplicate durable records and never mutate the draft. Incompatible historical merged checkpoints are not reinterpreted; persistence fails closed.
+
+## Verification status
+
+The in-memory Step 1.8 orchestration, crash/replay, audit replacement, hash separation, wrong-checkpoint atomicity, fencing and unchanged-draft tests are credential-free unit tests. PostgreSQL equivalents are opt-in and run only when the caller explicitly supplies a disposable `TEST_DATABASE_URL`; without that variable they are skipped, not reported as passed. No database URL is inferred from local configuration.
 
 Step 1.4 no longer emits membership, target-status or rank-only hierarchy findings. It retains the commercial body-presence rule. That same deterministic rule remains in Step 1.11's rerun, protecting revisions from removing the required body link.
 

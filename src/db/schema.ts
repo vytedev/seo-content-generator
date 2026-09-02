@@ -57,6 +57,17 @@ export const stepStatus = pgEnum("step_status", [
   "succeeded",
   "cancelled",
 ]);
+export const queueJobState = pgEnum("queue_job_state", [
+  "ready",
+  "leased",
+  "retry_wait",
+  "parked",
+  "operator_action",
+  "completed",
+  "cancelled",
+]);
+export const queueJobKind = pgEnum("queue_job_kind", ["continue_pipeline"]);
+export const queueJobPhase = pgEnum("queue_job_phase", ["pre_downstream", "downstream_started"]);
 export const findingSeverity = pgEnum("finding_severity", ["info", "warning", "blocker"]);
 export const findingDisposition = pgEnum("finding_disposition", ["accepted", "rejected"]);
 export const claimType = pgEnum("claim_type", [
@@ -137,6 +148,67 @@ export const runs = pgTable(
   ],
 );
 
+/** Durable coordination only: never stores handoffs, prompts, prose or provider output. */
+export const pipelineQueueJobs = pgTable(
+  "pipeline_queue_jobs",
+  {
+    id: uuid("id").primaryKey().defaultRandom(),
+    runId: uuid("run_id")
+      .notNull()
+      .references(() => runs.id, { onDelete: "restrict" }),
+    kind: queueJobKind("kind").notNull().default("continue_pipeline"),
+    state: queueJobState("state").notNull().default("ready"),
+    phase: queueJobPhase("phase").notNull().default("pre_downstream"),
+    attempt: integer("attempt").notNull().default(0),
+    availableAt: timestamp("available_at", { withTimezone: true }).notNull().defaultNow(),
+    leaseToken: uuid("lease_token"),
+    leaseOwner: text("lease_owner"),
+    leaseExpiresAt: timestamp("lease_expires_at", { withTimezone: true }),
+    options: jsonb("options")
+      .$type<{
+        refresh_link_discovery?: boolean;
+        authorise_legacy_draft_recovery?: boolean;
+        authorise_legacy_review_recovery?: true;
+      }>()
+      .notNull()
+      .default({}),
+    lastErrorCode: text("last_error_code"),
+    /** Refresh is isolated from all paid-step recovery authority. */
+    pendingRefresh: boolean("pending_refresh").notNull().default(false),
+    /** Marks a dedicated refresh pass that must resume the original unprivileged pipeline job. */
+    resumeAfterRefresh: boolean("resume_after_refresh").notNull().default(false),
+    /** Durable paid-step recovery continuation received while the current job is active. */
+    pendingOptions: jsonb("pending_options")
+      .$type<{
+        authorise_legacy_draft_recovery?: true;
+        authorise_legacy_review_recovery?: true;
+      }>()
+      .notNull()
+      .default({}),
+    createdAt,
+    updatedAt,
+  },
+  (t) => [
+    uniqueIndex("pipeline_queue_jobs_one_active_run_unique")
+      .on(t.runId)
+      .where(sql`${t.state} in ('ready','leased','retry_wait','parked','operator_action')`),
+    index("pipeline_queue_jobs_claim_idx").on(t.state, t.availableAt, t.createdAt),
+    check("pipeline_queue_jobs_attempt_range", sql`${t.attempt} between 0 and 3`),
+    check(
+      "pipeline_queue_jobs_lease_shape",
+      sql`(${t.state} = 'leased' and num_nonnulls(${t.leaseToken},${t.leaseOwner},${t.leaseExpiresAt}) = 3) or (${t.state} <> 'leased' and num_nonnulls(${t.leaseToken},${t.leaseOwner},${t.leaseExpiresAt}) = 0)`,
+    ),
+    check(
+      "pipeline_queue_jobs_options_shape",
+      sql`jsonb_typeof(${t.options})='object' and ${t.options} - array['refresh_link_discovery','authorise_legacy_draft_recovery','authorise_legacy_review_recovery']::text[] = '{}'::jsonb and (${t.options}->'refresh_link_discovery' is null or jsonb_typeof(${t.options}->'refresh_link_discovery')='boolean') and (${t.options}->'authorise_legacy_draft_recovery' is null or jsonb_typeof(${t.options}->'authorise_legacy_draft_recovery')='boolean') and (${t.options}->'authorise_legacy_review_recovery' is null or ${t.options}->'authorise_legacy_review_recovery'='true'::jsonb) and num_nonnulls(${t.options}->'refresh_link_discovery',${t.options}->'authorise_legacy_draft_recovery',${t.options}->'authorise_legacy_review_recovery') <= 1`,
+    ),
+    check(
+      "pipeline_queue_jobs_pending_options_shape",
+      sql`jsonb_typeof(${t.pendingOptions})='object' and ${t.pendingOptions} - array['authorise_legacy_draft_recovery','authorise_legacy_review_recovery']::text[] = '{}'::jsonb and (${t.pendingOptions}->'authorise_legacy_draft_recovery' is null or ${t.pendingOptions}->'authorise_legacy_draft_recovery'='true'::jsonb) and (${t.pendingOptions}->'authorise_legacy_review_recovery' is null or ${t.pendingOptions}->'authorise_legacy_review_recovery'='true'::jsonb) and num_nonnulls(${t.pendingOptions}->'authorise_legacy_draft_recovery',${t.pendingOptions}->'authorise_legacy_review_recovery') <= 1 and not (${t.pendingRefresh} and ${t.pendingOptions}<>'{}'::jsonb)`,
+    ),
+  ],
+);
+
 export const stepExecutions = pgTable(
   "step_executions",
   {
@@ -181,6 +253,7 @@ export const stepExecutions = pgTable(
   ],
 );
 
+/** Paid review reservations are declared after their referenced tables below. */
 /** Append-only content stored in PostgreSQL for the local phase. */
 export const artifacts = pgTable(
   "artifacts",
@@ -242,6 +315,92 @@ export const documentVersions = pgTable(
     check(
       "document_versions_revision_source",
       sql`(${t.revision} = 1 and ${t.revisionSource} is null) or (${t.revision} > 1 and ${t.revisionSource} in ('operator_findings','deterministic_repair','coherence_repair','operator_authorised_repair'))`,
+    ),
+  ],
+);
+
+export const reviewOperationStates = pgTable(
+  "review_operation_states",
+  {
+    operationId: text("operation_id").primaryKey(),
+    runId: uuid("run_id")
+      .notNull()
+      .references(() => runs.id, { onDelete: "restrict" }),
+    documentVersionId: uuid("document_version_id").notNull(),
+    producingStepExecutionId: uuid("producing_step_execution_id").notNull(),
+    step: pipelineStep("step").notNull(),
+    requestHash: text("request_hash").notNull(),
+    provider: text("provider").notNull(),
+    model: text("model").notNull(),
+    status: text("status").notNull().default("started"),
+    response: jsonb("response"),
+    responseHash: text("response_hash"),
+    createdAt,
+    checkpointedAt: timestamp("checkpointed_at", { withTimezone: true }),
+  },
+  (t) => [
+    uniqueIndex("review_operation_states_identity_unique").on(
+      t.runId,
+      t.documentVersionId,
+      t.step,
+      t.requestHash,
+      t.provider,
+      t.model,
+    ),
+    foreignKey({
+      columns: [t.documentVersionId, t.runId],
+      foreignColumns: [documentVersions.id, documentVersions.runId],
+    }).onDelete("restrict"),
+    foreignKey({
+      columns: [t.producingStepExecutionId, t.runId],
+      foreignColumns: [stepExecutions.id, stepExecutions.runId],
+    }).onDelete("restrict"),
+    check(
+      "review_operation_states_review_step",
+      sql`${t.step} in ('review_writing_style','review_information_gain','review_fact_checking','review_link_conversion')`,
+    ),
+    check(
+      "review_operation_states_status",
+      sql`${t.status} in ('started','provider_in_flight','checkpointed')`,
+    ),
+    check(
+      "review_operation_states_response_pair",
+      sql`(${t.status} in ('started','provider_in_flight') and ${t.response} is null and ${t.responseHash} is null and ${t.checkpointedAt} is null) or (${t.status}='checkpointed' and ${t.response} is not null and ${t.responseHash} is not null and ${t.checkpointedAt} is not null)`,
+    ),
+  ],
+);
+
+export const reviewOperationAdoptions = pgTable(
+  "review_operation_adoptions",
+  {
+    id: uuid("id").primaryKey().defaultRandom(),
+    operationId: text("operation_id")
+      .notNull()
+      .references(() => reviewOperationStates.operationId, { onDelete: "restrict" }),
+    runId: uuid("run_id")
+      .notNull()
+      .references(() => runs.id, { onDelete: "restrict" }),
+    fromStepExecutionId: uuid("from_step_execution_id").notNull(),
+    toStepExecutionId: uuid("to_step_execution_id").notNull(),
+    adoptedAt: timestamp("adopted_at", { withTimezone: true }).notNull().defaultNow(),
+  },
+  (t) => [
+    uniqueIndex("review_operation_adoptions_source_unique").on(
+      t.operationId,
+      t.fromStepExecutionId,
+    ),
+    uniqueIndex("review_operation_adoptions_target_unique").on(t.operationId, t.toStepExecutionId),
+    foreignKey({
+      columns: [t.fromStepExecutionId, t.runId],
+      foreignColumns: [stepExecutions.id, stepExecutions.runId],
+    }).onDelete("restrict"),
+    foreignKey({
+      columns: [t.toStepExecutionId, t.runId],
+      foreignColumns: [stepExecutions.id, stepExecutions.runId],
+    }).onDelete("restrict"),
+    check(
+      "review_operation_adoptions_distinct_executions",
+      sql`${t.fromStepExecutionId} <> ${t.toStepExecutionId}`,
     ),
   ],
 );
@@ -1080,6 +1239,56 @@ export const providerOperations = pgTable(
   ],
 );
 
+/** Durable Step 1.3 provider reservation and validated-response checkpoint. */
+export const draftOperationStates = pgTable(
+  "draft_operation_states",
+  {
+    operationId: text("operation_id").primaryKey(),
+    runId: uuid("run_id")
+      .notNull()
+      .references(() => runs.id, { onDelete: "restrict" }),
+    producingStepExecutionId: uuid("producing_step_execution_id").notNull(),
+    requestHash: text("request_hash").notNull(),
+    provider: text("provider").notNull(),
+    model: text("model").notNull(),
+    contractIdentity: text("contract_identity").notNull(),
+    purpose: text("purpose").notNull(),
+    operatorAuthorised: boolean("operator_authorised").notNull().default(false),
+    response: jsonb("response"),
+    responseHash: text("response_hash"),
+    status: text("status").notNull().default("started"),
+    createdAt,
+    checkpointedAt: timestamp("checkpointed_at", { withTimezone: true }),
+  },
+  (t) => [
+    uniqueIndex("draft_operation_states_run_request_purpose_unique").on(
+      t.runId,
+      t.requestHash,
+      t.purpose,
+    ),
+    foreignKey({
+      columns: [t.producingStepExecutionId, t.runId],
+      foreignColumns: [stepExecutions.id, stepExecutions.runId],
+    }).onDelete("restrict"),
+    check(
+      "draft_operation_states_status_check",
+      sql`${t.status} in ('started','provider_in_flight','checkpointed')`,
+    ),
+    check(
+      "draft_operation_states_purpose_check",
+      sql`${t.purpose} in ('initial','legacy_operator_recovery')`,
+    ),
+    check(
+      "draft_operation_states_authorisation_check",
+      sql`(${t.purpose} = 'initial' and ${t.operatorAuthorised} = false) or (${t.purpose} = 'legacy_operator_recovery' and ${t.operatorAuthorised} = true)`,
+    ),
+    check(
+      "draft_operation_states_response_pair",
+      sql`((${t.status} in ('started','provider_in_flight') and ${t.response} is null and ${t.responseHash} is null and ${t.checkpointedAt} is null) or (${t.status} = 'checkpointed' and ${t.response} is not null and ${t.responseHash} is not null and ${t.checkpointedAt} is not null))`,
+    ),
+  ],
+);
+
 /** Immutable one-row-per-accepted-finding Step 1.10 application audit. */
 export const revisionFindingAudits = pgTable(
   "revision_finding_audits",
@@ -1478,6 +1687,9 @@ export const coherenceCheckpoints = pgTable(
     requestHash: text("request_hash").notNull(),
     response: jsonb("response"),
     responseHash: text("response_hash"),
+    // Mirrors revision_operation_states: a durable pre-dispatch marker means a
+    // process loss after dispatch cannot be mistaken for "never called".
+    status: text("status").notNull().default("started"),
     createdAt,
     checkpointedAt: timestamp("checkpointed_at", { withTimezone: true }),
   },
@@ -1490,6 +1702,14 @@ export const coherenceCheckpoints = pgTable(
       columns: [t.producingStepExecutionId, t.runId],
       foreignColumns: [stepExecutions.id, stepExecutions.runId],
     }).onDelete("restrict"),
+    check(
+      "coherence_checkpoints_status_check",
+      sql`${t.status} in ('started','provider_in_flight','checkpointed')`,
+    ),
+    check(
+      "coherence_checkpoints_response_pair",
+      sql`((${t.status} in ('started','provider_in_flight') and ${t.response} is null and ${t.responseHash} is null) or (${t.status} = 'checkpointed' and ${t.response} is not null and ${t.responseHash} is not null))`,
+    ),
   ],
 );
 

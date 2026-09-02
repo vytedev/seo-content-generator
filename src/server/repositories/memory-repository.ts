@@ -9,8 +9,10 @@ import {
   type ExportRejectedFinding,
 } from "../../shared/export.js";
 import { ConflictError, NotFoundError, UnprocessableError } from "../../shared/errors.js";
+import { QueueOptionsSchema, type QueueLease, type QueueOptions } from "../../shared/queue.js";
 import { PIPELINE_STEPS, type Handoff, type PipelineStepId } from "../../shared/pipeline.js";
 import { FindingLocationSchema } from "../../shared/checker/index.js";
+import { revisionBindingExclusions } from "../../shared/revision-planning.js";
 import { bindExceptionalBlockers } from "../../shared/exceptional-recovery.js";
 import {
   DeterministicManifestSchema,
@@ -61,6 +63,7 @@ import {
   PersistedReviewFindingSchema,
   PersistedReviewResponseSchema,
   ReviewRequestSchema,
+  type PersistedReviewResponse,
   type BulkDisposition,
   type FindingRecord,
   type MilestoneThreeRepository,
@@ -75,8 +78,11 @@ import {
   contentHash,
   LinkDiscoveryMetadataSchema,
   stableId,
+  deriveDraftOperationIdentity,
   DraftProviderRequestSchema,
   DraftProviderResponseSchema,
+  type DraftOperationCommand,
+  type DraftOperationIdentity,
   type DraftProviderResponse,
   type IngestResult,
   type InternalLink,
@@ -123,10 +129,32 @@ export class InMemoryMilestoneRepository
 {
   private readonly runs = new Map<string, RunState>();
   private readonly keys = new Map<string, string>();
+  readonly queueJobs: Array<{
+    id: string;
+    run_id: string;
+    state:
+      "ready" | "leased" | "retry_wait" | "parked" | "operator_action" | "completed" | "cancelled";
+    attempt: number;
+    phase: "pre_downstream" | "downstream_started";
+    availableAt: number;
+    token: string | null;
+    expiresAt: number | null;
+    options: QueueOptions;
+    pendingRefresh: boolean;
+    resumeAfterRefresh: boolean;
+    pendingOptions: QueueOptions;
+    error?: string;
+  }> = [];
   readonly providerUsage: ProviderUsageRecord[] = [];
   readonly artifacts: ArtifactRecord[] = [];
   readonly documentVersions: DocumentVersionRecord[] = [];
   readonly findings: FindingRecord[] = [];
+  readonly reviewOperationAdoptions: Array<{
+    operation_id: string;
+    run_id: string;
+    from_step_execution_id: string;
+    to_step_execution_id: string;
+  }> = [];
   readonly dispositions: Array<{
     finding_id: string;
     decision: "accepted" | "rejected";
@@ -257,6 +285,7 @@ export class InMemoryMilestoneRepository
       updatedAt: this.now(),
     });
     this.keys.set(key, runId);
+    await this.enqueueRun(runId);
     return result;
   }
 
@@ -283,7 +312,7 @@ export class InMemoryMilestoneRepository
       (candidate) => candidate.step === step && candidate.status === "waiting",
     );
   }
-  async claimStep(runId: string, step: PipelineStepId, _owner: string) {
+  async claimStep(runId: string, step: PipelineStepId, _owner: string, replaySucceeded = false) {
     await this.ensureStep(runId, step);
     const run = this.requireRun(runId);
     const attempts = run.steps
@@ -291,7 +320,7 @@ export class InMemoryMilestoneRepository
       .sort((a, b) => b.attempt - a.attempt);
     let state = attempts[0]!;
     if (state.status === "succeeded") {
-      if (run.currentStep !== step) throw new Error("Step already succeeded");
+      if (!replaySucceeded && run.currentStep !== step) throw new Error("Step already succeeded");
       state = {
         id: stableId("execution", runId, step, String(state.attempt + 1)),
         step,
@@ -324,10 +353,12 @@ export class InMemoryMilestoneRepository
     state.token = randomUUID();
     state.status = "running";
     state.expiresAt = this.now() + this.leaseMs;
-    run.status = "running";
-    run.currentStep = step;
-    run.blockReason = null;
-    run.updatedAt = this.now();
+    if (!replaySucceeded) {
+      run.status = "running";
+      run.currentStep = step;
+      run.blockReason = null;
+      run.updatedAt = this.now();
+    }
     return { execution_id: state.id, token: state.token };
   }
   /** Fenced lease renewal: extends the lease only while the token still holds it. */
@@ -343,7 +374,11 @@ export class InMemoryMilestoneRepository
     state.expiresAt = this.now() + this.leaseMs;
     return true;
   }
-  async completeStep(executionId: string, token: string): Promise<void> {
+  async completeStep(
+    executionId: string,
+    token: string,
+    preserveRunProgress = false,
+  ): Promise<void> {
     const { run, state } = this.findExecution(executionId);
     this.assertFenceState(state, token);
     state.status = "succeeded";
@@ -364,13 +399,13 @@ export class InMemoryMilestoneRepository
       "final_coherence_export",
     ];
     const index = order.indexOf(state.step);
-    run.currentStep = order[Math.min(index + 1, order.length - 1)]!;
+    if (!preserveRunProgress) run.currentStep = order[Math.min(index + 1, order.length - 1)]!;
   }
   /** Operator stop: revokes in-flight leases; fenced writes then bounce. */
   async cancelRun(runId: string): Promise<void> {
     const run = this.requireRun(runId);
-    if (run.status !== "running")
-      throw new ConflictError("Only a running blog post can be stopped.");
+    if (!["queued", "running", "retryable_failed", "waiting", "blocked"].includes(run.status))
+      throw new ConflictError("Only an active or operator-paused blog post can be stopped.");
     for (const step of run.steps) {
       if (step.status === "running") {
         step.status = "cancelled";
@@ -378,11 +413,25 @@ export class InMemoryMilestoneRepository
         step.expiresAt = null;
       }
     }
+    const job = this.queueJobs.find(
+      (candidate) =>
+        candidate.run_id === runId && !["completed", "cancelled"].includes(candidate.state),
+    );
+    if (job) {
+      job.state = "cancelled";
+      job.token = null;
+      job.expiresAt = null;
+    }
     run.status = "cancelled";
     run.blockReason = null;
     run.updatedAt = this.now();
   }
-  async failStep(executionId: string, token: string, error: string): Promise<void> {
+  async failStep(
+    executionId: string,
+    token: string,
+    error: string,
+    preserveRunProgress = false,
+  ): Promise<void> {
     const { run, state } = this.findExecution(executionId);
     // A cancelled run keeps its operator-decided state; the unwinding
     // orchestrator's failure write must no-op instead of un-cancelling it.
@@ -392,9 +441,11 @@ export class InMemoryMilestoneRepository
     state.token = null;
     state.expiresAt = null;
     state.error = this.safeFailureMessage(error);
-    run.status = "retryable_failed";
-    run.currentStep = state.step;
-    run.blockReason = null;
+    if (!preserveRunProgress) {
+      run.status = "retryable_failed";
+      run.currentStep = state.step;
+      run.blockReason = null;
+    }
   }
   async saveLinkDiscoveryEvidence(
     runId: string,
@@ -476,21 +527,120 @@ export class InMemoryMilestoneRepository
     const value = this.requireRun(runId).draft;
     return value ? { draft: value.draft, artifact: value.artifact, version: value.version } : null;
   }
+  async beginDraftOperation(input: {
+    run_id: string;
+    execution_id: string;
+    token: string;
+    request: import("../../shared/milestone-two.js").DraftProviderRequest;
+    provider: string;
+    model: string;
+    contract_identity: string;
+    purpose: DraftOperationIdentity["purpose"];
+    operator_authorised: boolean;
+  }): Promise<{ identity: DraftOperationIdentity; response: DraftProviderResponse | null }> {
+    this.assertFence(input.run_id, input.execution_id, input.token);
+    if (input.purpose === "legacy_operator_recovery" && !input.operator_authorised)
+      throw new Error("Legacy draft recovery requires explicit operator authorisation");
+    if (input.purpose === "initial" && input.operator_authorised)
+      throw new Error("Initial draft operation cannot carry recovery authorisation");
+    const run = this.requireRun(input.run_id);
+    const priorDraftFailure = run.steps.some(
+      (step) => step.step === "draft" && step.status === "retryable_failed",
+    );
+    const runDraftOperations = [...this.outputKeys.entries()].filter(
+      ([key, value]) =>
+        key.startsWith("draft-state:") && value.includes(`\"run_id\":\"${input.run_id}\"`),
+    );
+    const hasDraftOperation = runDraftOperations.length > 0;
+    if (
+      runDraftOperations.some(
+        ([key]) =>
+          this.outputKeys.get(`${key}:status`) === "provider_in_flight" &&
+          !this.outputKeys.has(`${key}:response`),
+      )
+    )
+      throw new Error(
+        "Draft provider outcome is ambiguous; no duplicate call was made. A technical owner must authorise a new recovery operation.",
+      );
+    if (input.purpose === "legacy_operator_recovery" && (!priorDraftFailure || hasDraftOperation))
+      throw new Error("Legacy draft recovery is not eligible for this run");
+    if (input.purpose === "initial" && priorDraftFailure && !hasDraftOperation)
+      throw new Error("A pre-checkpoint draft failure requires explicit operator authorisation");
+    const identity = deriveDraftOperationIdentity(input);
+    const key = `draft-state:${identity.operation_id}`;
+    const existing = this.outputKeys.get(key);
+    const serialisedIdentity = JSON.stringify(identity);
+    if (existing && existing !== serialisedIdentity)
+      throw new Error("Immutable draft operation conflict");
+    this.outputKeys.set(key, serialisedIdentity);
+    const responseText = this.outputKeys.get(`${key}:response`);
+    if (!responseText && this.outputKeys.get(`${key}:status`) === "provider_in_flight")
+      throw new Error(
+        "Draft provider outcome is ambiguous; no duplicate call was made. A technical owner must authorise a new recovery operation.",
+      );
+    if (!this.outputKeys.has(`${key}:status`)) this.outputKeys.set(`${key}:status`, "started");
+    const response = responseText
+      ? DraftProviderResponseSchema.parse(JSON.parse(responseText))
+      : null;
+    if (response && this.outputKeys.get(`${key}:response-hash`) !== canonicalHash(response))
+      throw new Error("Draft checkpoint hash mismatch");
+    return { identity, response };
+  }
+  private assertDraftCommand(input: DraftOperationCommand): string {
+    this.assertFence(input.run_id, input.execution_id, input.token);
+    if (input.run_id !== input.identity.run_id)
+      throw new Error("Draft operation cannot cross runs");
+    const key = `draft-state:${input.identity.operation_id}`;
+    if (this.outputKeys.get(key) !== JSON.stringify(input.identity))
+      throw new Error("Draft operation identity mismatch");
+    return key;
+  }
+  async markDraftProviderInFlight(input: DraftOperationCommand): Promise<void> {
+    const key = this.assertDraftCommand(input);
+    if (this.outputKeys.get(`${key}:status`) !== "started")
+      throw new Error("Draft operation is not ready for provider dispatch");
+    this.outputKeys.set(`${key}:status`, "provider_in_flight");
+  }
+  async releaseDraftProviderFailure(input: DraftOperationCommand): Promise<void> {
+    const key = this.assertDraftCommand(input);
+    if (this.outputKeys.get(`${key}:status`) !== "provider_in_flight")
+      throw new Error("Draft operation has no releasable provider reservation");
+    this.outputKeys.set(`${key}:status`, "started");
+  }
+  async checkpointDraftResponse(
+    input: DraftOperationCommand & { response: DraftProviderResponse },
+  ): Promise<void> {
+    const key = this.assertDraftCommand(input);
+    if (this.outputKeys.get(`${key}:status`) !== "provider_in_flight")
+      throw new Error("Draft operation has no active provider reservation");
+    const response = DraftProviderResponseSchema.parse(input.response);
+    const value = JSON.stringify(response);
+    const existing = this.outputKeys.get(`${key}:response`);
+    if (existing && existing !== value) throw new Error("Immutable draft checkpoint conflict");
+    this.outputKeys.set(`${key}:response`, value);
+    this.outputKeys.set(`${key}:response-hash`, canonicalHash(response));
+    this.outputKeys.set(`${key}:status`, "checkpointed");
+  }
   async saveDraft(
     runId: string,
     executionId: string,
     token: string,
     response: DraftProviderResponse,
-    provider: string,
-    model: string,
-    rawRequest?: import("../../shared/milestone-two.js").DraftProviderRequest,
+    operation: DraftOperationIdentity,
   ) {
     const parsed = DraftProviderResponseSchema.parse(response);
-    const request = rawRequest ? DraftProviderRequestSchema.parse(rawRequest) : undefined;
-    const parsedProvider = this.requireNonEmpty(provider, "provider");
-    const parsedModel = this.requireNonEmpty(model, "model");
     this.assertFence(runId, executionId, token);
+    if (operation.run_id !== runId) throw new Error("Draft operation cannot cross runs");
+    const operationKey = `draft-state:${operation.operation_id}`;
+    if (
+      this.outputKeys.get(operationKey) !== JSON.stringify(operation) ||
+      this.outputKeys.get(`${operationKey}:status`) !== "checkpointed" ||
+      this.outputKeys.get(`${operationKey}:response-hash`) !== canonicalHash(parsed)
+    )
+      throw new Error("Draft persistence requires its exact validated provider checkpoint");
     const run = this.requireRun(runId);
+    const parsedProvider = operation.provider;
+    const parsedModel = operation.model;
     const identityHash = canonicalHash(parsed.draft);
     if (run.draft) {
       if (run.draft.canonicalHash !== identityHash) throw new Error("Immutable draft conflict");
@@ -536,19 +686,19 @@ export class InMemoryMilestoneRepository
       ...parsed.usage,
     };
     this.artifacts.push(artifact);
-    if (request) {
-      const requestBody = JSON.stringify(request);
-      this.artifacts.push({
-        id: stableId("artifact", runId, "draft_request", contentHash(requestBody)),
-        run_id: runId,
-        step_execution_id: executionId,
-        parent_id: null,
-        kind: "draft_request",
-        media_type: "application/json",
-        body_text: requestBody,
-        content_hash: contentHash(requestBody),
-      });
-    }
+    // The request bytes were already validated and hashed into the immutable operation.
+    // Persist only the approved operation identity here; prompts remain provider-owned.
+    const requestBody = JSON.stringify(operation);
+    this.artifacts.push({
+      id: stableId("artifact", runId, "draft_request", contentHash(requestBody)),
+      run_id: runId,
+      step_execution_id: executionId,
+      parent_id: null,
+      kind: "draft_request",
+      media_type: "application/json",
+      body_text: requestBody,
+      content_hash: contentHash(requestBody),
+    });
     this.documentVersions.push(version);
     this.providerUsage.push(usage);
     run.draft = {
@@ -681,6 +831,120 @@ export class InMemoryMilestoneRepository
     if (complete) this.completeValidatedStep(fenced.run, fenced.state);
   }
 
+  async beginReviewOperation(input: {
+    run_id: string;
+    document_version_id: string;
+    execution_id: string;
+    token: string;
+    step: ReviewStep;
+    request: ReviewRequest;
+    provider: string;
+    model: string;
+  }): Promise<{ operation_id: string; response: PersistedReviewResponse | null }> {
+    this.assertFence(input.run_id, input.execution_id, input.token);
+    const request = ReviewRequestSchema.parse(input.request);
+    const operationId = stableId(
+      "review-operation",
+      input.run_id,
+      input.document_version_id,
+      input.step,
+      canonicalHash(request),
+      input.provider,
+      input.model,
+    );
+    const key = `review-operation:${operationId}`;
+    const identity = canonicalHash({
+      run_id: input.run_id,
+      document_version_id: input.document_version_id,
+      step: input.step,
+      request_hash: canonicalHash(request),
+      provider: input.provider,
+      model: input.model,
+    });
+    const existing = this.outputKeys.get(key);
+    if (existing && existing !== identity) throw new Error("Immutable review operation conflict");
+    this.outputKeys.set(key, identity);
+    const status = this.outputKeys.get(`${key}:status`) ?? "started";
+    if (status === "provider_in_flight")
+      throw new Error("Review provider outcome is ambiguous; operator action is required");
+    const producerKey = `${key}:producer`;
+    const producer = this.outputKeys.get(producerKey);
+    if (!producer) this.outputKeys.set(producerKey, input.execution_id);
+    else if (producer !== input.execution_id && status === "started") {
+      const previous = this.findExecution(producer);
+      const current = this.findExecution(input.execution_id);
+      if (
+        previous.run !== current.run ||
+        previous.state.step !== input.step ||
+        current.state.step !== input.step ||
+        previous.state.status !== "retryable_failed" ||
+        previous.state.token !== null ||
+        previous.state.expiresAt !== null ||
+        current.state.status !== "running" ||
+        previous.state.attempt >= current.state.attempt
+      )
+        throw new Error("Started review operation cannot be adopted by this attempt");
+      this.reviewOperationAdoptions.push({
+        operation_id: operationId,
+        run_id: input.run_id,
+        from_step_execution_id: producer,
+        to_step_execution_id: input.execution_id,
+      });
+      this.outputKeys.set(producerKey, input.execution_id);
+    }
+    const raw = this.outputKeys.get(`${key}:response`);
+    const response = raw ? PersistedReviewResponseSchema.parse(JSON.parse(raw)) : null;
+    if (response && this.outputKeys.get(`${key}:response-hash`) !== canonicalHash(response))
+      throw new Error("Review checkpoint hash mismatch");
+    return { operation_id: operationId, response };
+  }
+
+  async markReviewProviderInFlight(input: {
+    run_id: string;
+    execution_id: string;
+    token: string;
+    operation_id: string;
+  }): Promise<void> {
+    this.assertFence(input.run_id, input.execution_id, input.token);
+    const key = `review-operation:${input.operation_id}`;
+    if (
+      !this.outputKeys.has(key) ||
+      (this.outputKeys.get(`${key}:status`) ?? "started") !== "started" ||
+      this.outputKeys.get(`${key}:producer`) !== input.execution_id
+    )
+      throw new Error("Review operation is not ready for dispatch");
+    this.outputKeys.set(`${key}:status`, "provider_in_flight");
+  }
+
+  async checkpointReviewResponse(input: {
+    run_id: string;
+    execution_id: string;
+    token: string;
+    operation_id: string;
+    response: PersistedReviewResponse;
+  }): Promise<void> {
+    this.assertFence(input.run_id, input.execution_id, input.token);
+    const key = `review-operation:${input.operation_id}`;
+    const response = PersistedReviewResponseSchema.parse(input.response);
+    const hash = canonicalHash(response);
+    if (this.outputKeys.get(`${key}:status`) === "checkpointed") {
+      if (
+        this.outputKeys.get(`${key}:response-hash`) !== hash ||
+        this.outputKeys.get(`${key}:producer`) !== input.execution_id
+      )
+        throw new Error("Immutable review checkpoint conflict");
+      return;
+    }
+    if (
+      this.outputKeys.get(`${key}:status`) !== "provider_in_flight" ||
+      this.outputKeys.get(`${key}:producer`) !== input.execution_id
+    )
+      throw new Error("Review operation has no active provider reservation");
+    this.outputKeys.set(`${key}:response`, JSON.stringify(response));
+    this.outputKeys.set(`${key}:response-hash`, hash);
+    this.outputKeys.set(`${key}:status`, "checkpointed");
+  }
+
   async saveReview(
     runId: string,
     documentVersionId: string,
@@ -691,9 +955,13 @@ export class InMemoryMilestoneRepository
     rawResponse: ReviewResponse & { findings: Array<ReviewFinding & { hard_flag: boolean }> },
     provider: string,
     model: string,
+    rawCheckpointResponse?: PersistedReviewResponse,
   ): Promise<void> {
     const request = ReviewRequestSchema.parse(rawRequest);
     const response = PersistedReviewResponseSchema.parse(rawResponse);
+    const checkpointResponse = rawCheckpointResponse
+      ? PersistedReviewResponseSchema.parse(rawCheckpointResponse)
+      : response;
     const fenced = this.assertFence(runId, executionId, token);
     const parsedProvider = this.requireNonEmpty(provider, "provider");
     const parsedModel = this.requireNonEmpty(model, "model");
@@ -722,8 +990,23 @@ export class InMemoryMilestoneRepository
         throw new Error("Immutable source conflict");
       pendingSources.push({ ...source, run_id: runId, content_hash: hash });
     }
-    const key = `${runId}:${documentVersionId}:${step}`;
+    const operationId = stableId(
+      "review-operation",
+      runId,
+      documentVersionId,
+      step,
+      canonicalHash(request),
+      parsedProvider,
+      parsedModel,
+    );
+    const operationKey = `review-operation:${operationId}`;
     const identity = canonicalHash(response);
+    if (
+      this.outputKeys.get(`${operationKey}:status`) !== "checkpointed" ||
+      this.outputKeys.get(`${operationKey}:response-hash`) !== canonicalHash(checkpointResponse)
+    )
+      throw new Error("Review persistence requires its exact validated provider checkpoint");
+    const key = `${runId}:${documentVersionId}:${step}`;
     const existing = this.outputKeys.get(key);
     if (existing && existing !== identity) throw new Error("Immutable review conflict");
     if (existing) return;
@@ -1002,8 +1285,9 @@ export class InMemoryMilestoneRepository
     const parsed = BulkDispositionSchema.parse(input);
     const run = this.runs.get(runId);
     if (!run) throw new NotFoundError("The findings run was not found.");
+    const frozen = this.activeReviewSet(runId);
     const waiting = run.steps.find(
-      (item) => item.step === "findings_review" && item.status === "waiting",
+      (item) => item.id === frozen?.findings_step_execution_id && item.status === "waiting",
     );
     const normalized = {
       document_version_id: parsed.document_version_id,
@@ -1047,8 +1331,7 @@ export class InMemoryMilestoneRepository
     if (!run.draft) throw new UnprocessableError("The current document version is unavailable.");
     if (parsed.document_version_id !== run.draft.version.id)
       throw new ConflictError("Dispositions must target the current document version.");
-    const frozen = this.activeReviewSet(runId);
-    if (!frozen || frozen.findings_step_execution_id !== waiting.id)
+    if (!frozen)
       throw new ConflictError("The waiting findings execution has no matching frozen review set.");
     const reviewSet = frozen.finding_ids.map((id) =>
       this.findings.find((finding) => finding.id === id)!,
@@ -1070,33 +1353,78 @@ export class InMemoryMilestoneRepository
         throw new ConflictError("A finding already has a disposition.");
       return { finding, item };
     });
-    for (const { finding, item } of selected) {
-      this.dispositions.push({
-        finding_id: finding.id,
-        decision: item.decision,
-        ...(item.rationale?.trim() ? { rationale: item.rationale.trim() } : {}),
-      });
-    }
-    const pending = reviewSet.some(
-      (item) => !this.dispositions.some((disposition) => disposition.finding_id === item.id),
+    const appendedDispositions: (typeof this.dispositions)[number][] = [];
+    let appendedSubmission: (typeof this.findingReviewSubmissions)[number] | null = null;
+    const waitingStatus = waiting.status;
+    const runSnapshot = {
+      status: run.status,
+      currentStep: run.currentStep,
+      blockReason: run.blockReason,
+    };
+    const targetQueueSnapshots = new Map(
+      this.queueJobs
+        .filter((job) => job.run_id === runId)
+        .map((job) => [job, structuredClone(job)] as const),
     );
-    if (!pending) {
-      this.findingReviewSubmissions.push({
-        run_id: runId,
-        review_set_id: frozen.id,
-        idempotency_key: parsed.idempotency_key,
-        payload_hash: payloadHash,
-        finding_count: selected.length,
-      });
-      waiting.status = "succeeded";
-      // Findings review has concluded — the run moves on to the next
-      // (externally-triggered, model-owned) step rather than staying
-      // parked at the step that just succeeded.
-      run.status = "running";
-      run.currentStep = "revision_pass";
-      run.blockReason = null;
+    try {
+      for (const { finding, item } of selected) {
+        const disposition = {
+          finding_id: finding.id,
+          decision: item.decision,
+          ...(item.rationale?.trim() ? { rationale: item.rationale.trim() } : {}),
+        };
+        appendedDispositions.push(disposition);
+        this.dispositions.push(disposition);
+      }
+      const pending = reviewSet.some(
+        (item) => !this.dispositions.some((disposition) => disposition.finding_id === item.id),
+      );
+      if (!pending) {
+        appendedSubmission = {
+          run_id: runId,
+          review_set_id: frozen.id,
+          idempotency_key: parsed.idempotency_key,
+          payload_hash: payloadHash,
+          finding_count: selected.length,
+        };
+        this.findingReviewSubmissions.push(appendedSubmission);
+        waiting.status = "succeeded";
+        // Findings review has concluded — the run moves on to the next
+        // (externally-triggered, model-owned) step rather than staying
+        // parked at the step that just succeeded.
+        run.status = "running";
+        run.currentStep = "revision_pass";
+        run.blockReason = null;
+        await this.enqueueRun(runId);
+      }
+      return { completed: !pending, submitted: selected.length, continuation_required: !pending };
+    } catch (error) {
+      for (const disposition of appendedDispositions) {
+        const index = this.dispositions.indexOf(disposition);
+        if (index !== -1) this.dispositions.splice(index, 1);
+      }
+      if (appendedSubmission) {
+        const index = this.findingReviewSubmissions.indexOf(appendedSubmission);
+        if (index !== -1) this.findingReviewSubmissions.splice(index, 1);
+      }
+      waiting.status = waitingStatus;
+      run.status = runSnapshot.status;
+      run.currentStep = runSnapshot.currentStep;
+      run.blockReason = runSnapshot.blockReason;
+
+      for (let index = this.queueJobs.length - 1; index >= 0; index -= 1) {
+        const job = this.queueJobs[index]!;
+        if (job.run_id === runId && !targetQueueSnapshots.has(job)) this.queueJobs.splice(index, 1);
+      }
+      for (const [job, snapshot] of targetQueueSnapshots) {
+        const mutableJob = job as unknown as Record<string, unknown>;
+        for (const key of Object.keys(mutableJob)) {
+          if (!(key in snapshot)) delete mutableJob[key];
+        }
+        Object.assign(job, snapshot);
+      }
+      throw error;
     }
-    return { completed: !pending, submitted: selected.length, continuation_required: !pending };
   }
 
   private reviewSet(runId: string, documentVersionId: string): FindingRecord[] {
@@ -1231,7 +1559,26 @@ export class InMemoryMilestoneRepository
       const parsed = FindingLocationSchema.safeParse(claim.location);
       return parsed.success ? [parsed.data] : [];
     });
-    return { source, findings, rejected_locations, verified_fact_locations };
+    return {
+      source,
+      findings,
+      rejected_locations,
+      verified_fact_locations,
+      authorised_readability: Object.fromEntries(
+        (exceptionalBindings ?? [])
+          .filter((binding) => binding.readability_blocks?.length)
+          .map((binding) => [
+            binding.finding_id,
+            {
+              blocks: binding.readability_blocks!,
+              ...(binding.selector_version ? { selector_version: binding.selector_version } : {}),
+              ...(binding.target_set_identity
+                ? { target_set_identity: binding.target_set_identity }
+                : {}),
+            },
+          ]),
+      ),
+    };
   }
 
   async beginRevisionOperation(input: {
@@ -1538,6 +1885,7 @@ export class InMemoryMilestoneRepository
     if (result.document_id !== input.document_version_id)
       throw new Error("Step 1.11 document mismatch");
     const key = `${input.run_id}:${input.document_version_id}`;
+    this.assertFence(input.run_id, input.execution_id, input.token);
     const existing = this.deterministicReruns.get(key);
     if (existing) {
       if (canonicalHash(existing) === canonicalHash(result)) {
@@ -1672,8 +2020,48 @@ export class InMemoryMilestoneRepository
     if (existing && existing !== identity)
       throw new Error("Immutable coherence operation conflict");
     this.outputKeys.set(key, identity);
+    const statusKey = `${key}:status`;
+    // A newly inserted checkpoint starts in the pre-dispatch state. Keep an
+    // existing state untouched so retries observe the durable transition.
+    if (!this.outputKeys.has(statusKey)) this.outputKeys.set(statusKey, "started");
     const response = this.outputKeys.get(`${key}:response`);
-    return response ? CoherenceResponseSchema.parse(JSON.parse(response)) : null;
+    if (response) return CoherenceResponseSchema.parse(JSON.parse(response));
+    // Parity with PostgreSQL: a durable pre-dispatch marker without a
+    // checkpoint means the paid call may already have been processed upstream.
+    if (this.outputKeys.get(`${key}:status`) === "provider_in_flight")
+      throw new Error(
+        "Coherence provider outcome is ambiguous; no duplicate call was made. Operator action is required before this document can continue.",
+      );
+    return null;
+  }
+  async markCoherenceProviderInFlight(input: {
+    run_id: string;
+    execution_id: string;
+    token: string;
+    operation_id: string;
+  }): Promise<void> {
+    this.assertFence(input.run_id, input.execution_id, input.token);
+    const key = `coherence-state:${input.operation_id}`;
+    if (!this.outputKeys.has(key) || this.outputKeys.has(`${key}:response`))
+      throw new Error("Coherence operation cannot start a provider call");
+    const status = this.outputKeys.get(`${key}:status`);
+    if (status !== "started")
+      throw new Error("Coherence operation is not ready for provider dispatch");
+    this.outputKeys.set(`${key}:status`, "provider_in_flight");
+  }
+  async releaseCoherenceProviderFailure(input: {
+    run_id: string;
+    execution_id: string;
+    token: string;
+    operation_id: string;
+  }): Promise<void> {
+    this.assertFence(input.run_id, input.execution_id, input.token);
+    const key = `coherence-state:${input.operation_id}`;
+    if (this.outputKeys.has(`${key}:response`))
+      throw new Error("Checkpointed coherence response cannot be released");
+    if (this.outputKeys.get(`${key}:status`) !== "provider_in_flight")
+      throw new Error("Coherence release requires an in-flight provider operation");
+    this.outputKeys.set(`${key}:status`, "started");
   }
   async checkpointCoherenceResponse(input: {
     run_id: string;
@@ -1683,11 +2071,24 @@ export class InMemoryMilestoneRepository
     response: CoherenceResponse;
   }) {
     this.assertFence(input.run_id, input.execution_id, input.token);
-    const key = `coherence-state:${input.operation_id}:response`,
-      value = JSON.stringify(CoherenceResponseSchema.parse(input.response));
-    const existing = this.outputKeys.get(key);
-    if (existing && existing !== value) throw new Error("Immutable coherence checkpoint conflict");
+    const parsed = CoherenceResponseSchema.parse(input.response),
+      key = `coherence-state:${input.operation_id}:response`,
+      value = JSON.stringify(parsed),
+      responseHash = canonicalHash(parsed),
+      existing = this.outputKeys.get(key),
+      statusKey = `coherence-state:${input.operation_id}:status`,
+      status = this.outputKeys.get(statusKey);
+    if (existing) {
+      if (canonicalHash(CoherenceResponseSchema.parse(JSON.parse(existing))) !== responseHash)
+        throw new Error("Immutable coherence checkpoint conflict");
+      if (status !== "checkpointed")
+        throw new Error("Checkpointed coherence response has invalid status");
+      return;
+    }
+    if (status !== "provider_in_flight")
+      throw new Error("Coherence checkpoint requires an in-flight provider operation");
     this.outputKeys.set(key, value);
+    this.outputKeys.set(statusKey, "checkpointed");
   }
 
   async recoverCoherence(
@@ -1983,13 +2384,17 @@ export class InMemoryMilestoneRepository
     idempotency_key: string;
     explicit_confirmation: true;
   }): Promise<"authorised" | "replay"> {
-    const replay = this.exceptionalCorrectionAuthorisations.find(
+    // Exact key ownership first, then a separate check for an authorisation this
+    // run already holds under a different key. Both paths are observational.
+    const sameKey = this.exceptionalCorrectionAuthorisations.find(
       (item) => item.idempotency_key === input.idempotency_key,
     );
-    if (replay) {
-      if (replay.run_id !== input.run_id) throw new ConflictError("Authorisation key conflict");
+    if (sameKey) {
+      if (sameKey.run_id !== input.run_id) throw new ConflictError("Authorisation key conflict");
       return "replay";
     }
+    if (this.exceptionalCorrectionAuthorisations.some((item) => item.run_id === input.run_id))
+      throw new ConflictError("The run already has an exceptional authorisation.");
     const run = this.requireRun(input.run_id);
     const documentVersionId = run.draft?.version.id;
     const rerunKey = documentVersionId ? `${input.run_id}:${documentVersionId}` : "";
@@ -2003,7 +2408,27 @@ export class InMemoryMilestoneRepository
         finding.step === "automated_checks_rerun" &&
         finding.severity === "blocker",
     );
-    const bindings = run.draft ? bindExceptionalBlockers(run.draft.draft, exactBlockers) : null;
+    const bindings = run.draft
+      ? bindExceptionalBlockers(
+          run.draft.draft,
+          run.handoff.primary_keyword,
+          exactBlockers,
+          revisionBindingExclusions({
+            document: run.draft.draft,
+            // Same exclusions execution will apply, so authorisation can never
+            // record authority over rejected prose.
+            rejectedLocations: this.findings.flatMap((finding) =>
+              finding.run_id === input.run_id &&
+              finding.document_version_id === documentVersionId &&
+              this.dispositions.find(
+                (item) => item.finding_id === finding.id && item.decision === "rejected",
+              )
+                ? [finding.location]
+                : [],
+            ),
+          }),
+        )
+      : null;
     if (
       !input.explicit_confirmation ||
       run.status !== "blocked" ||
@@ -2077,6 +2502,17 @@ export class InMemoryMilestoneRepository
     const coherenceBlockers = currentFindings.filter(
       (item) => item.step === "final_coherence_export" && item.severity === "blocker",
     ).length;
+    const draftOperationStatus = [...this.outputKeys.entries()].find(
+      ([key, value]) => key.startsWith("draft-state:") && value.includes(`\"run_id\":\"${runId}\"`),
+    );
+    const draftRecovery =
+      run.status === "retryable_failed" && run.currentStep === "draft" && !current
+        ? draftOperationStatus
+          ? this.outputKeys.get(`${draftOperationStatus[0]}:status`) === "provider_in_flight"
+            ? ("ambiguous_technical_review" as const)
+            : ("none" as const)
+          : ("legacy_confirmation_required" as const)
+        : ("none" as const);
     return RunDetailSchema.parse({
       run_id: runId,
       status: run.status,
@@ -2116,7 +2552,7 @@ export class InMemoryMilestoneRepository
       // externally-triggered steps and needs the operator to trigger the next
       // one explicitly.
       can_retry:
-        run.status === "retryable_failed" ||
+        (run.status === "retryable_failed" && draftRecovery !== "ambiguous_technical_review") ||
         run.status === "running" ||
         // A run waiting at 1.9 with its dispositions recorded (step succeeded)
         // is resting between externally-triggered steps, ready to continue.
@@ -2124,6 +2560,7 @@ export class InMemoryMilestoneRepository
           run.steps.some(
             (candidate) => candidate.step === "findings_review" && candidate.status === "succeeded",
           )),
+      draft_recovery: draftRecovery,
       blocked_for_operator: run.status === "blocked",
       can_recover_deterministic_block:
         run.status === "blocked" &&
@@ -2194,6 +2631,279 @@ export class InMemoryMilestoneRepository
     const run = this.requireRun(runId);
     return { status: run.status, current_step: run.currentStep };
   }
+  async enqueueRun(runId: string, options: QueueOptions = {}): Promise<void> {
+    const run = this.requireRun(runId);
+    if (["succeeded", "cancelled", "waiting", "blocked"].includes(run.status))
+      throw new ConflictError("This run is not queueable in its current state.");
+    const parsed = QueueOptionsSchema.parse(options);
+    const legacyReview =
+      run.status === "retryable_failed" &&
+      [
+        "review_writing_style",
+        "review_information_gain",
+        "review_fact_checking",
+        "review_link_conversion",
+      ].includes(run.currentStep ?? "");
+    if (legacyReview && parsed.authorise_legacy_review_recovery !== true)
+      throw new ConflictError(
+        "This historical review failure requires explicit operator recovery authorisation.",
+      );
+    const active = this.queueJobs.find(
+      (job) => job.run_id === runId && !["completed", "cancelled"].includes(job.state),
+    );
+    if (active) {
+      if (["ready", "leased", "retry_wait"].includes(active.state)) {
+        const signal = Object.fromEntries(
+          Object.entries(parsed).filter(([, value]) => value),
+        ) as QueueOptions;
+        if (!Object.keys(signal).length) return;
+        const currentAuthority = Object.values(active.options).some(Boolean);
+        const pendingAuthority =
+          active.pendingRefresh || Object.keys(active.pendingOptions).length > 0;
+        const sameRefresh =
+          signal.refresh_link_discovery &&
+          (active.pendingRefresh || active.options.refresh_link_discovery === true);
+        const sameRecovery =
+          !signal.refresh_link_discovery &&
+          Object.keys(signal).every(
+            (key) =>
+              active.pendingOptions[key as keyof QueueOptions] ||
+              active.options[key as keyof QueueOptions],
+          );
+        if ((currentAuthority || pendingAuthority) && !sameRefresh && !sameRecovery)
+          throw new ConflictError("Queue authorities must be requested separately.");
+        if (signal.refresh_link_discovery) {
+          if (active.phase === "downstream_started")
+            throw new ConflictError(
+              "Link refresh cannot be accepted after paid downstream processing has started.",
+            );
+          active.pendingRefresh = true;
+        } else active.pendingOptions = signal;
+        return;
+      }
+      if (legacyReview && active.state !== "operator_action")
+        throw new ConflictError("Historical review recovery is not available for this queue job.");
+      Object.assign(active, {
+        state: "ready",
+        attempt: 0,
+        phase: "pre_downstream",
+        availableAt: this.now(),
+        options: parsed,
+        pendingRefresh: false,
+        resumeAfterRefresh: false,
+        pendingOptions: {},
+      });
+      delete active.error;
+      return;
+    }
+    this.queueJobs.push({
+      id: stableId("queue-job", runId, String(this.queueJobs.length)),
+      run_id: runId,
+      state: "ready",
+      attempt: 0,
+      phase: "pre_downstream",
+      availableAt: this.now(),
+      token: null,
+      expiresAt: null,
+      options: parsed,
+      pendingRefresh: false,
+      resumeAfterRefresh: false,
+      pendingOptions: {},
+    });
+  }
+
+  async claimQueueJob(_owner: string, leaseMs: number): Promise<QueueLease | null> {
+    const job = this.queueJobs
+      .filter((candidate) => {
+        const status = this.requireRun(candidate.run_id).status;
+        const refreshOnly =
+          candidate.options.refresh_link_discovery === true &&
+          Object.keys(candidate.options).length === 1;
+        if (
+          status === "cancelled" ||
+          (["waiting", "blocked", "succeeded"].includes(status) && !refreshOnly)
+        )
+          return false;
+        return (
+          candidate.state === "ready" ||
+          (candidate.state === "retry_wait" && candidate.availableAt <= this.now()) ||
+          (candidate.state === "leased" && candidate.expiresAt! <= this.now())
+        );
+      })
+      .sort((a, b) => a.availableAt - b.availableAt)[0];
+    if (!job) return null;
+    if (job.attempt >= 3) {
+      job.state = "operator_action";
+      job.token = null;
+      job.expiresAt = null;
+      return null;
+    }
+    job.state = "leased";
+    job.attempt += 1;
+    job.token = randomUUID();
+    job.expiresAt = this.now() + leaseMs;
+    return {
+      id: job.id,
+      run_id: job.run_id,
+      token: job.token,
+      attempt: job.attempt,
+      phase: job.phase,
+      options: job.options,
+    };
+  }
+
+  async heartbeatQueueJob(jobId: string, token: string, leaseMs: number): Promise<boolean> {
+    const job = this.queueJobs.find((candidate) => candidate.id === jobId);
+    if (!job || job.state !== "leased" || job.token !== token || job.expiresAt! <= this.now())
+      return false;
+    job.expiresAt = this.now() + leaseMs;
+    return true;
+  }
+
+  async closeRefreshWindow(
+    jobId: string,
+    token: string,
+  ): Promise<"refresh_promoted" | "downstream_started" | null> {
+    const job = this.queueJobs.find((candidate) => candidate.id === jobId);
+    if (!job || job.state !== "leased" || job.token !== token || job.expiresAt! <= this.now())
+      return null;
+    if (job.pendingRefresh) {
+      job.state = "ready";
+      job.options = { refresh_link_discovery: true };
+      job.pendingRefresh = false;
+      job.resumeAfterRefresh = true;
+      job.attempt = 0;
+      job.phase = "pre_downstream";
+      job.availableAt = this.now();
+      job.token = null;
+      job.expiresAt = null;
+      delete job.error;
+      return "refresh_promoted";
+    }
+    job.phase = "downstream_started";
+    return "downstream_started";
+  }
+
+  async finishQueueJob(
+    jobId: string,
+    token: string,
+    state: "parked" | "operator_action" | "completed" | "cancelled",
+    errorCode?: string,
+  ): Promise<boolean> {
+    const job = this.queueJobs.find((candidate) => candidate.id === jobId);
+    if (!job || job.state !== "leased" || job.token !== token || job.expiresAt! <= this.now())
+      return false;
+    if (state !== "cancelled" && job.resumeAfterRefresh) {
+      job.state = "ready";
+      job.options = {};
+      job.resumeAfterRefresh = false;
+      job.phase = "pre_downstream";
+      job.attempt = 0;
+      job.availableAt = this.now();
+      delete job.error;
+    } else if (
+      state !== "cancelled" &&
+      (job.pendingRefresh || Object.keys(job.pendingOptions).length)
+    ) {
+      job.state = "ready";
+      job.options = job.pendingRefresh ? { refresh_link_discovery: true } : job.pendingOptions;
+      job.phase = "pre_downstream";
+      job.pendingRefresh = false;
+      job.pendingOptions = {};
+      job.attempt = 0;
+      job.availableAt = this.now();
+      delete job.error;
+    } else {
+      job.state = state;
+      if (errorCode === undefined) delete job.error;
+      else job.error = errorCode;
+    }
+    job.token = null;
+    job.expiresAt = null;
+    return true;
+  }
+
+  async deferQueueJob(jobId: string, token: string, delayMs: number): Promise<boolean> {
+    const job = this.queueJobs.find((candidate) => candidate.id === jobId);
+    if (!job || job.state !== "leased" || job.token !== token || job.expiresAt! <= this.now())
+      return false;
+    job.state = "retry_wait";
+    job.attempt = Math.max(0, job.attempt - 1);
+    job.availableAt = this.now() + delayMs;
+    job.token = null;
+    job.expiresAt = null;
+    job.error = "step_lease_coordination_wait";
+    return true;
+  }
+
+  async retryQueueJob(
+    jobId: string,
+    token: string,
+    delayMs: number,
+    errorCode: string,
+  ): Promise<boolean> {
+    const job = this.queueJobs.find((candidate) => candidate.id === jobId);
+    if (!job || job.state !== "leased" || job.token !== token || job.expiresAt! <= this.now())
+      return false;
+    job.state = job.attempt < 3 ? "retry_wait" : "operator_action";
+    job.availableAt = this.now() + delayMs;
+    job.token = null;
+    job.expiresAt = null;
+    job.error = errorCode;
+    return true;
+  }
+
+  async recoverQueueJobs(): Promise<void> {
+    for (const job of this.queueJobs) {
+      const status = this.requireRun(job.run_id).status;
+      if (status === "cancelled") {
+        job.state = "cancelled";
+        job.token = null;
+        job.expiresAt = null;
+      } else if (
+        ["waiting", "blocked", "succeeded"].includes(status) &&
+        job.options.refresh_link_discovery === true &&
+        Object.keys(job.options).length === 1
+      ) {
+        // A previously promoted dedicated refresh remains claimable across startup.
+      } else if (["waiting", "blocked", "succeeded"].includes(status) && job.pendingRefresh) {
+        job.state = "ready";
+        job.options = { refresh_link_discovery: true };
+        job.phase = "pre_downstream";
+        job.pendingRefresh = false;
+        job.attempt = 0;
+        job.availableAt = this.now();
+        job.token = null;
+        job.expiresAt = null;
+      } else if (["waiting", "blocked", "succeeded"].includes(status)) {
+        job.state = status === "succeeded" ? "completed" : "parked";
+        job.token = null;
+        job.expiresAt = null;
+      } else if (job.state === "leased" && job.expiresAt! <= this.now()) {
+        job.state = job.attempt < 3 ? "ready" : "operator_action";
+        job.token = null;
+        job.expiresAt = null;
+      }
+    }
+  }
+
+  async queueExecutionState(runId: string) {
+    const run = this.requireRun(runId);
+    const ambiguous = [...this.outputKeys.entries()].some(
+      ([key, value]) => key.includes(runId) && value === "provider_in_flight",
+    );
+    const coordination_wait = run.steps.some(
+      (step) => step.status === "running" && step.expiresAt !== null && step.expiresAt > this.now(),
+    );
+    return { run_status: run.status, current_step: run.currentStep, ambiguous, coordination_wait };
+  }
+
+  async hasActiveQueueJob(runId: string): Promise<boolean> {
+    return this.queueJobs.some(
+      (job) => job.run_id === runId && ["ready", "leased", "retry_wait"].includes(job.state),
+    );
+  }
+
   private requireRun(id: string): RunState {
     const run = this.runs.get(id);
     if (!run) throw new NotFoundError("The run was not found.");

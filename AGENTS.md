@@ -2,16 +2,20 @@
 
 ## Source of truth
 
-Implement the standalone Mobelaris SEO content production web app in this repository.
+Build and harden the current standalone Mobelaris SEO Content Generator in this repository. The primary goal is a smooth, production-ready product.
 Use these sources in order:
 
 1. The current Xevy task requirements. Never rewrite or weaken them.
-2. Recorded Xevy decisions for the current task.
-3. Approved plan specs for the current task.
-4. Active task notes: UI/UX Flow, QA Notes and Technical Review Instructions.
-5. `.xevy/design.md` for frontend design decisions.
+2. Newer recorded Xevy decisions, with explicit supersession taking precedence over older decisions.
+3. Approved or locked Xevy plan specs and active task notes that still describe the current product, especially Step 1.10–1.12 contracts, UI/UX Flow, QA Notes and Technical Review Instructions.
+4. The current application behaviour and source code, constrained by current safety invariants.
+5. `docs/current-product-production-readiness.md`, this guide and the current step documents under `docs/`.
+6. `.xevy/design.md` for frontend design decisions.
+7. The original MM03-01 task and early plans as historical context only for requirements the current product retains.
 
-When sources appear to conflict, stop and resolve the conflict in Xevy rather than guessing.
+Do not restore obsolete flows or integrations solely because they appear in the original task. When current sources conflict, prefer the newer explicit decision and current product contract. If a conflict changes product scope or safety and cannot be resolved from those sources, stop and resolve it in Xevy rather than guessing. If Xevy is unavailable, use checked-in current contracts, disclose the limitation and stop only when correctness depends on the unresolved conflict.
+
+Production-readiness reviews must distinguish a working happy path from smooth UX, crash/retry safety and deployable operation. Report concrete evidence, risk, exact fix location and priority; do not grade the product against superseded historical prose.
 
 ## Product invariants
 
@@ -19,13 +23,16 @@ When sources appear to conflict, stop and resolve the conflict in Xevy rather th
 - The canonical steps and order are defined in `src/shared/pipeline.ts`.
 - Deterministic checks run before probabilistic/model reviews.
 - Reviews return structured findings only; they never rewrite prose.
-- Step 1.10 applies accepted findings in one controlled revision operation.
+- Step 1.10 applies accepted findings in one controlled revision operation. Exact edit authority, immutable audits and provider checkpoints must remain narrow and traceable.
+- Step 1.11 reruns the frozen deterministic checker. A Step 1.11 execution marked `succeeded` means the checker completed; it does not mean the article passed. A clean result clears obsolete deterministic block state and advances to Step 1.12. Remaining blockers enter at most two automatic controlled repair cycles, then block for one operator-authorised targeted correction.
 - Step 1.12 may return blockers to revision for at most two coherence cycles, then blocks for operator action.
-- Findings review is the only normal human interruption and must support bulk acceptance.
+- Findings review is the only normal human interruption and must support bulk acceptance. The one-time exceptional Step 1.11 correction is a safety fallback, not a second normal findings review.
+- Step 1.9 is never reopened by deterministic or coherence recovery. There is no unrestricted rewrite and no repair-budget reset.
+- Deterministic or coherence blockers always prevent export. Google Docs receives only the exact current document that passed the Step 1.11 gate.
 - Reference documents, mappings, artefacts and document versions are versioned and traceable.
 - Every factual figure needs provenance. Unresolved claims remain `unverified`.
 - Provenance and designer-attribution claims are always hard flagged.
-- Product verification uses Medusa first and storefront/Tina only as fallback.
+- Product verification uses credential-free public Mobelaris storefront evidence discovered from the public sitemap. Unsupported claims remain `unverified`; Medusa and paid evidence gateways are not active dependencies.
 - The handoff includes optional `client_insights`; a SERP composition mismatch warns but does not block.
 - Export targets Google Docs through an in-app Google OAuth connection and must be idempotent.
 
@@ -39,13 +46,13 @@ When sources appear to conflict, stop and resolve the conflict in Xevy rather th
 - The workflow ends at Google Docs export; publishing and translation are out of scope.
 - Customer, lead and order data are out of scope.
 
-## Local-only boundary
+## Worktree and deployment boundary
 
-Until separate written approval:
+For the current isolated MM03-01 development flow:
 
-- Work only in this repository and its dedicated task worktrees.
-- Do not configure production deployment or choose a production runtime.
-- Do not create a remote repository or add a Git remote. Push only to an existing remote from a dedicated task branch.
+- Work only in this repository and its dedicated task worktrees. Verify the Git root and branch before editing, and follow any newer session task lock.
+- Repository hosting configuration for `content-generator.vyte.dev` has separate approval, but implementation work does not authorise a deploy. Do not deploy, rebuild production or change production configuration without explicit approval.
+- Do not create a remote repository or add or modify a Git remote. Commit and push only from a dedicated task branch under the Git workflow rules below; never push directly to a protected branch.
 - Do not use production credentials.
 - Do not modify or import source from reference repositories.
 - Reference repositories may be read only for patterns, never for secrets.
@@ -71,6 +78,31 @@ Until separate written approval:
 - Before posting an automated Plane milestone comment, check whether an equivalent update already exists and avoid duplicate comments.
 - If a Plane status or comment update fails, do not report or imply that synchronisation succeeded. Surface the failure clearly and retry only when it is safe to do so.
 - Never close, complete, cancel or otherwise move a Plane task out of `In Progress` automatically. Do not set `PR Subitted`, `PR Review`, `Testing on Live`, `Done` or `Cancelled` unless the user explicitly instructs it. Pushing code alone never means the task is complete.
+
+## Step 1.10–1.12 correction status
+
+### Current verified behaviour
+
+- Step 1.10 checkpoints provider output before controlled application and persists only authorised structural changes.
+- Step 1.11 uses the frozen Step 1.4 manifest, advances a zero-blocker document to `final_coherence_export`, and blocks safely after the two-cycle repair cap.
+- The UI describes a completed Step 1.11 with remaining blockers as “Blocked after 1.11”, while its history remains `Succeeded`.
+- Step 1.12 and Google Docs export remain exact-document and zero-blocker gated.
+
+### Step 1.10 correction behaviour now implemented
+
+- The complete Step 1.10 candidate is evaluated with the same frozen checker Step 1.11 uses, after controlled application and before `saveRevision()`.
+- A correction stays `applied` only when its target blocker is provably resolved and ownership is exact. Ineffective and blocker-introducing edits are reverted, successful independent sibling edits are preserved, and unattributable introduced blockers fail closed to a full reversion.
+- Locationless rules receive only rule-specific, versioned, application-owned bindings, shared by the normal and exceptional routes. `keyword.primary.h2` and `style.readability_grade_8` are bound; no other locationless rule is, and there is no unrestricted `body_markdown` rewrite authority.
+- `style.readability_grade_8` may authorise a bounded set of exact, non-contiguous prose blocks under one immutable audit, issued as application-owned block ids through the unchanged provider contract. The whole-document frozen rule still decides whether those edits persist.
+- Over-length meta descriptions are shortened using the frozen checker's UTF-16 code-unit semantics without splitting surrogate pairs.
+
+### Approved target behaviour not yet implemented
+
+- The exceptional correction is refused up front when any blocker has no safe binding. Rule-specific bindings for the remaining locationless rules are not implemented.
+- An exceptional authorisation freezes the complete readability block set, selector version and target-set identity; execution uses only those ranges and fails closed on any drift. Same-key replay is observational in both repositories and never extends the one-time correction.
+- Coherence has revision-equivalent protection: a durable `provider_in_flight` reservation before dispatch, fail-closed ambiguity on restart, and a narrowly proven release for provably undispatched provider errors.
+
+Do not document these target items as implemented until code and tests prove them.
 
 ## Engineering rules
 
@@ -154,10 +186,11 @@ npm run db:generate
 npm run format:check
 ```
 
-When database invariants change, also apply migrations to disposable local PostgreSQL and run:
+PostgreSQL integration tests are opt-in through `TEST_DATABASE_URL` and must point only to an explicitly disposable local database. Never derive it by reading or copying a deployed `.env`. When database invariants change, also apply migrations to disposable local PostgreSQL and run:
 
 ```bash
-psql "$DATABASE_URL" -v ON_ERROR_STOP=1 -f scripts/test-db-invariants.sql
+TEST_DATABASE_URL=postgresql://LOCAL_USER:LOCAL_PASSWORD@127.0.0.1:LOCAL_PORT/mm0301_test npm test
+psql "$TEST_DATABASE_URL" -v ON_ERROR_STOP=1 -f scripts/test-db-invariants.sql
 ```
 
 Do not claim success without command output. Follow the Git workflow rules above for commits and pushes.

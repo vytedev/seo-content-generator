@@ -8,9 +8,6 @@ import {
   type IngestStore,
   type SerpCompositionProbe,
 } from "../../shared/milestone-two.js";
-import type { MilestoneFourOrchestrator } from "../pipeline/milestone-four.js";
-import type { MilestoneThreeOrchestrator } from "../pipeline/milestone-three.js";
-import type { MilestoneTwoOrchestrator } from "../pipeline/milestone-two.js";
 
 const IdempotencyKeySchema = z
   .string()
@@ -69,9 +66,7 @@ export function createIngestService(
 export function registerIngestRoutes(
   app: Express,
   service: IngestService,
-  milestoneTwo?: MilestoneTwoOrchestrator,
-  milestoneThree?: MilestoneThreeOrchestrator,
-  milestoneFour?: MilestoneFourOrchestrator,
+  testOnlySynchronousContinuation?: (runId: string) => Promise<void>,
 ): void {
   app.post("/api/runs", async (request, response, next) => {
     try {
@@ -89,29 +84,11 @@ export function registerIngestRoutes(
         return;
       }
       const result = await service.ingest(request.body, keyResult.data);
-      // HTTP semantics stay ingest-owned: the ingest (fresh or replay) is already
-      // durably committed, so an orchestrator failure must never change the 201
-      // contract or the IngestResult body. The failure is already persisted by the
-      // orchestrator as retryable_failed at the failing step, so the response stays
-      // redacted here and POST /api/runs/:runId/milestone-two/resume is the
-      // operator's recovery path. Provider and payload details are deliberately
-      // never logged or echoed.
-      if (milestoneTwo) {
+      if (testOnlySynchronousContinuation) {
         try {
-          await milestoneTwo.run(result.run_id);
-          // Step 1.4 runs deterministically after 1.3, so a fresh ingest advances
-          // straight to the 1.9 operator wait. The same swallow-on-failure
-          // contract applies: the failure is persisted at the failing step and
-          // the matching resume route is the recovery path.
-          if (milestoneThree) {
-            await milestoneThree.run(result.run_id);
-            // A zero-finding Step 1.9 completes atomically and continues without
-            // manufacturing a human interruption. A non-empty review set makes
-            // milestone four reject safely because Step 1.9 is still waiting.
-            if (milestoneFour) await milestoneFour.run(result.run_id);
-          }
+          await testOnlySynchronousContinuation(result.run_id);
         } catch {
-          // Swallowed on purpose; see the contract note above.
+          // Test-only compatibility: orchestrators own their durable failure state.
         }
       }
       response.location(`/api/runs/${result.run_id}`).status(201).json(result);

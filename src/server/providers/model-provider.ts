@@ -12,6 +12,12 @@ export interface ModelProviderOptions {
 }
 
 export type ModelProviderFailureContext = "draft" | "review" | "revision" | "coherence";
+export type ModelProviderInvalidOutputReason =
+  | "invalid_envelope"
+  | "empty_content"
+  | "invalid_json"
+  | "schema_validation_failure"
+  | "truncation";
 
 /** Identifies the selected provider/model before a model operation begins. */
 export function logModelProviderOperationStarted(
@@ -28,6 +34,7 @@ export function logModelProviderOutputInvalid(
   context: ModelProviderFailureContext,
   model: string,
   attempts: number,
+  reason: ModelProviderInvalidOutputReason,
 ): void {
   logger.warn("model_provider.output_invalid", {
     provider,
@@ -35,6 +42,7 @@ export function logModelProviderOutputInvalid(
     model,
     attempts,
     category: "structured_output_invalid",
+    reason,
   });
 }
 

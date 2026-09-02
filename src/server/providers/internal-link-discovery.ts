@@ -17,6 +17,7 @@ import {
   type LinkDiscoveryMetadata,
 } from "../../shared/milestone-two.js";
 import { canonicaliseInternalUrl } from "../../shared/internal-link-url.js";
+import { isCanonicalProductRoute } from "../../shared/product-route.js";
 import type {
   DraftLinkVerifier,
   LinkVerificationOutcome,
@@ -906,14 +907,10 @@ function classifyHierarchy(url: URL): z.infer<typeof InternalLinkHierarchySchema
   const path = url.pathname.toLowerCase();
   if (path === "/") return "homepage";
   if (/\/designers?\//.test(path)) return "designer_hub";
-  if (/\/products?\//.test(path)) return "product";
+  if (isCanonicalProductRoute(url)) return "product";
   const segments = path.split("/").filter(Boolean);
   if (segments.includes("collections"))
     return segments.length > 2 ? "sub_collection" : "collection";
-  // Mobelaris publishes products as locale-prefixed flat routes (for example
-  // /en/style-...-chair), rather than below /products/. The locale root itself
-  // remains non-commercial; a second segment is a product in this sitemap shape.
-  if (segments.length === 2 && /^[a-z]{2}(?:-[a-z]{2})?$/.test(segments[0]!)) return "product";
   return "broad_category";
 }
 function isCommercialHierarchy(value: z.infer<typeof InternalLinkHierarchySchema>): boolean {
@@ -1202,24 +1199,34 @@ export class LiveInternalLinkDiscoverer {
       retrievedAt,
     };
     const retrieved = new Date(retrievedAt);
+    const completeOutcome =
+      providerStatus.sitemap === "available" &&
+      (providerStatus.gsc === "available" || providerStatus.gsc === "not_configured") &&
+      merged.counts.verification_omitted_deadline === 0 &&
+      merged.counts.unresolved === 0;
+    const cacheWrite = completeOutcome
+      ? {
+          cache_key: "internal-links:v2" as const,
+          request_hash: requestHash,
+          response_hash: canonicalHash(outcome),
+          provider: "sitemap+gsc",
+          retrieved_at: retrieved.toISOString(),
+          expires_at: new Date(retrieved.getTime() + this.config.cacheTtlMs).toISOString(),
+          payload: outcome,
+          observed_retrieved_at: cached?.retrievedAt.toISOString() ?? null,
+        }
+      : undefined;
     return {
       ...outcome,
       identity,
       cache: {
         state: options.refresh ? "refreshed" : "miss",
         retrieved_at: retrieved.toISOString(),
-        expires_at: new Date(retrieved.getTime() + this.config.cacheTtlMs).toISOString(),
+        expires_at: cacheWrite
+          ? new Date(retrieved.getTime() + this.config.cacheTtlMs).toISOString()
+          : null,
       },
-      cacheWrite: {
-        cache_key: "internal-links:v2",
-        request_hash: requestHash,
-        response_hash: canonicalHash(outcome),
-        provider: "sitemap+gsc",
-        retrieved_at: retrieved.toISOString(),
-        expires_at: new Date(retrieved.getTime() + this.config.cacheTtlMs).toISOString(),
-        payload: outcome,
-        observed_retrieved_at: cached?.retrievedAt.toISOString() ?? null,
-      },
+      ...(cacheWrite ? { cacheWrite } : {}),
     };
   }
 }

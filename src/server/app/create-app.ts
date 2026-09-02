@@ -1,8 +1,13 @@
 import express, { type ErrorRequestHandler, type Express } from "express";
 import { existsSync } from "node:fs";
 import path from "node:path";
-import { ConflictError, NotFoundError, UnprocessableError } from "../../shared/errors.js";
-import { errorFields, logger } from "../logger.js";
+import {
+  ConflictError,
+  NotFoundError,
+  ServiceUnavailableError,
+  UnprocessableError,
+} from "../../shared/errors.js";
+import { classifyError, logger, safeRequestId } from "../logger.js";
 import type { MilestoneThreeRepository } from "../../shared/milestone-three.js";
 import type { MilestoneFourRepository } from "../../shared/milestone-four.js";
 import {
@@ -36,6 +41,19 @@ const AUTH_ALLOWED_ORIGIN_SET = new Set<string>(AUTH_ALLOWED_ORIGINS);
 
 type CheckRunner = (input: CheckerInput) => Finding[];
 
+type FailureClassification = { category: string; reason_code: string; code?: string };
+
+function classifyHttpStatus(status: number): FailureClassification {
+  if (status === 401 || status === 403) return { category: "auth", reason_code: "access_denied" };
+  if (status === 404) return { category: "not_found", reason_code: "resource_not_found" };
+  if (status === 409) return { category: "conflict", reason_code: "state_conflict" };
+  if (status === 413) return { category: "validation", reason_code: "payload_too_large" };
+  if (status === 422) return { category: "validation", reason_code: "unprocessable" };
+  if (status === 429) return { category: "rate_limit", reason_code: "rate_limited" };
+  if (status >= 500) return { category: "server", reason_code: "server_error" };
+  return { category: "request", reason_code: "request_failed" };
+}
+
 export interface CreateAppOptions {
   runChecks?: CheckRunner;
   serveClient?: boolean;
@@ -49,6 +67,10 @@ export interface CreateAppOptions {
   referenceApprovals?: PostgresReferenceApprovalRepository;
   googleOAuth?: GoogleOAuthRoutes;
   modelDiagnostic?: ModelDiagnosticService;
+  queue?: import("../../shared/queue.js").PipelineQueueRepository;
+  workerHealth?: () => { status: "running" | "stopped" | "failed" };
+  /** Test-only compatibility. Production-like composition must supply the durable queue. */
+  testOnlySynchronousPipeline?: boolean;
   /** Explicitly disabled preserves isolated tests; local runtime always supplies enabled auth. */
   auth?: { mode: "disabled" } | ({ mode: "enabled" } & AuthServiceOptions);
 }
@@ -59,6 +81,106 @@ export function createApp(options: CreateAppOptions = {}): Express {
 
   app.disable("x-powered-by");
   const jsonParser = express.json({ limit: JSON_BODY_LIMIT });
+  app.use((request, response, next) => {
+    if (!request.path.startsWith("/api")) return next();
+    const startedAt = Date.now();
+    const requestId = safeRequestId(request.header("X-Request-ID"));
+    // Only known static route vocabulary is logged verbatim; anything else is a
+    // client-chosen value and is reduced to ":value" so paths can never echo
+    // attacker-controlled input into server logs.
+    const KNOWN_SEGMENTS = new Set([
+      "api",
+      "auth",
+      "login",
+      "logout",
+      "session",
+      "calibrations",
+      "reference-proposals",
+      "versions",
+      "report",
+      "results",
+      "resume",
+      "checker",
+      "health",
+      "integrations",
+      "google",
+      "callback",
+      "connect",
+      "status",
+      "model",
+      "diagnostic",
+      "reference-versions",
+      "approval-attestations",
+      "runs",
+      "cancel",
+      "costs",
+      "editorial-correction",
+      "open",
+      "exceptional-correction",
+      "authorise",
+      "export",
+      "retry",
+      "findings",
+      "dispositions",
+      "milestone-two",
+      "milestone-three",
+      "milestone-four",
+    ]);
+    const safePath = request.path
+      .split("/")
+      .map((segment) =>
+        /^(?:[0-9a-f]{8}-[0-9a-f-]{27,}|run_[a-z0-9]{16,64}|(?=[a-z0-9_-]{16,64}$)(?=.*\d)[a-z0-9_-]+)$/i.test(
+          segment,
+        )
+          ? ":id"
+          : segment === ""
+            ? segment
+            : KNOWN_SEGMENTS.has(segment)
+              ? segment
+              : ":value",
+      )
+      .join("/");
+    response.locals.requestId = requestId;
+    response.locals.safePath = safePath;
+    response.setHeader("X-Request-ID", requestId);
+    logger.info("http.request_started", {
+      request_id: requestId,
+      method: request.method,
+      path: safePath,
+    });
+    let terminalLogged = false;
+    response.once("finish", () => {
+      terminalLogged = true;
+      const failed = response.statusCode >= 400;
+      logger[failed ? "warn" : "info"](failed ? "http.request_failed" : "http.request_completed", {
+        request_id: requestId,
+        method: request.method,
+        path: safePath,
+        status: response.statusCode,
+        duration_ms: Date.now() - startedAt,
+        ...(failed
+          ? {
+              ...classifyHttpStatus(response.statusCode),
+              ...(response.locals.failureClassification ?? {}),
+            }
+          : {}),
+      });
+    });
+    response.once("close", () => {
+      if (terminalLogged) return;
+      terminalLogged = true;
+      logger.warn("http.request_aborted", {
+        request_id: requestId,
+        method: request.method,
+        path: safePath,
+        duration_ms: Date.now() - startedAt,
+        category: "request_aborted",
+        reason_code: "request_aborted",
+      });
+    });
+    next();
+  });
+
   if (options.auth?.mode === "enabled") {
     app.use("/api", (request, response, next) => {
       const origin = request.header("origin");
@@ -68,8 +190,9 @@ export function createApp(options: CreateAppOptions = {}): Express {
         response.setHeader("Vary", "Origin");
         response.setHeader(
           "Access-Control-Allow-Headers",
-          "Content-Type, X-CSRF-Token, Idempotency-Key",
+          "Content-Type, X-CSRF-Token, Idempotency-Key, X-Request-ID",
         );
+        response.setHeader("Access-Control-Expose-Headers", "X-Request-ID");
         response.setHeader("Access-Control-Allow-Methods", "GET, HEAD, POST, PUT, PATCH, DELETE");
       }
       if (request.method === "OPTIONS") {
@@ -80,24 +203,13 @@ export function createApp(options: CreateAppOptions = {}): Express {
     });
   }
 
-  // Request log: method, path and duration for every API call. Run IDs and
-  // step IDs appear in the path; request bodies (handoff JSON, dispositions)
-  // are never logged.
-  app.use((request, _response, next) => {
-    const startedAt = Date.now();
-    next();
-    request.on("close", () => {
-      if (request.path.startsWith("/api"))
-        logger.debug("request", {
-          method: request.method,
-          path: request.path,
-          ms: Date.now() - startedAt,
-        });
-    });
-  });
-
   app.get("/api/health", (_request, response) => {
-    response.status(200).json({ status: "ok" });
+    const worker = options.workerHealth?.();
+    if (worker?.status === "failed") {
+      response.status(503).json({ status: "degraded", queue_worker: "failed" });
+      return;
+    }
+    response.status(200).json({ status: "ok", ...(worker ? { queue_worker: worker.status } : {}) });
   });
 
   if (options.auth?.mode === "enabled") {
@@ -119,8 +231,15 @@ export function createApp(options: CreateAppOptions = {}): Express {
     app.use(jsonParser);
   }
 
-  if (options.findingsRepository)
-    registerFindingsRoutes(app, options.findingsRepository, options.milestoneFour?.orchestrator);
+  if (options.findingsRepository) {
+    const testOnlyLegacyContinuation =
+      options.testOnlySynchronousPipeline && !options.queue && options.milestoneFour
+        ? (runId: string) => options.milestoneFour!.orchestrator.run(runId)
+        : undefined;
+    registerFindingsRoutes(app, options.findingsRepository, {
+      ...(testOnlyLegacyContinuation ? { testOnlyLegacyContinuation } : {}),
+    });
+  }
 
   if (options.pipelineUnavailable) registerPipelineUnavailableRoutes(app);
 
@@ -128,19 +247,42 @@ export function createApp(options: CreateAppOptions = {}): Express {
     registerIngestRoutes(
       app,
       options.ingestService,
-      options.milestoneTwo?.orchestrator,
-      options.milestoneThree?.orchestrator,
-      options.milestoneFour?.orchestrator,
+      options.testOnlySynchronousPipeline && options.milestoneTwo
+        ? async (runId) => {
+            await options.milestoneTwo!.orchestrator.run(runId);
+            if (options.milestoneThree) {
+              await options.milestoneThree.orchestrator.run(runId);
+              if (options.milestoneFour) await options.milestoneFour.orchestrator.run(runId);
+            }
+          }
+        : undefined,
     );
   if (options.referenceApprovals) registerReferenceApprovalRoutes(app, options.referenceApprovals);
   registerGoogleOAuthRoutes(app, options.googleOAuth ?? { configured: false });
   registerModelDiagnosticRoutes(app, options.modelDiagnostic);
-  if (options.milestoneTwo || options.milestoneThree || options.milestoneFour)
+  if (options.milestoneTwo || options.milestoneThree || options.milestoneFour) {
+    const testOnlyQueue =
+      !options.queue && options.testOnlySynchronousPipeline
+        ? ({
+            enqueueRun: async (runId: string, queueOptions = {}) => {
+              if (options.milestoneTwo)
+                await options.milestoneTwo.orchestrator.run(runId, "test-only-worker", {
+                  refreshLinkDiscovery: queueOptions.refresh_link_discovery ?? false,
+                  operatorAuthorisedDraftRecovery:
+                    queueOptions.authorise_legacy_draft_recovery ?? false,
+                });
+              if (options.milestoneThree) await options.milestoneThree.orchestrator.run(runId);
+              if (options.milestoneFour) await options.milestoneFour.orchestrator.run(runId);
+            },
+          } as import("../../shared/queue.js").PipelineQueueRepository)
+        : undefined;
     registerRunRoutes(app, {
       milestoneTwo: options.milestoneTwo,
       milestoneThree: options.milestoneThree,
       milestoneFour: options.milestoneFour,
+      queue: options.queue ?? testOnlyQueue,
     });
+  }
 
   if (options.calibration)
     registerCalibrationRoutes(app, options.calibration.service, options.calibration.repository);
@@ -168,8 +310,12 @@ export function createApp(options: CreateAppOptions = {}): Express {
   }
 
   const errorHandler: ErrorRequestHandler = (error, request, response, _next) => {
+    response.locals.failureClassification = classifyError(error);
     if (error instanceof SyntaxError && "body" in error) {
-      logger.warn("request.invalid_json", { method: request.method, path: request.path });
+      logger.warn("request.invalid_json", {
+        method: request.method,
+        path: response.locals.safePath,
+      });
       response.status(400).json({
         error: { code: "INVALID_JSON", message: "The request body must be valid JSON." },
       });
@@ -178,6 +324,10 @@ export function createApp(options: CreateAppOptions = {}): Express {
 
     if (typeof error === "object" && error !== null && "type" in error) {
       if (error.type === "entity.too.large") {
+        response.locals.failureClassification = {
+          category: "validation",
+          reason_code: "payload_too_large",
+        };
         response.status(413).json({
           error: { code: "PAYLOAD_TOO_LARGE", message: "The request body is too large." },
         });
@@ -186,24 +336,37 @@ export function createApp(options: CreateAppOptions = {}): Express {
     }
 
     if (error instanceof NotFoundError) {
-      logger.info("request.not_found", { method: request.method, path: request.path });
+      response.locals.failureClassification = classifyHttpStatus(404);
+      logger.info("request.not_found", { method: request.method, path: response.locals.safePath });
       response.status(404).json({ error: { code: error.code, message: error.message } });
       return;
     }
     if (error instanceof ConflictError) {
+      response.locals.failureClassification = classifyHttpStatus(409);
       // Expected races (cancel vs resume, duplicate disposition) — informational.
       logger.info("request.conflict", {
         method: request.method,
-        path: request.path,
+        path: response.locals.safePath,
         code: error.code,
       });
       response.status(409).json({ error: { code: error.code, message: error.message } });
       return;
     }
+    if (error instanceof ServiceUnavailableError) {
+      response.locals.failureClassification = classifyHttpStatus(503);
+      logger.warn("request.service_unavailable", {
+        method: request.method,
+        path: response.locals.safePath,
+        code: error.code,
+      });
+      response.status(503).json({ error: { code: error.code, message: error.message } });
+      return;
+    }
     if (error instanceof UnprocessableError) {
+      response.locals.failureClassification = classifyHttpStatus(422);
       logger.warn("request.unprocessable", {
         method: request.method,
-        path: request.path,
+        path: response.locals.safePath,
         code: error.code,
         message: error.message.slice(0, 200),
       });
@@ -212,9 +375,10 @@ export function createApp(options: CreateAppOptions = {}): Express {
     }
 
     logger.error("request.internal_error", {
+      request_id: response.locals.requestId,
       method: request.method,
-      path: request.path,
-      ...errorFields(error),
+      path: response.locals.safePath,
+      ...classifyError(error),
     });
 
     response.status(500).json({

@@ -43,6 +43,10 @@ import { createIngestService } from "../routes/ingest-routes.js";
 import { PostgresReferenceApprovalRepository } from "../repositories/reference-approval-repository.js";
 import { authConfigFromEnv } from "../auth/config.js";
 import { PostgresSessionStore } from "../auth/session-store.js";
+import { LOCAL_FRONTEND_ORIGIN } from "../../shared/local-runtime.js";
+import { PipelineQueueWorker } from "../pipeline/queue-worker.js";
+import { closePoolWithin, type ShutdownResult } from "../shutdown.js";
+import { classifyError, logger } from "../logger.js";
 import {
   GscSearchAnalyticsClient,
   SitemapClient,
@@ -65,7 +69,8 @@ export interface LocalServicesConfig {
 
 export function createLocalServices(config: LocalServicesConfig): {
   appOptions: CreateAppOptions;
-  close(): Promise<void>;
+  ready: Promise<void>;
+  close(deadlineMs?: number): Promise<ShutdownResult>;
 } {
   // Validate any attempted Google configuration even when the database is unavailable;
   // only a wholly absent configuration is allowed to select credential-free behaviour.
@@ -87,7 +92,8 @@ export function createLocalServices(config: LocalServicesConfig): {
       throw new Error("Local PostgreSQL is required for operator authentication");
     return {
       appOptions: { pipelineUnavailable: true, auth: { mode: "disabled" } },
-      close: async () => undefined,
+      ready: Promise.resolve(),
+      close: async () => "closed",
     };
   }
   if (config.authMode !== "disabled-test" && !authConfig) {
@@ -126,7 +132,7 @@ export function createLocalServices(config: LocalServicesConfig): {
   const googleClientOrigin =
     process.env.npm_lifecycle_event === "start" || process.env.CONTAINER_DEV === "true"
       ? ""
-      : "http://127.0.0.1:5173";
+      : LOCAL_FRONTEND_ORIGIN;
   const referenceApprovals = new PostgresReferenceApprovalRepository(pool);
   const calibrationRepository = new PostgresCalibrationRepository(pool);
   const calibrationRetriever = new CachedPublicPageRetriever(
@@ -207,6 +213,29 @@ export function createLocalServices(config: LocalServicesConfig): {
       : new MockCoherenceProvider("local-no-network"),
     new PostgresGoogleDocsExportService(pool, googleDocsAdapter),
   );
+  const queueWorker = new PipelineQueueWorker(
+    repository,
+    {
+      milestoneTwo,
+      milestoneThree,
+      milestoneFour: orchestrator,
+    },
+    undefined,
+    undefined,
+    undefined,
+    undefined,
+    undefined,
+    (error) => {
+      logger.error("local_services.queue_worker_failed", {
+        worker_status: "failed",
+        ...classifyError(error),
+      });
+    },
+  );
+  const ready = queueWorker.start();
+  // Mark the promise observed for compositions that only inspect providers in tests; the same
+  // rejecting promise is still returned and production awaits it before opening readiness.
+  void ready.catch(() => undefined);
   return {
     appOptions: {
       auth:
@@ -220,6 +249,8 @@ export function createLocalServices(config: LocalServicesConfig): {
                 process.env.NODE_ENV === "production" || process.env.CONTAINER_DEV === "true",
             },
       findingsRepository: repository,
+      queue: repository,
+      workerHealth: () => queueWorker.health(),
       modelDiagnostic,
       googleOAuth: {
         configured: Boolean(googleConfig),
@@ -238,11 +269,22 @@ export function createLocalServices(config: LocalServicesConfig): {
       milestoneFour: { repository, orchestrator },
       calibration: { repository: calibrationRepository, service: calibrationService },
     },
-    close: () => pool.end(),
+    ready,
+    close: async (deadlineMs = 10_000) => {
+      if (!Number.isSafeInteger(deadlineMs) || deadlineMs < 0)
+        throw new Error("Service shutdown deadline must be a non-negative integer");
+      const expiresAt = Date.now() + deadlineMs;
+      const worker = await queueWorker.stop(Math.max(0, expiresAt - Date.now()));
+      if (worker === "deadline_exceeded" || Date.now() >= expiresAt) return "deadline_exceeded";
+      // pg does not provide a safe cancellation primitive for checked-out client work. Bound
+      // end(); if it misses the deadline its sockets/timers are unref'd so the process can exit
+      // while the durable queue lease expires naturally.
+      return closePoolWithin(pool, Math.max(0, expiresAt - Date.now()));
+    },
   };
 }
 
 export function createLocalApp(config: LocalServicesConfig) {
   const services = createLocalServices(config);
-  return { app: createApp(services.appOptions), close: services.close };
+  return { app: createApp(services.appOptions), ready: services.ready, close: services.close };
 }

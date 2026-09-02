@@ -1,6 +1,6 @@
 import { createHash } from "node:crypto";
 import pg from "pg";
-import { afterAll, beforeEach, describe, expect, it } from "vitest";
+import { afterAll, beforeEach, describe, expect, it, vi } from "vitest";
 import {
   DEFAULT_BLOG_SCHEMA_TEMPLATE,
   DEFAULT_WRITER_TEMPLATE,
@@ -31,6 +31,7 @@ async function seedPassingFinalGate(
   documentVersionId: string,
   artifactId: string,
   finalExecutionId: string,
+  coherenceBlocker = false,
 ) {
   const context = (
     await pool!.query<any>(
@@ -136,8 +137,10 @@ async function seedPassingFinalGate(
   const response = { findings: [], usage: { input_units: 0, output_units: 0, cost_micros: 0 } };
   const request = { fixture: true };
   await pool!.query(
-    `insert into coherence_checkpoints(operation_id,run_id,document_version_id,producing_step_execution_id,request_hash,response,response_hash,checkpointed_at)
-     values($1,$2,$3,$4,$5,$6::jsonb,$7,clock_timestamp())`,
+    // A seeded row that already carries a response is by definition
+    // checkpointed; the response-pair invariant now requires that to be stated.
+    `insert into coherence_checkpoints(operation_id,run_id,document_version_id,producing_step_execution_id,request_hash,response,response_hash,status,checkpointed_at)
+     values($1,$2,$3,$4,$5,$6::jsonb,$7,'checkpointed',clock_timestamp())`,
     [
       `gate:${runId}`,
       runId,
@@ -153,6 +156,12 @@ async function seedPassingFinalGate(
      values($1,$2,$3,$4,'final_coherence_export',$5)`,
     [`gate:${runId}`, runId, documentVersionId, finalExecutionId, canonicalHash(response)],
   );
+  if (coherenceBlocker)
+    await pool!.query(
+      `insert into findings(run_id,document_version_id,step_execution_id,stable_key,category,rule_reference,severity,location,issue,suggested_fix)
+       values($1,$2,$3,'coherence:test-blocker','grammar','coherence.grammar','blocker','{"field":"markdown","line_start":1}'::jsonb,'Persisted blocker','Correct it')`,
+      [runId, documentVersionId, finalExecutionId],
+    );
 }
 
 const handoff = {
@@ -219,6 +228,45 @@ integration("PostgreSQL milestone two contracts", () => {
     expect(
       (await pool!.query("select status,current_step from runs where id=$1", [run.run_id])).rows[0],
     ).toEqual({ status: "running", current_step: "automated_checks" });
+  });
+
+  it("fails closed on a durable in-flight draft reservation and never dispatches twice", async () => {
+    const repository = new PostgresMilestoneRepository(pool!);
+    const run = await ingestHandoff(handoff, "draft-in-flight-crash", repository);
+    const provider = new MockDraftProvider("mock-v1");
+    const first = new MilestoneTwoOrchestrator(
+      repository,
+      new MockLinkDiscoverer([
+        {
+          url: "https://www.mobelaris.com/products/chair",
+          title: "Chair",
+          relevance: 1,
+        },
+      ]),
+      provider,
+      {
+        hit: (boundary) => {
+          if (boundary === "after_draft_reservation") throw new Error("crash");
+        },
+      },
+    );
+    await expect(first.run(run.run_id)).rejects.toThrow("crash");
+    expect(provider.calls).toHaveLength(0);
+    const state = await pool!.query(
+      "select status,response,response_hash from draft_operation_states where run_id=$1",
+      [run.run_id],
+    );
+    expect(state.rows).toEqual([
+      { status: "provider_in_flight", response: null, response_hash: null },
+    ]);
+    await expect(
+      new MilestoneTwoOrchestrator(repository, new MockLinkDiscoverer(), provider).run(
+        run.run_id,
+        "resume-worker",
+      ),
+    ).rejects.toThrow("Draft provider outcome is ambiguous");
+    expect(provider.calls).toHaveLength(0);
+    expect(await repository.getDraft(run.run_id)).toBeNull();
   });
 
   it("persistently blocks empty, editorial, unverified and stale discovery before drafting/model spend", async () => {
@@ -548,6 +596,91 @@ integration("PostgreSQL milestone two contracts", () => {
     expect(counts).toEqual({ cache: 1, artefact: 1, metadata: 1, candidates: 1 });
   });
 
+  it("atomically fences blocked attempt evidence with its negative cache write", async () => {
+    const repository = new PostgresMilestoneRepository(pool!);
+    const run = await ingestHandoff(handoff, "negative-cache-atomic", repository);
+    const lease = await repository.claimStep(run.run_id, "internal_link_discovery", "worker");
+    const retrieved = "2026-01-01T00:00:00.000Z";
+    const payload = {
+      availability: "available" as const,
+      eligibility: "blocked" as const,
+      reason: "no_candidates" as const,
+      links: [],
+      providerStatus: { sitemap: "available" as const, gsc: "not_configured" as const },
+      counts: {
+        ghost_collected: 0,
+        gsc_collected: 0,
+        deduplicated: 0,
+        commercial: 0,
+        editorial: 0,
+        verification_attempted: 0,
+        direct_200: 0,
+        rejected_non_200: 0,
+        unresolved: 0,
+        shortlisted: 0,
+      },
+    };
+    const metadata = {
+      availability: payload.availability,
+      eligibility: payload.eligibility,
+      reason: payload.reason,
+      providerStatus: payload.providerStatus,
+      counts: payload.counts,
+      cache: {
+        state: "refreshed" as const,
+        retrieved_at: retrieved,
+        expires_at: "2026-01-02T00:00:00.000Z",
+      },
+      identity: {
+        query_hash: "b".repeat(64),
+        config_hash: "c".repeat(64),
+        origin_policy_hash: "d".repeat(64),
+        request_hash: "e".repeat(64),
+      },
+      cacheWrite: {
+        cache_key: "internal-links:v2",
+        request_hash: "e".repeat(64),
+        response_hash: canonicalHash(payload),
+        provider: "sitemap+gsc",
+        retrieved_at: retrieved,
+        expires_at: "2026-01-02T00:00:00.000Z",
+        payload,
+        observed_retrieved_at: null,
+      },
+      bypass: { enabled: false, used: false, reason: null },
+    };
+    await pool!.query(
+      "update step_executions set lease_expires_at=clock_timestamp()-interval '1 second' where id=$1",
+      [lease.execution_id],
+    );
+    await expect(
+      repository.saveLinkDiscoveryEvidence(run.run_id, lease.execution_id, lease.token, metadata),
+    ).rejects.toThrow("fencing");
+    expect(
+      (
+        await pool!.query(
+          "select (select count(*)::int from link_discovery_attempts where run_id=$1) attempts,(select count(*)::int from link_discovery_cache where request_hash=$2) cache",
+          [run.run_id, "e".repeat(64)],
+        )
+      ).rows[0],
+    ).toEqual({ attempts: 0, cache: 0 });
+    const retry = await repository.claimStep(run.run_id, "internal_link_discovery", "worker-2");
+    await repository.saveLinkDiscoveryEvidence(
+      run.run_id,
+      retry.execution_id,
+      retry.token,
+      metadata,
+    );
+    expect(
+      (
+        await pool!.query(
+          "select (select count(*)::int from link_discovery_attempts where run_id=$1) attempts,(select count(*)::int from link_discovery_cache where request_hash=$2) cache",
+          [run.run_id, "e".repeat(64)],
+        )
+      ).rows[0],
+    ).toEqual({ attempts: 1, cache: 1 });
+  });
+
   it("replays SERP warnings and stores raw-byte hashes", async () => {
     const repository = new PostgresMilestoneRepository(pool!);
     const first = await ingestHandoff(handoff, "serp", repository, {
@@ -579,8 +712,7 @@ integration("PostgreSQL milestone two contracts", () => {
         "00000000-0000-0000-0000-000000000000",
         "00000000-0000-0000-0000-000000000000",
         { request_id: "malformed" } as never,
-        "provider",
-        "model",
+        {} as never,
       ),
     ).rejects.toThrow();
     const after = await pool!.query(
@@ -590,56 +722,24 @@ integration("PostgreSQL milestone two contracts", () => {
     expect(after.rows).toEqual(before.rows);
   });
 
-  it("keeps provider request identities run-scoped and rejects conflicting revision one without side effects", async () => {
+  it("keeps provider request identities run-scoped", async () => {
     const repository = new PostgresMilestoneRepository(pool!);
     const provider = new MockDraftProvider("mock-v1");
     const runA = await ingestHandoff(handoff, "a", repository);
     const runB = await ingestHandoff({ ...handoff, plane_ticket: "MOB-PG-2" }, "b", repository);
-    for (const run of [runA, runB]) {
-      const linkLease = await repository.claimStep(run.run_id, "internal_link_discovery", "worker");
-      await repository.saveLinks(run.run_id, linkLease.execution_id, linkLease.token, []);
-      await repository.completeStep(linkLease.execution_id, linkLease.token);
-      expect(
-        (await pool!.query("select current_step from runs where id=$1", [run.run_id])).rows[0],
-      ).toEqual({ current_step: "draft" });
-      const draftLease = await repository.claimStep(run.run_id, "draft", "worker");
-      const response = await provider.generate({
-        handoff: run.handoff,
-        internal_links: [],
-        model: provider.model,
-      });
-      await repository.saveDraft(
+    for (const run of [runA, runB])
+      await new MilestoneTwoOrchestrator(repository, new MockLinkDiscoverer(), provider).run(
         run.run_id,
-        draftLease.execution_id,
-        draftLease.token,
-        response,
-        provider.provider,
-        provider.model,
       );
-      if (run === runA) {
-        const before = await pool!.query(
-          "select (select count(*) from artifacts where run_id=$1) artifacts,(select count(*) from provider_usage where run_id=$1) usage",
-          [run.run_id],
-        );
-        await expect(
-          repository.saveDraft(
-            run.run_id,
-            draftLease.execution_id,
-            draftLease.token,
-            { ...response, draft: { ...response.draft, title: "Changed" } },
-            provider.provider,
-            provider.model,
-          ),
-        ).rejects.toThrow("conflict");
-        const after = await pool!.query(
-          "select (select count(*) from artifacts where run_id=$1) artifacts,(select count(*) from provider_usage where run_id=$1) usage",
-          [run.run_id],
-        );
-        expect(after.rows).toEqual(before.rows);
-      }
-    }
     expect(
       (await pool!.query("select count(*)::int count from provider_usage")).rows[0]?.count,
+    ).toBe(2);
+    expect(
+      (
+        await pool!.query(
+          "select count(distinct operation_id)::int count from draft_operation_states",
+        )
+      ).rows[0]?.count,
     ).toBe(2);
   });
 
@@ -649,17 +749,11 @@ integration("PostgreSQL milestone two contracts", () => {
     const links = await repository.claimStep(run.run_id, "internal_link_discovery", "worker");
     await repository.saveLinks(run.run_id, links.execution_id, links.token, []);
     await repository.completeStep(links.execution_id, links.token);
-    const lease = await repository.claimStep(run.run_id, "draft", "worker");
     const provider = new MockDraftProvider("mock-v1");
-    const saved = await repository.saveDraft(
+    await new MilestoneTwoOrchestrator(repository, new MockLinkDiscoverer(), provider).run(
       run.run_id,
-      lease.execution_id,
-      lease.token,
-      await provider.generate({ handoff, internal_links: [], model: provider.model }),
-      provider.provider,
-      provider.model,
     );
-    await repository.completeStep(lease.execution_id, lease.token);
+    const saved = (await repository.getDraft(run.run_id))!;
     const finalLease = await repository.claimStep(run.run_id, "final_coherence_export", "worker");
     await seedPassingFinalGate(
       run.run_id,
@@ -687,8 +781,8 @@ integration("PostgreSQL milestone two contracts", () => {
     await expect(
       new PostgresGoogleDocsExportService(pool!, new MockGoogleDocsAdapter()).export({
         ...request,
-        step_execution_id: lease.execution_id,
-        fencing_token: lease.token,
+        step_execution_id: saved.artifact.step_execution_id,
+        fencing_token: "00000000-0000-0000-0000-000000000000",
       }),
     ).rejects.toThrow("fencing");
     await expect(
@@ -769,23 +863,60 @@ integration("PostgreSQL milestone two contracts", () => {
     ).rejects.toThrow("append-only");
   });
 
+  it("refuses direct export when the exact current document has a persisted coherence blocker", async () => {
+    const repository = new PostgresMilestoneRepository(pool!);
+    const run = await ingestHandoff(handoff, "blocked-direct-export", repository);
+    const links = await repository.claimStep(run.run_id, "internal_link_discovery", "worker");
+    await repository.saveLinks(run.run_id, links.execution_id, links.token, []);
+    await repository.completeStep(links.execution_id, links.token);
+    await new MilestoneTwoOrchestrator(
+      repository,
+      new MockLinkDiscoverer(),
+      new MockDraftProvider("mock-v1"),
+    ).run(run.run_id);
+    const saved = (await repository.getDraft(run.run_id))!;
+    const finalLease = await repository.claimStep(run.run_id, "final_coherence_export", "worker");
+    await seedPassingFinalGate(
+      run.run_id,
+      saved.version.id,
+      saved.artifact.id,
+      finalLease.execution_id,
+      true,
+    );
+    const renderInput = {
+      plane_ticket: handoff.plane_ticket,
+      draft: saved.draft,
+      writer_template: DEFAULT_WRITER_TEMPLATE,
+      schema_template: DEFAULT_BLOG_SCHEMA_TEMPLATE,
+    };
+    const adapter = new MockGoogleDocsAdapter();
+    const exportSpy = vi.spyOn(adapter, "export");
+
+    await expect(
+      new PostgresGoogleDocsExportService(pool!, adapter).export({
+        run_id: run.run_id,
+        step_execution_id: finalLease.execution_id,
+        fencing_token: finalLease.token,
+        document_version_id: saved.version.id,
+        idempotency_key: "blocked-direct-export",
+        render_input: renderInput,
+        rendered: renderExport(renderInput),
+      }),
+    ).rejects.toThrow("Final blocker gate");
+    expect(exportSpy).not.toHaveBeenCalled();
+  });
+
   it("canonicalises concurrent export keys to one provider call", async () => {
     const repository = new PostgresMilestoneRepository(pool!);
     const run = await ingestHandoff(handoff, "concurrent-export", repository);
     const links = await repository.claimStep(run.run_id, "internal_link_discovery", "worker");
     await repository.saveLinks(run.run_id, links.execution_id, links.token, []);
     await repository.completeStep(links.execution_id, links.token);
-    const draftLease = await repository.claimStep(run.run_id, "draft", "worker");
     const provider = new MockDraftProvider("mock-v1");
-    const saved = await repository.saveDraft(
+    await new MilestoneTwoOrchestrator(repository, new MockLinkDiscoverer(), provider).run(
       run.run_id,
-      draftLease.execution_id,
-      draftLease.token,
-      await provider.generate({ handoff, internal_links: [], model: provider.model }),
-      provider.provider,
-      provider.model,
     );
-    await repository.completeStep(draftLease.execution_id, draftLease.token);
+    const saved = (await repository.getDraft(run.run_id))!;
     const finalLease = await repository.claimStep(run.run_id, "final_coherence_export", "worker");
     await seedPassingFinalGate(
       run.run_id,
@@ -831,17 +962,11 @@ integration("PostgreSQL milestone two contracts", () => {
     const links = await repository.claimStep(run.run_id, "internal_link_discovery", "worker");
     await repository.saveLinks(run.run_id, links.execution_id, links.token, []);
     await repository.completeStep(links.execution_id, links.token);
-    const lease = await repository.claimStep(run.run_id, "draft", "worker");
     const provider = new MockDraftProvider("mock-v1");
-    const saved = await repository.saveDraft(
+    await new MilestoneTwoOrchestrator(repository, new MockLinkDiscoverer(), provider).run(
       run.run_id,
-      lease.execution_id,
-      lease.token,
-      await provider.generate({ handoff, internal_links: [], model: provider.model }),
-      provider.provider,
-      provider.model,
     );
-    await repository.completeStep(lease.execution_id, lease.token);
+    const saved = (await repository.getDraft(run.run_id))!;
 
     const currentDetail = await repository.getRunDetail(run.run_id);
     expect(currentDetail.current_document?.legacy_derived_fields ?? []).toEqual([]);
@@ -861,7 +986,7 @@ integration("PostgreSQL milestone two contracts", () => {
          values(gen_random_uuid(),$1,$2,$3,'draft','application/json',$4,$5,$6) returning id`,
         [
           run.run_id,
-          lease.execution_id,
+          saved.artifact.step_execution_id,
           saved.artifact.id,
           legacyBody,
           createHash("sha256").update(legacyBody).digest("hex"),
@@ -901,7 +1026,7 @@ integration("PostgreSQL milestone two contracts", () => {
          values(gen_random_uuid(),$1,$2,$3,'draft','application/json',$4,$5,$6) returning id`,
         [
           run.run_id,
-          lease.execution_id,
+          saved.artifact.step_execution_id,
           legacyArtifact,
           intermediateBody,
           createHash("sha256").update(intermediateBody).digest("hex"),

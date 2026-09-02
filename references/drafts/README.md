@@ -1,6 +1,6 @@
-# MM03-01 Task-Derived Reference Drafts
+# MM03-01 Reference Drafts
 
-All files in this directory are derived only from the original MM03-01 task, recorded decisions, active task notes and plan MM03-01-S1.
+These files began as task-derived drafts and are retained as versioned editorial inputs for the current SEO Content Generator. The current product and newer approved decisions govern runtime behaviour; wording here must not silently restore a superseded historical flow.
 
 They are **pending editorial approval**. A local operator may record an immutable, pending/unverified claim that an external reviewer approved a version, but that record cannot activate it. Production activation requires a separate trusted verification event; no unauthenticated API can create one. Version 1 may remain active only as the tightly constrained provisional local baseline.
 

@@ -13,7 +13,7 @@ import {
 const config = {
   clientId: "client-id",
   clientSecret: "client-secret",
-  redirectUri: "http://127.0.0.1:3100/api/integrations/google/callback",
+  redirectUri: "http://127.0.0.1:3110/api/integrations/google/callback",
   encryptionKey: Buffer.alloc(32, 7),
 };
 const scope = GOOGLE_SCOPES.join(" ");
@@ -217,31 +217,75 @@ describe("Google OAuth and Docs providers", () => {
     ).rejects.toThrow("required for this operation");
   });
 
-  it("revokes before tombstoning and retains local credentials on unsafe revoke failure", async () => {
+  it("locally tombstones unreadable credentials without attempting remote revoke", async () => {
+    const client = {
+      query: vi.fn(async (sql: string) => {
+        if (sql.includes("select version,event")) {
+          return {
+            rows: [
+              {
+                version: 1,
+                event: "connected",
+                encrypted_tokens: "unreadable-ciphertext",
+                iv: Buffer.alloc(12).toString("base64"),
+                auth_tag: Buffer.alloc(16).toString("base64"),
+              },
+            ],
+          };
+        }
+        return { rows: [] };
+      }),
+      release: vi.fn(),
+    };
+    const store = new GoogleTokenStore(
+      { connect: vi.fn().mockResolvedValue(client) } as never,
+      config.encryptionKey,
+    );
+    const revoke = vi.fn<typeof fetch>();
+
+    await expect(new GoogleOAuthClient(config, store, revoke).disconnect()).resolves.toBe(
+      "local_only",
+    );
+    expect(revoke).not.toHaveBeenCalled();
+    expect(client.query).toHaveBeenCalledWith("select pg_advisory_lock(hashtextextended($1,0))", [
+      "google_oauth:google",
+    ]);
+    expect(client.query).toHaveBeenCalledWith(
+      "insert into google_oauth_token_versions(provider,event) values('google','disconnected')",
+    );
+  });
+
+  it("tombstones after successful or already-invalid revoke and retains valid credentials on other failures", async () => {
     const tombstoneSerialised = vi.fn().mockResolvedValue(undefined);
+    const current = {
+      accessToken: "access",
+      refreshToken: "refresh",
+      expiresAt: new Date(Date.now() + 60_000),
+      scope,
+      version: 1,
+    };
     const store = {
-      serialised: async (operation: (stored: unknown, client: unknown) => Promise<void>) =>
-        operation(
-          {
-            accessToken: "access",
-            refreshToken: "refresh",
-            expiresAt: new Date(Date.now() + 60_000),
-            scope,
-            version: 1,
-          },
-          {},
-        ),
+      disconnectSerialised: async (
+        operation: (stored: typeof current, client: unknown) => Promise<void>,
+      ) => {
+        await operation(current, {});
+        return "disconnected" as const;
+      },
       tombstoneSerialised,
     } as unknown as GoogleTokenStore;
-    const successfulFetch = vi
-      .fn<typeof fetch>()
-      .mockResolvedValue(new Response(null, { status: 200 }));
-    await new GoogleOAuthClient(config, store, successfulFetch).disconnect();
-    expect(successfulFetch).toHaveBeenCalledWith(
-      "https://oauth2.googleapis.com/revoke",
-      expect.objectContaining({ method: "POST" }),
-    );
-    expect(tombstoneSerialised).toHaveBeenCalledOnce();
+
+    for (const status of [200, 400]) {
+      tombstoneSerialised.mockClear();
+      const revoke = vi.fn<typeof fetch>().mockResolvedValue(new Response(null, { status }));
+      await expect(new GoogleOAuthClient(config, store, revoke).disconnect()).resolves.toBe(
+        "disconnected",
+      );
+      expect(revoke).toHaveBeenCalledWith(
+        "https://oauth2.googleapis.com/revoke",
+        expect.objectContaining({ method: "POST" }),
+      );
+      expect(tombstoneSerialised).toHaveBeenCalledOnce();
+    }
 
     tombstoneSerialised.mockClear();
     const failedFetch = vi

@@ -21,6 +21,14 @@ const recoverySql = readFileSync(
   new URL("../drizzle/0002_milestone_two_recovery.sql", import.meta.url),
   "utf8",
 );
+const coherenceMigrationSql = readFileSync(
+  new URL("../drizzle/0038_perfect_prodigy.sql", import.meta.url),
+  "utf8",
+);
+const exportServiceSource = readFileSync(
+  new URL("../src/server/services/export-service.ts", import.meta.url),
+  "utf8",
+);
 
 describe("persistence contracts", () => {
   it("exports the core durable tables", () => {
@@ -79,5 +87,67 @@ describe("persistence contracts", () => {
     expect(recoverySql).toContain("FUNCTION complete_step_execution");
     expect(recoverySql).toContain("FUNCTION fail_step_execution");
     expect(`${invariantSql}\n${recoverySql}`).toMatch(/lease_token\s*=\s*fencing_token/);
+  });
+
+  it("backfills both legacy coherence checkpoint shapes before enforcing status", () => {
+    const addStatus = coherenceMigrationSql.indexOf('ADD COLUMN "status" text;');
+    const backfill = coherenceMigrationSql.indexOf('UPDATE "coherence_checkpoints"');
+    const defaultStatus = coherenceMigrationSql.indexOf("SET DEFAULT 'started'");
+    const notNull = coherenceMigrationSql.indexOf("SET NOT NULL");
+    const statusCheck = coherenceMigrationSql.indexOf("coherence_checkpoints_status_check");
+    expect(addStatus).toBeGreaterThanOrEqual(0);
+    expect(backfill).toBeGreaterThan(addStatus);
+    expect(defaultStatus).toBeGreaterThan(backfill);
+    expect(notNull).toBeGreaterThan(defaultStatus);
+    expect(statusCheck).toBeGreaterThan(notNull);
+    expect(coherenceMigrationSql).toMatch(
+      /SET "status" = CASE WHEN "response" IS NOT NULL THEN 'checkpointed' ELSE 'provider_in_flight' END/,
+    );
+    expect(coherenceMigrationSql).toContain('WHERE "status" IS NULL');
+    expect(coherenceMigrationSql).toContain(
+      `CHECK ("coherence_checkpoints"."status" in ('started','provider_in_flight','checkpointed'))`,
+    );
+  });
+
+  it("independently proves recovered coherence export from authoritative live lineage", () => {
+    expect(exportServiceSource).toContain("recovery.operation_id=c.operation_id");
+    expect(exportServiceSource).toContain("recovery.run_id=c.run_id");
+    expect(exportServiceSource).toContain("recovery.document_version_id=c.document_version_id");
+    expect(exportServiceSource).toContain(
+      "recovery.producing_step_execution_id=c.producing_step_execution_id",
+    );
+    expect(exportServiceSource).toContain(
+      "recovery.recovery_step_execution_id=current_execution.id",
+    );
+    expect(exportServiceSource).toContain("recovery.outcome='export'");
+    expect(exportServiceSource).toContain("current_run.current_step='final_coherence_export'");
+    expect(exportServiceSource).toContain("current_run.status='running'");
+    expect(exportServiceSource).toContain("newer.attempt>current_execution.attempt");
+    expect(exportServiceSource).toContain("current_execution.status='running'");
+    expect(exportServiceSource).toContain("current_execution.lease_token=$4");
+    expect(exportServiceSource).toContain("current_execution.lease_expires_at>clock_timestamp()");
+    expect(exportServiceSource).toContain("finding->>'severity'='blocker'");
+    expect(exportServiceSource).toContain(
+      "finalGate.coherence_response_hash === canonicalHash(parsedCoherenceResponse.data)",
+    );
+    expect(exportServiceSource).toContain(
+      'parsedCoherenceResponse.data.findings.every((finding) => finding.severity !== "blocker")',
+    );
+  });
+
+  it("enforces coherence response pairing and rejects invalid transitions", () => {
+    expect(coherenceMigrationSql).toContain("coherence_checkpoints_response_pair");
+    expect(coherenceMigrationSql).toContain(
+      "OLD.status = 'started' AND NEW.status = 'provider_in_flight'",
+    );
+    expect(coherenceMigrationSql).toContain(
+      "OLD.status = 'provider_in_flight' AND NEW.status IN ('started','checkpointed')",
+    );
+    expect(coherenceMigrationSql).toContain(
+      "RAISE EXCEPTION 'invalid coherence checkpoint transition",
+    );
+    expect(coherenceMigrationSql).not.toContain(
+      "OLD.status = 'started' AND NEW.status = 'checkpointed'",
+    );
   });
 });

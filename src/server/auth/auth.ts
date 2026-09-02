@@ -1,5 +1,6 @@
 import type { Express, NextFunction, Request, RequestHandler, Response } from "express";
 import { z } from "zod";
+import { LOCAL_API_ORIGIN, LOCAL_FRONTEND_ORIGIN } from "../../shared/local-runtime.js";
 import type { AuthConfig } from "./config.js";
 import {
   csrfToken,
@@ -12,8 +13,8 @@ import type { SessionStore } from "./session-store.js";
 
 export const SESSION_COOKIE = "mm03_operator_session";
 export const AUTH_ALLOWED_ORIGINS = [
-  "http://127.0.0.1:5173",
-  "http://127.0.0.1:3100",
+  LOCAL_FRONTEND_ORIGIN,
+  LOCAL_API_ORIGIN,
   "https://content-generator.vyte.dev",
 ] as const;
 const loginSchema = z

@@ -9,6 +9,7 @@ import {
 } from "../src/server/pipeline/milestone-two.js";
 import { MockDraftProvider } from "../src/server/providers/draft-provider.js";
 import { ConflictError } from "../src/shared/errors.js";
+import { ingestHandoff } from "../src/shared/milestone-two.js";
 
 function handoff(planeTicket: string) {
   return {
@@ -73,6 +74,26 @@ describe("run cancellation", () => {
     ).resolves.toBeUndefined();
     expect((await repository.getRunDetail(runId)).status).toBe("cancelled");
   });
+
+  it.each([
+    ["waiting", "parked"],
+    ["blocked", "operator_action"],
+  ] as const)(
+    "cancels an operator-paused %s run and its %s queue job",
+    async (status, queueState) => {
+      const { repository } = wiredApp();
+      const run = await ingestHandoff(
+        handoff(`MOB-CANCEL-${status}`) as never,
+        `cancel-${status}`,
+        repository,
+      );
+      (repository as any).runs.get(run.run_id).status = status;
+      repository.queueJobs[0]!.state = queueState;
+      await repository.cancelRun(run.run_id);
+      expect((await repository.getRunDetail(run.run_id)).status).toBe("cancelled");
+      expect(repository.queueJobs[0]?.state).toBe("cancelled");
+    },
+  );
 
   it("refuses to cancel a run that is not running", async () => {
     const { repository, app } = wiredApp();

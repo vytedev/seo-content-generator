@@ -85,7 +85,13 @@ export function RunWorkspace({
       : undefined;
   const failure =
     failingAttempt && detail.current_step
-      ? friendlyFailure(detail.current_step, failingAttempt.error, failingAttempt.attempt)
+      ? friendlyFailure(
+          detail.current_step,
+          detail.draft_recovery === "legacy_confirmation_required"
+            ? "A pre-checkpoint draft failure requires explicit operator authorisation"
+            : failingAttempt.error,
+          failingAttempt.attempt,
+        )
       : undefined;
   const [exceptionalConfirmed, setExceptionalConfirmed] = useState(false);
   const blockedSectionRef = useRef<HTMLElement>(null);
@@ -101,6 +107,12 @@ export function RunWorkspace({
   }, [blockPresentationKey]);
   const deterministicBlockerCount = detail.block_counts.deterministic_blockers;
   const blockerNoun = deterministicBlockerCount === 1 ? "item" : "items";
+  const rerunCompletedWithBlockers =
+    detail.status === "blocked" &&
+    detail.current_step === "automated_checks_rerun" &&
+    detail.block_reason === "deterministic_blockers" &&
+    deterministicBlockerCount > 0 &&
+    latestCurrentAttempt?.status === "succeeded";
   const blockGuidance =
     detail.block_reason === "deterministic_blockers"
       ? `The article was checked again, but ${deterministicBlockerCount} ${blockerNoun} still ${deterministicBlockerCount === 1 ? "needs" : "need"} fixing. The app stopped safely before the final check, and no Google Doc was created.`
@@ -267,6 +279,8 @@ export function RunWorkspace({
               const latest = stepAttempts.at(-1);
               const status = latest?.status ?? "queued";
               const isCurrentRow = step.id === detail.current_step;
+              const completedWithBlockers =
+                step.id === "automated_checks_rerun" && isCurrentRow && rerunCompletedWithBlockers;
               const canReviewFindings =
                 step.id === "findings_review" &&
                 detail.status === "waiting" &&
@@ -297,6 +311,12 @@ export function RunWorkspace({
                     ) : status === "blocked" && !resuming ? (
                       <p className="mt-1 text-xs text-danger">
                         Blocked — needs your review before this can continue.
+                      </p>
+                    ) : completedWithBlockers ? (
+                      <p className="mt-1 text-xs text-danger">
+                        Checks completed successfully; {deterministicBlockerCount} required{" "}
+                        {blockerNoun} still {deterministicBlockerCount === 1 ? "blocks" : "block"}{" "}
+                        the article.
                       </p>
                     ) : null}
                   </div>
@@ -404,7 +424,7 @@ export function RunWorkspace({
               <StatusBadge status={detail.status} />
             </DefinitionRow>
             <DefinitionRow
-              label="Current step"
+              label={rerunCompletedWithBlockers ? "Blocked after" : "Current step"}
               value={
                 detail.current_step
                   ? (() => {
@@ -457,7 +477,9 @@ export function RunWorkspace({
                       : "Resuming…"
                     : detail.current_step === "internal_link_discovery"
                       ? "Retry link discovery"
-                      : "Resume safely"}
+                      : detail.draft_recovery === "legacy_confirmation_required"
+                        ? "Authorise one new draft request"
+                        : "Resume safely"}
                 </Button>
               )}
               {detail.export.status === "failed" && !detail.blocked_for_operator && (

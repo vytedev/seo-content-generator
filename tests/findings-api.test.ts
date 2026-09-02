@@ -1,5 +1,5 @@
 import request from "supertest";
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
 import { createApp } from "../src/server/app.js";
 import type { MilestoneThreeRepository } from "../src/shared/milestone-three.js";
 import { ConflictError, NotFoundError, UnprocessableError } from "../src/shared/errors.js";
@@ -45,6 +45,9 @@ function repository(): MilestoneThreeRepository {
       throw new Error();
     },
     saveFindings: async () => {},
+    beginReviewOperation: async () => ({ operation_id: "operation", response: null }),
+    markReviewProviderInFlight: async () => {},
+    checkpointReviewResponse: async () => {},
     saveReview: async () => {},
     waitForFindings: async () => {},
     listFindings: async () => [finding],
@@ -83,13 +86,56 @@ describe("findings API", () => {
         idempotency_key: "decision-test-1",
         dispositions: [{ finding_id: "finding-1", decision: "accepted", rationale: "Apply" }],
       });
-    expect(submitted.status).toBe(200);
+    expect(submitted.status).toBe(202);
     expect(submitted.body).toEqual({
       completed: true,
       submitted: 1,
       continuation_required: true,
-      continuation: "not_started",
+      continuation: "queue_accepted",
     });
+  });
+
+  it("never invokes the legacy synchronous continuation in production-shaped composition", async () => {
+    const run = vi.fn(async () => undefined);
+    const app = createApp({
+      serveClient: false,
+      findingsRepository: repository(),
+      milestoneFour: { repository: repository() as never, orchestrator: { run } as never },
+    });
+
+    const submitted = await request(app)
+      .post("/api/runs/run-1/findings/dispositions")
+      .send({
+        document_version_id: "doc-1",
+        idempotency_key: "decision-production-route",
+        dispositions: [{ finding_id: "finding-1", decision: "accepted" }],
+      });
+
+    expect(submitted.status).toBe(202);
+    expect(submitted.body.continuation).toBe("queue_accepted");
+    expect(run).not.toHaveBeenCalled();
+  });
+
+  it("retains synchronous continuation only behind the explicit test switch", async () => {
+    const run = vi.fn(async () => undefined);
+    const app = createApp({
+      serveClient: false,
+      testOnlySynchronousPipeline: true,
+      findingsRepository: repository(),
+      milestoneFour: { repository: repository() as never, orchestrator: { run } as never },
+    });
+
+    const submitted = await request(app)
+      .post("/api/runs/run-1/findings/dispositions")
+      .send({
+        document_version_id: "doc-1",
+        idempotency_key: "decision-test-route",
+        dispositions: [{ finding_id: "finding-1", decision: "accepted" }],
+      });
+
+    expect(submitted.status).toBe(200);
+    expect(submitted.body.continuation).toBe("completed");
+    expect(run).toHaveBeenCalledOnce();
   });
 
   it.each([

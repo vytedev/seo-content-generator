@@ -9,6 +9,7 @@ import {
 } from "../src/server/pipeline/milestone-two.js";
 import { MilestoneThreeOrchestrator } from "../src/server/pipeline/milestone-three.js";
 import { MilestoneFourOrchestrator } from "../src/server/pipeline/milestone-four.js";
+import { PipelineQueueWorker } from "../src/server/pipeline/queue-worker.js";
 import { MockDraftProvider } from "../src/server/providers/draft-provider.js";
 import { MockReviewProvider } from "../src/server/providers/review-provider.js";
 import {
@@ -78,8 +79,7 @@ const compliantDraft = {
   ],
 };
 
-function wiredApp() {
-  const repository = new InMemoryMilestoneRepository();
+function wiredApp(repository = new InMemoryMilestoneRepository()) {
   const milestoneTwo = new MilestoneTwoOrchestrator(
     repository,
     new MockLinkDiscoverer([
@@ -96,10 +96,11 @@ function wiredApp() {
     fixture,
     new MockReviewProvider("local-no-network"),
   );
+  const revisionProvider = new MockRevisionProvider("local-no-network");
   const milestoneFour = new MilestoneFourOrchestrator(
     repository,
     fixture,
-    new MockRevisionProvider("local-no-network"),
+    revisionProvider,
     new MockCoherenceProvider("local-no-network"),
     repository,
   );
@@ -108,7 +109,9 @@ function wiredApp() {
     milestoneTwo,
     milestoneThree,
     milestoneFour,
+    revisionProvider,
     app: createApp({
+      testOnlySynchronousPipeline: true,
       findingsRepository: repository,
       ingestService: createIngestService(repository),
       milestoneTwo: { repository, orchestrator: milestoneTwo },
@@ -119,6 +122,341 @@ function wiredApp() {
 }
 
 describe("live run advancement 1.1 → 1.9 → export", () => {
+  it("continues Step 1.10 only through the durable queue after a worker restart", async () => {
+    const setup = wiredApp();
+    const app = createApp({
+      serveClient: false,
+      findingsRepository: setup.repository,
+      ingestService: createIngestService(setup.repository),
+      queue: setup.repository,
+      milestoneTwo: { repository: setup.repository, orchestrator: setup.milestoneTwo },
+      milestoneThree: { repository: setup.repository, orchestrator: setup.milestoneThree },
+      milestoneFour: { repository: setup.repository, orchestrator: setup.milestoneFour },
+    });
+    const milestoneFourRun = vi.spyOn(setup.milestoneFour, "run");
+    const orchestrators = {
+      milestoneTwo: setup.milestoneTwo,
+      milestoneThree: setup.milestoneThree,
+      milestoneFour: setup.milestoneFour,
+    };
+    const firstWorker = new PipelineQueueWorker(
+      setup.repository,
+      orchestrators,
+      "before-findings-restart",
+      30_000,
+      1,
+    );
+    await firstWorker.start();
+    const created = await request(app)
+      .post("/api/runs")
+      .set("Idempotency-Key", "queued-step-1-10-restart")
+      .send(handoff);
+    expect(created.status).toBe(201);
+    const runId = created.body.run_id as string;
+    await vi.waitFor(async () =>
+      expect((await setup.repository.getRunDetail(runId)).status).toBe("waiting"),
+    );
+    await firstWorker.stop();
+
+    const detail = await setup.repository.getRunDetail(runId);
+    const findings = await request(app).get(`/api/runs/${runId}/findings`).expect(200);
+    const milestoneFourCallsBeforeSubmission = milestoneFourRun.mock.calls.length;
+    const submitted = await request(app)
+      .post(`/api/runs/${runId}/findings/dispositions`)
+      .send({
+        document_version_id: detail.current_document!.version.id,
+        idempotency_key: `queued-dispositions-${runId}`,
+        dispositions: findings.body.findings.map((finding: { id: string }) => ({
+          finding_id: finding.id,
+          decision: "accepted",
+        })),
+      });
+    expect(submitted.status).toBe(202);
+    expect(submitted.body.continuation).toBe("queue_accepted");
+    expect(setup.revisionProvider.calls).toHaveLength(0);
+
+    const restartedWorker = new PipelineQueueWorker(
+      setup.repository,
+      orchestrators,
+      "after-findings-restart",
+      30_000,
+      1,
+    );
+    await restartedWorker.start();
+    await vi.waitFor(async () =>
+      expect((await setup.repository.getRunDetail(runId)).status).toBe("succeeded"),
+    );
+    await restartedWorker.stop();
+
+    expect(milestoneFourRun.mock.calls.length).toBeGreaterThan(milestoneFourCallsBeforeSubmission);
+    expect(setup.revisionProvider.calls).toHaveLength(1);
+    expect(
+      (await setup.repository.getRunDetail(runId)).steps.find(
+        (step) => step.step === "revision_pass",
+      )?.status,
+    ).toBe("succeeded");
+    expect(setup.repository.queueJobs).toHaveLength(1);
+    expect(setup.repository.queueJobs[0]).toMatchObject({ state: "completed", attempt: 1 });
+  });
+
+  it("recovers a crashed worker after Step 1.11 persisted without rerunning the gate", async () => {
+    let now = 0;
+    const repository = new InMemoryMilestoneRepository(300_000, () => now);
+    const setup = wiredApp(repository);
+    const app = createApp({
+      serveClient: false,
+      findingsRepository: repository,
+      ingestService: createIngestService(repository),
+      queue: repository,
+      milestoneTwo: { repository, orchestrator: setup.milestoneTwo },
+      milestoneThree: { repository, orchestrator: setup.milestoneThree },
+      milestoneFour: { repository, orchestrator: setup.milestoneFour },
+    });
+    const initialWorker = new PipelineQueueWorker(
+      repository,
+      {
+        milestoneTwo: setup.milestoneTwo,
+        milestoneThree: setup.milestoneThree,
+        milestoneFour: setup.milestoneFour,
+      },
+      "step-1-11-initial",
+      1_000,
+      1,
+    );
+    await initialWorker.start();
+    const created = await request(app)
+      .post("/api/runs")
+      .set("Idempotency-Key", "queued-step-1-11-takeover")
+      .send(handoff)
+      .expect(201);
+    const runId = created.body.run_id as string;
+    await vi.waitFor(async () =>
+      expect((await repository.getRunDetail(runId)).status).toBe("waiting"),
+    );
+    await initialWorker.stop();
+
+    const detail = await repository.getRunDetail(runId);
+    const findings = await request(app).get(`/api/runs/${runId}/findings`).expect(200);
+    await request(app)
+      .post(`/api/runs/${runId}/findings/dispositions`)
+      .send({
+        document_version_id: detail.current_document!.version.id,
+        idempotency_key: `step-1-11-takeover-${runId}`,
+        dispositions: findings.body.findings.map((finding: { id: string }) => ({
+          finding_id: finding.id,
+          decision: "accepted",
+        })),
+      })
+      .expect(202);
+
+    const coherence = new MockCoherenceProvider("step-1-11-takeover");
+    const originalSaveRerun = repository.saveRerun.bind(repository);
+    let saveRerunCalls = 0;
+    repository.saveRerun = async (input) => {
+      saveRerunCalls += 1;
+      return originalSaveRerun(input);
+    };
+    const crashedOrchestrator = new MilestoneFourOrchestrator(
+      repository,
+      fixture,
+      setup.revisionProvider,
+      coherence,
+      repository,
+      {
+        hit(boundary) {
+          if (boundary === "after_rerun_persist") return new Promise<void>(() => undefined);
+        },
+      },
+    );
+    const crashedWorker = new PipelineQueueWorker(
+      repository,
+      {
+        milestoneTwo: setup.milestoneTwo,
+        milestoneThree: setup.milestoneThree,
+        milestoneFour: crashedOrchestrator,
+      },
+      "step-1-11-crashed",
+      1_000,
+      1,
+    );
+    await crashedWorker.start();
+    await vi.waitFor(async () => {
+      const current = await repository.getRunDetail(runId);
+      expect(current.current_step).toBe("final_coherence_export");
+      expect(current.steps.find((step) => step.step === "automated_checks_rerun")?.status).toBe(
+        "succeeded",
+      );
+    });
+    await expect(crashedWorker.stop(5)).resolves.toBe("deadline_exceeded");
+    expect(repository.queueJobs[0]).toMatchObject({ state: "leased", attempt: 1 });
+
+    now += 1_001;
+    const replacementOrchestrator = new MilestoneFourOrchestrator(
+      repository,
+      fixture,
+      setup.revisionProvider,
+      coherence,
+      repository,
+    );
+    const replacementWorker = new PipelineQueueWorker(
+      repository,
+      {
+        milestoneTwo: setup.milestoneTwo,
+        milestoneThree: setup.milestoneThree,
+        milestoneFour: replacementOrchestrator,
+      },
+      "step-1-11-replacement",
+      1_000,
+      1,
+    );
+    await replacementWorker.start();
+    await vi.waitFor(async () =>
+      expect((await repository.getRunDetail(runId)).status).toBe("succeeded"),
+    );
+    await replacementWorker.stop();
+
+    expect(repository.deterministicReruns.size).toBe(1);
+    expect(saveRerunCalls).toBe(1);
+    expect(setup.revisionProvider.calls).toHaveLength(1);
+    expect(coherence.calls).toHaveLength(1);
+    expect(repository.exports).toHaveLength(1);
+    expect(repository.queueJobs[0]).toMatchObject({ state: "completed", attempt: 2 });
+  });
+
+  it("takes over a pre-save Step 1.11 crash and rejects the stale worker save", async () => {
+    let now = 0;
+    const repository = new InMemoryMilestoneRepository(1_000, () => now);
+    const setup = wiredApp(repository);
+    const app = createApp({
+      serveClient: false,
+      findingsRepository: repository,
+      ingestService: createIngestService(repository),
+      queue: repository,
+      milestoneTwo: { repository, orchestrator: setup.milestoneTwo },
+      milestoneThree: { repository, orchestrator: setup.milestoneThree },
+      milestoneFour: { repository, orchestrator: setup.milestoneFour },
+    });
+    const initialWorker = new PipelineQueueWorker(
+      repository,
+      {
+        milestoneTwo: setup.milestoneTwo,
+        milestoneThree: setup.milestoneThree,
+        milestoneFour: setup.milestoneFour,
+      },
+      "pre-save-initial",
+      1_000,
+      1,
+    );
+    await initialWorker.start();
+    const created = await request(app)
+      .post("/api/runs")
+      .set("Idempotency-Key", "queued-step-1-11-pre-save-takeover")
+      .send(handoff)
+      .expect(201);
+    const runId = created.body.run_id as string;
+    await vi.waitFor(async () =>
+      expect((await repository.getRunDetail(runId)).status).toBe("waiting"),
+    );
+    await initialWorker.stop();
+    const detail = await repository.getRunDetail(runId);
+    const findings = await request(app).get(`/api/runs/${runId}/findings`).expect(200);
+    await request(app)
+      .post(`/api/runs/${runId}/findings/dispositions`)
+      .send({
+        document_version_id: detail.current_document!.version.id,
+        idempotency_key: `pre-save-takeover-${runId}`,
+        dispositions: findings.body.findings.map((finding: { id: string }) => ({
+          finding_id: finding.id,
+          decision: "accepted",
+        })),
+      })
+      .expect(202);
+
+    let release!: () => void;
+    const boundaryReached = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+    let signalBoundary!: () => void;
+    const enteredBoundary = new Promise<void>((resolve) => {
+      signalBoundary = resolve;
+    });
+    const originalSaveRerun = repository.saveRerun.bind(repository);
+    let saveAttempts = 0;
+    let staleSaveRejected = false;
+    repository.saveRerun = async (input) => {
+      saveAttempts += 1;
+      try {
+        return await originalSaveRerun(input);
+      } catch (error) {
+        if (saveAttempts > 1 && /Stale fencing token/.test(String(error))) staleSaveRejected = true;
+        throw error;
+      }
+    };
+    const crashedOrchestrator = new MilestoneFourOrchestrator(
+      repository,
+      fixture,
+      setup.revisionProvider,
+      new MockCoherenceProvider("pre-save-crashed"),
+      repository,
+      {
+        async hit(boundary) {
+          if (boundary === "before_rerun_persist") {
+            signalBoundary();
+            await boundaryReached;
+          }
+        },
+      },
+    );
+    const crashedWorker = new PipelineQueueWorker(
+      repository,
+      {
+        milestoneTwo: setup.milestoneTwo,
+        milestoneThree: setup.milestoneThree,
+        milestoneFour: crashedOrchestrator,
+      },
+      "pre-save-crashed",
+      1_000,
+      1,
+    );
+    await crashedWorker.start();
+    await enteredBoundary;
+    expect(repository.deterministicReruns.size).toBe(0);
+
+    now += 1_001;
+    const coherence = new MockCoherenceProvider("pre-save-replacement");
+    const replacementWorker = new PipelineQueueWorker(
+      repository,
+      {
+        milestoneTwo: setup.milestoneTwo,
+        milestoneThree: setup.milestoneThree,
+        milestoneFour: new MilestoneFourOrchestrator(
+          repository,
+          fixture,
+          setup.revisionProvider,
+          coherence,
+          repository,
+        ),
+      },
+      "pre-save-replacement",
+      1_000,
+      1,
+    );
+    await replacementWorker.start();
+    await vi.waitFor(async () =>
+      expect((await repository.getRunDetail(runId)).status).toBe("succeeded"),
+    );
+    await replacementWorker.stop();
+    release();
+    await vi.waitFor(() => expect(staleSaveRejected).toBe(true));
+    await crashedWorker.stop();
+
+    expect(saveAttempts).toBe(2);
+    expect(repository.deterministicReruns.size).toBe(1);
+    expect(coherence.calls).toHaveLength(1);
+    expect(repository.exports).toHaveLength(1);
+    expect(repository.queueJobs[0]).toMatchObject({ state: "completed", attempt: 2 });
+  });
+
   it("ingest auto-runs milestone two then three and stops waiting at 1.9", async () => {
     const setup = wiredApp();
     const milestoneThreeRun = vi.spyOn(setup.milestoneThree, "run");
@@ -179,6 +517,7 @@ describe("live run advancement 1.1 → 1.9 → export", () => {
     // Ingest through an app wired with milestone two only, so the run stalls at
     // 1.4 exactly like a run whose milestone-three pass previously failed.
     const milestoneTwoOnly = createApp({
+      testOnlySynchronousPipeline: true,
       ingestService: createIngestService(setup.repository),
       milestoneTwo: { repository: setup.repository, orchestrator: setup.milestoneTwo },
     });
@@ -201,6 +540,7 @@ describe("live run advancement 1.1 → 1.9 → export", () => {
   it("milestone-three resume invokes milestone-four continuation exactly once", async () => {
     const setup = wiredApp();
     const milestoneTwoOnly = createApp({
+      testOnlySynchronousPipeline: true,
       ingestService: createIngestService(setup.repository),
       milestoneTwo: { repository: setup.repository, orchestrator: setup.milestoneTwo },
     });
@@ -225,6 +565,7 @@ describe("live run advancement 1.1 → 1.9 → export", () => {
   it("returns persisted milestone-three provider failure detail instead of a generic 500", async () => {
     const setup = wiredApp();
     const milestoneTwoOnly = createApp({
+      testOnlySynchronousPipeline: true,
       ingestService: createIngestService(setup.repository),
       milestoneTwo: { repository: setup.repository, orchestrator: setup.milestoneTwo },
     });
@@ -261,6 +602,7 @@ describe("live run advancement 1.1 → 1.9 → export", () => {
   it("propagates an unpersisted milestone-three error while the run remains running", async () => {
     const setup = wiredApp();
     const milestoneTwoOnly = createApp({
+      testOnlySynchronousPipeline: true,
       ingestService: createIngestService(setup.repository),
       milestoneTwo: { repository: setup.repository, orchestrator: setup.milestoneTwo },
     });
@@ -282,6 +624,7 @@ describe("live run advancement 1.1 → 1.9 → export", () => {
   it("returns authoritative cancelled detail when cancellation wins a resume error", async () => {
     const setup = wiredApp();
     const milestoneTwoOnly = createApp({
+      testOnlySynchronousPipeline: true,
       ingestService: createIngestService(setup.repository),
       milestoneTwo: { repository: setup.repository, orchestrator: setup.milestoneTwo },
     });

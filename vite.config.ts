@@ -2,6 +2,7 @@ import { fileURLToPath } from "node:url";
 import tailwindcss from "@tailwindcss/vite";
 import react from "@vitejs/plugin-react";
 import { defineConfig, type Plugin } from "vite";
+import { LOCAL_API_ORIGIN, LOCAL_FRONTEND_PORT } from "./src/shared/local-runtime.js";
 
 function conciseDevOutput(): Plugin {
   let watchBuild = false;
@@ -37,7 +38,7 @@ export default defineConfig({
   build: { outDir: "dist/client", emptyOutDir: true },
   server: {
     host: containerDev ? "0.0.0.0" : "127.0.0.1",
-    port: containerDev ? 3000 : 5173,
+    port: containerDev ? 3000 : LOCAL_FRONTEND_PORT,
     strictPort: true,
     allowedHosts: containerDev ? ["content-generator.vyte.dev"] : [],
     ...(containerDev
@@ -49,6 +50,6 @@ export default defineConfig({
           },
         }
       : {}),
-    proxy: { "/api": "http://127.0.0.1:3100" },
+    proxy: { "/api": LOCAL_API_ORIGIN },
   },
 });

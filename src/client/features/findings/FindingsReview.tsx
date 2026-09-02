@@ -16,6 +16,11 @@ import {
 import { Skeleton } from "../../components/ui/skeleton.js";
 import { Textarea } from "../../components/ui/textarea.js";
 import { apiFetch } from "../../lib/api.js";
+import {
+  findingCategoryLabel,
+  isFindingCategory,
+  type FindingCategory,
+} from "./finding-category-labels.js";
 
 type LoadState = "idle" | "loading" | "success" | "error";
 type Decision = "accepted" | "rejected";
@@ -38,6 +43,7 @@ async function fetchAuthoritativeFindings(runId: string): Promise<FindingRecord[
 }
 type DispositionFilter = "all" | "pending" | Decision;
 type SeverityFilter = "all" | FindingRecord["severity"];
+type CategoryFilter = "all" | FindingCategory;
 
 interface StagedDecision {
   decision: Decision;
@@ -86,7 +92,7 @@ export function FindingsReview({
   const [findings, setFindings] = useState<FindingRecord[]>([]);
   const [loadState, setLoadState] = useState<LoadState>("idle");
   const [severity, setSeverity] = useState<SeverityFilter>("all");
-  const [category, setCategory] = useState("all");
+  const [category, setCategory] = useState<CategoryFilter>("all");
   const [disposition, setDisposition] = useState<DispositionFilter>("all");
   const [selected, setSelected] = useState<Set<string>>(new Set());
   const [staged, setStaged] = useState<Record<string, StagedDecision>>({});
@@ -95,7 +101,7 @@ export function FindingsReview({
   const [submitError, setSubmitError] = useState("");
 
   const categories = useMemo(
-    () => [...new Set(findings.map((finding) => finding.category))].sort(),
+    () => [...new Set(findings.map((finding) => finding.category as FindingCategory))].sort(),
     [findings],
   );
   const visible = useMemo(
@@ -154,6 +160,8 @@ export function FindingsReview({
         throw new Error(errorMessage(result, "Findings could not be loaded."));
       }
       const loaded = (result as { findings: FindingRecord[] }).findings;
+      if (loaded.some((finding) => !isFindingCategory(finding.category)))
+        throw new Error("A finding category has no approved operator-facing label.");
       setFindings(loaded);
       setLoadedRunId(cleanRunId);
       setSelected(new Set());
@@ -342,10 +350,13 @@ export function FindingsReview({
               <Filter
                 label="Category"
                 value={category}
-                onChange={setCategory}
+                onChange={(value) => setCategory(value as CategoryFilter)}
                 options={[
                   { value: "all", label: "All categories" },
-                  ...categories.map((option) => ({ value: option, label: option })),
+                  ...categories.map((option) => ({
+                    value: option,
+                    label: findingCategoryLabel(option),
+                  })),
                 ]}
               />
               <Filter
@@ -403,9 +414,9 @@ export function FindingsReview({
                       >
                         <h3
                           id={`category-${severityGroup.severity}-${categoryGroup.name.replaceAll(" ", "-")}`}
-                          className="min-w-0 [overflow-wrap:anywhere] border-b border-rule px-4 py-2 text-xs font-semibold tracking-[0.08em] text-muted uppercase"
+                          className="min-w-0 [overflow-wrap:anywhere] border-b border-rule px-4 py-2 text-xs font-semibold tracking-[0.08em] text-muted"
                         >
-                          {categoryGroup.name}
+                          {findingCategoryLabel(categoryGroup.name)}
                         </h3>
                         <ul>
                           {categoryGroup.findings.map((finding) => (
