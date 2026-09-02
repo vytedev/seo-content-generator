@@ -54,7 +54,7 @@ describe("run cancellation", () => {
       .post("/api/runs")
       .set("Idempotency-Key", "cancel-test-1")
       .send(handoff("MOB-CANCEL-1"));
-    expect(created.status).toBe(201);
+    expect(created.status).toBe(202);
     const runId = created.body.run_id as string;
 
     // Simulate an in-flight step: claim the draft step for a second attempt.
@@ -66,9 +66,8 @@ describe("run cancellation", () => {
       .set("Idempotency-Key", `cancel-second-${runId}`)
       .set("Idempotency-Key", `cancel-first-${runId}`)
       .set("Idempotency-Key", `cancel-${runId}`);
-    expect(cancelled.status).toBe(200);
-    expect(cancelled.body.status).toBe("cancelled");
-    expect(cancelled.body.can_retry).toBe(false);
+    expect(cancelled.status).toBe(202);
+    expect(cancelled.body).toMatchObject({ run_id: runId, queue_accepted: false });
 
     // The revoked lease now bounces every fenced write: heartbeat, complete.
     expect(await repository.heartbeatStep(lease.execution_id, lease.token)).toBe(false);
@@ -112,7 +111,7 @@ describe("run cancellation", () => {
     const first = await request(app)
       .post(`/api/runs/${runId}/cancel`)
       .set("Idempotency-Key", `cancel-first-${runId}`);
-    expect(first.status).toBe(200);
+    expect(first.status).toBe(202);
     // A second stop on the now-cancelled run conflicts.
     const second = await request(app)
       .post(`/api/runs/${runId}/cancel`)

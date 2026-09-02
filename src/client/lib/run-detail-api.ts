@@ -1,4 +1,8 @@
 import { RunDetailSchema, type RunDetail } from "../../shared/contracts/run-detail.js";
+import {
+  parseCommandSubmissionResponse,
+  type CommandSubmissionResult,
+} from "./command-submission-api.js";
 
 const MILESTONE_TWO_STEPS = new Set(["internal_link_discovery", "draft"]);
 const MILESTONE_THREE_STEPS = new Set([
@@ -26,20 +30,24 @@ export function resumeEndpoint(runId: string, currentStep: string | null): strin
 export function resumeRequest(
   currentStep: string | null,
   draftRecovery: RunDetail["draft_recovery"] = "none",
+  idempotencyKey?: string,
 ): RequestInit {
+  const headers = {
+    ...(idempotencyKey ? { "Idempotency-Key": idempotencyKey } : {}),
+  };
   if (currentStep === "internal_link_discovery")
     return {
       method: "POST",
-      headers: { "Content-Type": "application/json" },
+      headers: { ...headers, "Content-Type": "application/json" },
       body: JSON.stringify({ refresh_link_discovery: true }),
     };
   if (currentStep === "draft" && draftRecovery === "legacy_confirmation_required")
     return {
       method: "POST",
-      headers: { "Content-Type": "application/json" },
+      headers: { ...headers, "Content-Type": "application/json" },
       body: JSON.stringify({ authorise_legacy_draft_recovery: true }),
     };
-  return { method: "POST" };
+  return { method: "POST", headers };
 }
 
 export function runDetailErrorMessage(body: unknown, fallback: string): string {
@@ -48,6 +56,16 @@ export function runDetailErrorMessage(body: unknown, fallback: string): string {
     if (typeof error?.message === "string") return error.message;
   }
   return fallback;
+}
+
+export function parseRunCommandResponse(
+  body: unknown,
+  status: number,
+  expectedRunId: string,
+  fallback: string,
+): CommandSubmissionResult {
+  if (status !== 202) throw new Error(runDetailErrorMessage(body, fallback));
+  return parseCommandSubmissionResponse(body, status, fallback, expectedRunId);
 }
 
 export function parseRunDetailResponse(

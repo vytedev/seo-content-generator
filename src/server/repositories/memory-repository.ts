@@ -149,6 +149,7 @@ export class InMemoryMilestoneRepository
   readonly commands: import("../../shared/commands.js").RunCommand[] = [];
   readonly commandActivity: import("../../shared/commands.js").RunActivity[] = [];
   private readonly commandResults = new Map<string, CommandSubmissionResult>();
+  private editorialCorrectionHandler: ((runId: string) => Promise<unknown>) | undefined;
   readonly queueJobs: Array<{
     id: string;
     run_id: string;
@@ -2662,6 +2663,10 @@ export class InMemoryMilestoneRepository
     return this.commands.find((command) => command.idempotency_key === idempotencyKey) ?? null;
   }
 
+  configureEditorialCorrection(handler: (runId: string) => Promise<unknown>): void {
+    this.editorialCorrectionHandler = handler;
+  }
+
   async submitCommand(
     rawCommand: import("../../shared/commands.js").RunCommand,
   ): Promise<CommandSubmissionResult> {
@@ -2720,6 +2725,11 @@ export class InMemoryMilestoneRepository
         case "cancel_run":
           await this.cancelRun(runId);
           result = { cancelled: true };
+          break;
+        case "open_editorial_correction":
+          if (!this.editorialCorrectionHandler)
+            throw new UnprocessableError("Editorial correction is not configured.");
+          result = await this.editorialCorrectionHandler(runId);
           break;
         case "authorise_exceptional_correction":
           result = {

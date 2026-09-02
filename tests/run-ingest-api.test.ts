@@ -283,8 +283,9 @@ describe("POST /api/runs with milestone two wired", () => {
       .post(endpoint)
       .set("Idempotency-Key", "route-command-resume")
       .send({});
-    expect(first.status).toBe(200);
-    expect(replay.status).toBe(200);
+    expect(first.status).toBe(202);
+    expect(replay.status).toBe(202);
+    expect(replay.body).toEqual({ ...first.body, replayed: true });
     expect(setup.repository.commands).toHaveLength(2);
     expect(setup.repository.commandActivity).toHaveLength(2);
     expect(setup.repository.queueJobs).toHaveLength(1);
@@ -311,7 +312,7 @@ describe("POST /api/runs with milestone two wired", () => {
       .post(`/api/runs/${created.body.run_id}/milestone-two/resume`)
       .set("Idempotency-Key", "refresh-route-key")
       .send({ refresh_link_discovery: true });
-    expect(response.status).toBe(200);
+    expect(response.status).toBe(202);
     expect(job.options).toEqual({});
     expect(job.pendingRefresh).toBe(true);
     expect(job.pendingOptions).toEqual({});
@@ -328,7 +329,9 @@ describe("POST /api/runs with milestone two wired", () => {
     expect((await request(setup.app).get(`/api/runs/${runId}/costs`)).body).toMatchObject({
       cost_micros: expect.any(Number),
     });
-    const missing = await request(setup.app).post("/api/runs/missing-run/milestone-two/resume");
+    const missing = await request(setup.app)
+      .post("/api/runs/missing-run/milestone-two/resume")
+      .set("Idempotency-Key", "missing-run-command");
     expect(missing.status).toBe(404);
     expect(missing.body.error.code).toBe("NOT_FOUND");
   });

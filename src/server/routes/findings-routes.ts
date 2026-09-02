@@ -1,6 +1,6 @@
 import type { Express } from "express";
 import type { RunCommandRepository } from "../../shared/command-repository.js";
-import { buildRouteCommand } from "./command-submission.js";
+import { buildRouteCommand, commandAcceptedBody } from "./command-submission.js";
 import {
   BulkDispositionSchema,
   FindingFiltersSchema,
@@ -55,29 +55,23 @@ export function registerFindingsRoutes(
       return;
     }
     try {
-      const result = (
-        await options.commands.submitCommand(
-          buildRouteCommand({
-            kind: "submit_findings",
-            run_id: request.params.runId!,
-            idempotency_key: parsed.data.idempotency_key,
-            body: { dispositions: parsed.data },
-          }),
-        )
-      ).result as Awaited<ReturnType<typeof findingsRepository.submitDispositions>>;
-      if (result.continuation_required && options.testOnlyLegacyContinuation) {
-        try {
-          await options.testOnlyLegacyContinuation(request.params.runId!);
-          response.status(200).json({ ...result, continuation: "completed" });
-        } catch {
-          response.status(202).json({ ...result, continuation: "retryable_failed" });
-        }
+      const submission = await options.commands.submitCommand(
+        buildRouteCommand({
+          kind: "submit_findings",
+          run_id: request.params.runId!,
+          idempotency_key: parsed.data.idempotency_key,
+          body: { dispositions: parsed.data },
+        }),
+      );
+      if (options.testOnlyLegacyContinuation) {
+        await options.testOnlyLegacyContinuation(request.params.runId!);
+        response.status(200).json({
+          ...(submission.result as object),
+          continuation: "completed",
+        });
         return;
       }
-      response.status(result.continuation_required ? 202 : 200).json({
-        ...result,
-        continuation: result.continuation_required ? "queue_accepted" : "already_accepted",
-      });
+      response.status(202).json(commandAcceptedBody(submission));
     } catch (error) {
       next(error);
     }

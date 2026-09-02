@@ -252,16 +252,21 @@ export function createApp(options: CreateAppOptions = {}): Express {
   if ((options.ingestService || options.findingsRepository) && !commandRepository)
     throw new Error("Command repository is required for ingest and findings composition.");
 
-  if (options.findingsRepository) {
-    const testOnlyLegacyContinuation =
-      options.testOnlySynchronousPipeline && !options.queue && options.milestoneFour
-        ? (runId: string) => options.milestoneFour!.orchestrator.run(runId)
-        : undefined;
+  if (options.milestoneThree?.editorialCorrection)
+    commandRepository?.configureEditorialCorrection?.((runId) =>
+      options.milestoneThree!.editorialCorrection!.open(runId),
+    );
+
+  if (options.findingsRepository)
     registerFindingsRoutes(app, options.findingsRepository, {
       commands: commandRepository!,
-      ...(testOnlyLegacyContinuation ? { testOnlyLegacyContinuation } : {}),
+      ...(options.testOnlySynchronousPipeline && !options.queue && options.milestoneFour
+        ? {
+            testOnlyLegacyContinuation: (runId: string) =>
+              options.milestoneFour!.orchestrator.run(runId),
+          }
+        : {}),
     });
-  }
 
   if (options.pipelineUnavailable) registerPipelineUnavailableRoutes(app);
 
@@ -270,9 +275,9 @@ export function createApp(options: CreateAppOptions = {}): Express {
       app,
       options.ingestService,
       commandRepository,
-      options.testOnlySynchronousPipeline && options.milestoneTwo
+      options.testOnlySynchronousPipeline && !options.queue
         ? async (runId) => {
-            await options.milestoneTwo!.orchestrator.run(runId);
+            if (options.milestoneTwo) await options.milestoneTwo.orchestrator.run(runId);
             if (options.milestoneThree) {
               await options.milestoneThree.orchestrator.run(runId);
               if (options.milestoneFour) await options.milestoneFour.orchestrator.run(runId);
@@ -308,14 +313,15 @@ export function createApp(options: CreateAppOptions = {}): Express {
         milestoneThree: options.milestoneThree,
         milestoneFour: options.milestoneFour,
         commands,
-        testOnlySynchronousContinuation:
-          options.testOnlySynchronousPipeline && !options.queue
-            ? async (runId) => {
+        ...(options.testOnlySynchronousPipeline && !options.queue
+          ? {
+              testOnlySynchronousContinuation: async (runId: string) => {
                 if (options.milestoneTwo) await options.milestoneTwo.orchestrator.run(runId);
                 if (options.milestoneThree) await options.milestoneThree.orchestrator.run(runId);
                 if (options.milestoneFour) await options.milestoneFour.orchestrator.run(runId);
-              }
-            : undefined,
+              },
+            }
+          : {}),
       });
   }
 

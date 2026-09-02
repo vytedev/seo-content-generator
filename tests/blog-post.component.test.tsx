@@ -99,6 +99,18 @@ function response(body: unknown, status = 200) {
   });
 }
 
+function accepted(runId = "run-m4-1", replayed = false) {
+  return response(
+    {
+      command_id: replayed ? "command-replayed" : "command-accepted",
+      run_id: runId,
+      replayed,
+      queue_accepted: true,
+    },
+    202,
+  );
+}
+
 /** Stubs fetch so the run list resolves to `list` and run detail to `runDetail()`. */
 /** The paginated shape /api/runs now returns; navigation reads only `runs`. */
 function runsResponse(list: unknown) {
@@ -118,9 +130,10 @@ function runsResponse(list: unknown) {
 }
 
 function stubFetch(list: unknown, runDetail: () => unknown) {
-  return vi.spyOn(globalThis, "fetch").mockImplementation(async (input) => {
+  return vi.spyOn(globalThis, "fetch").mockImplementation(async (input, init) => {
     const url = typeof input === "string" ? input : String((input as Request).url ?? "");
     if (url.includes("/api/runs?")) return runsResponse(list);
+    if (init?.method === "POST") return accepted();
     return response(runDetail());
   });
 }
@@ -161,9 +174,7 @@ describe("Blog Post page", () => {
     const fetchMock = vi.spyOn(globalThis, "fetch").mockImplementation(async (input, init) => {
       const url = typeof input === "string" ? input : String((input as Request).url ?? "");
       if (url.includes("/api/runs?")) return runsResponse(running);
-      if (url.includes("/resume") && init?.method === "POST") {
-        return response(detail({ status: "succeeded", current_step: null }));
-      }
+      if (url.includes("/resume") && init?.method === "POST") return accepted();
       return response(detail());
     });
     const user = userEvent.setup();
@@ -181,10 +192,46 @@ describe("Blog Post page", () => {
 
     await user.click(screen.getByRole("button", { name: "Resume safely" }));
     await waitFor(() =>
-      expect(fetchMock).toHaveBeenCalledWith("/api/runs/run-m4-1/milestone-four/resume", {
-        method: "POST",
-      }),
+      expect(fetchMock).toHaveBeenCalledWith(
+        "/api/runs/run-m4-1/milestone-four/resume",
+        expect.objectContaining({
+          method: "POST",
+          headers: expect.objectContaining({ "Idempotency-Key": expect.any(String) }),
+        }),
+      ),
     );
+  });
+
+  it("reuses a resume key after a disconnected response, then rotates after acceptance", async () => {
+    const failed = detail({ status: "retryable_failed", current_step: "automated_checks" });
+    const keys: string[] = [];
+    let attempts = 0;
+    vi.spyOn(globalThis, "fetch").mockImplementation(async (input, init) => {
+      const url = typeof input === "string" ? input : String((input as Request).url ?? "");
+      if (url.includes("/api/runs?"))
+        return runsResponse({
+          runs: [summary({ status: "retryable_failed", current_step: "automated_checks" })],
+        });
+      if (url.includes("/resume") && init?.method === "POST") {
+        keys.push((init.headers as Record<string, string>)["Idempotency-Key"]!);
+        attempts += 1;
+        if (attempts === 1) throw new TypeError("Network disconnected");
+        return accepted("run-m4-1", true);
+      }
+      return response(failed);
+    });
+    const user = userEvent.setup();
+    render(<App authMode="test-bypass" />);
+
+    await user.click(await screen.findByRole("button", { name: "Resume safely" }));
+    await screen.findByText("Network disconnected");
+    await user.click(screen.getByRole("button", { name: "Resume safely" }));
+    await waitFor(() => expect(keys).toHaveLength(2));
+    expect(keys[1]).toBe(keys[0]);
+
+    await user.click(screen.getByRole("button", { name: "Resume safely" }));
+    await waitFor(() => expect(keys).toHaveLength(3));
+    expect(keys[2]).not.toBe(keys[1]);
   });
 
   it("resumes milestone-two steps through the milestone-two endpoint", async () => {
@@ -204,11 +251,17 @@ describe("Blog Post page", () => {
       await screen.findByRole("button", { name: "Authorise one new draft request" }),
     );
     await waitFor(() =>
-      expect(fetchMock).toHaveBeenCalledWith("/api/runs/run-m4-1/milestone-two/resume", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ authorise_legacy_draft_recovery: true }),
-      }),
+      expect(fetchMock).toHaveBeenCalledWith(
+        "/api/runs/run-m4-1/milestone-two/resume",
+        expect.objectContaining({
+          method: "POST",
+          headers: expect.objectContaining({
+            "Content-Type": "application/json",
+            "Idempotency-Key": expect.any(String),
+          }),
+          body: JSON.stringify({ authorise_legacy_draft_recovery: true }),
+        }),
+      ),
     );
   });
 
@@ -281,6 +334,45 @@ describe("Blog Post page", () => {
         expect.objectContaining({
           method: "POST",
           body: JSON.stringify({ refresh_link_discovery: true }),
+        }),
+      ),
+    );
+  });
+
+  it("sends stable action-specific keys for cancel and export commands", async () => {
+    const user = userEvent.setup();
+    const cancelFetch = stubFetch({ runs: [summary()] }, detail);
+    const view = render(<App authMode="test-bypass" />);
+    await user.click(await screen.findByRole("button", { name: "Stop blog post" }));
+    await waitFor(() =>
+      expect(cancelFetch).toHaveBeenCalledWith(
+        "/api/runs/run-m4-1/cancel",
+        expect.objectContaining({
+          method: "POST",
+          headers: { "Idempotency-Key": expect.stringMatching(/^client:cancel:/) },
+        }),
+      ),
+    );
+
+    view.unmount();
+    vi.restoreAllMocks();
+    const exportFetch = stubFetch(
+      { runs: [summary({ status: "retryable_failed", current_step: "final_coherence_export" })] },
+      () =>
+        detail({
+          status: "retryable_failed",
+          current_step: "final_coherence_export",
+          export: { status: "failed", external_url: null },
+        }),
+    );
+    render(<App authMode="test-bypass" />);
+    await user.click(await screen.findByRole("button", { name: "Retry export" }));
+    await waitFor(() =>
+      expect(exportFetch).toHaveBeenCalledWith(
+        "/api/runs/run-m4-1/export/retry",
+        expect.objectContaining({
+          method: "POST",
+          headers: { "Idempotency-Key": expect.stringMatching(/^client:export:/) },
         }),
       ),
     );
@@ -381,7 +473,7 @@ describe("Blog Post page", () => {
         });
       if (url.includes("/resume") && init?.method === "POST") {
         current = persisted;
-        return response(persisted);
+        return accepted();
       }
       return response(current);
     });
@@ -432,7 +524,7 @@ describe("Blog Post page", () => {
 
     await waitFor(() => expect(within(context).getByText("Running")).toBeInTheDocument());
     expect(detailReads).toBeGreaterThan(1);
-    resolveResume(response(running));
+    resolveResume(accepted());
   });
 
   it("polls a clean Step 1.11 completion into Step 1.12 without a hard refresh", async () => {
@@ -494,7 +586,7 @@ describe("Blog Post page", () => {
     const rerunRow = within(pipeline).getByText("Automated checks re-run").closest("li")!;
     expect(within(rerunRow).getByText("Succeeded")).toBeInTheDocument();
     expect(detailReads).toBeGreaterThan(1);
-    resolveResume(response(advanced));
+    resolveResume(accepted());
   });
 
   it("derives the needs-decision state from a waiting run, opening the findings screen automatically", async () => {
@@ -818,7 +910,7 @@ describe("Blog Post page", () => {
   });
 
   it("requires explicit confirmation before the one exceptional correction", async () => {
-    stubFetch(
+    const fetchMock = stubFetch(
       { runs: [summary({ status: "blocked", current_step: "automated_checks_rerun" })] },
       () =>
         detail({
@@ -876,6 +968,21 @@ describe("Blog Post page", () => {
     const block = screen.getByRole("region", { name: "Operator action required" });
     expect(block).toHaveAttribute("tabindex", "-1");
     expect(block).toHaveClass("scroll-mt-20");
+
+    await userEvent.click(button);
+    await waitFor(() => {
+      const call = fetchMock.mock.calls.find(([input]) =>
+        String(input).includes("/exceptional-correction/authorise"),
+      );
+      expect(call).toBeDefined();
+      const init = call![1]!;
+      const actionKey = (init.headers as Record<string, string>)["Idempotency-Key"];
+      expect(actionKey).toMatch(/^client:exceptional-correction:/);
+      expect(JSON.parse(String(init.body))).toEqual({
+        explicit_confirmation: true,
+        idempotency_key: actionKey,
+      });
+    });
   });
 
   it("uses the persisted reason even when independently calculated counts are ambiguous", async () => {

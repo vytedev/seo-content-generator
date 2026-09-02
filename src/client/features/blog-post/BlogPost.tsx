@@ -1,12 +1,18 @@
-import { useCallback, useEffect, useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 import type { RunDetail, RunSummary } from "../../../shared/contracts/run-detail.js";
 import { AsyncNotice } from "../../components/AsyncNotice.js";
 import { PageHeader } from "../../components/PageHeader.js";
 import { Button } from "../../components/ui/button.js";
 import { fetchRecentRuns } from "../../lib/run-list-api.js";
+import { newActionIdempotencyKey } from "../../lib/command-submission-api.js";
 import { apiFetch } from "../../lib/api.js";
 import { reportClientFailure } from "../../lib/diagnostics.js";
-import { parseRunDetailResponse, resumeEndpoint, resumeRequest } from "../../lib/run-detail-api.js";
+import {
+  parseRunCommandResponse,
+  parseRunDetailResponse,
+  resumeEndpoint,
+  resumeRequest,
+} from "../../lib/run-detail-api.js";
 import { FindingsReview } from "../findings/FindingsReview.js";
 import { NewRun } from "../runs/NewRun.js";
 import { RunWorkspace, type RunAction } from "../runs/RunWorkspace.js";
@@ -53,6 +59,7 @@ export function BlogPost() {
   const [actionError, setActionError] = useState("");
   const [backToStart, setBackToStart] = useState(false);
   const [showFindings, setShowFindings] = useState(false);
+  const actionKeys = useRef(new Map<string, string>());
 
   const applyDetail = useCallback((incoming: RunDetail) => {
     // A quiet poll and an action response can cross in flight. Never let an
@@ -227,6 +234,7 @@ export function BlogPost() {
   function openRun(runId: string) {
     setBackToStart(false);
     setFocusRunId(runId);
+    actionKeys.current.clear();
     setRunInLocation(runId);
   }
 
@@ -235,6 +243,7 @@ export function BlogPost() {
     setDetail(null);
     setDetailState("idle");
     setFocusRunId("");
+    actionKeys.current.clear();
     setRunInLocation("");
   }
 
@@ -242,6 +251,10 @@ export function BlogPost() {
     if (!focusRunId || !detail) return;
     setAction(kind);
     setActionError("");
+    const actionIdentity = `${focusRunId}:${kind}`;
+    const idempotencyKey =
+      actionKeys.current.get(actionIdentity) ?? newActionIdempotencyKey(kind, focusRunId);
+    actionKeys.current.set(actionIdentity, idempotencyKey);
     const path =
       kind === "export"
         ? `/api/runs/${encodeURIComponent(focusRunId)}/export/retry`
@@ -253,26 +266,36 @@ export function BlogPost() {
     try {
       const response = await apiFetch(path, {
         ...(kind === "resume"
-          ? resumeRequest(detail.current_step, detail.draft_recovery)
-          : { method: "POST" }),
+          ? resumeRequest(detail.current_step, detail.draft_recovery, idempotencyKey)
+          : {
+              method: "POST",
+              headers: { "Idempotency-Key": idempotencyKey },
+            }),
         ...(kind === "exceptional-correction"
           ? {
-              headers: { "Content-Type": "application/json" },
+              headers: {
+                "Content-Type": "application/json",
+                "Idempotency-Key": idempotencyKey,
+              },
               body: JSON.stringify({
                 explicit_confirmation: true,
-                idempotency_key: `exceptional:${focusRunId}:${detail.current_document?.version.id ?? "missing"}`,
+                idempotency_key: idempotencyKey,
               }),
             }
           : {}),
       });
       const body: unknown = await response.json();
-      const parsed = parseRunDetailResponse(
+      parseRunCommandResponse(
         body,
-        response.ok,
+        response.status,
+        focusRunId,
         "The action could not be completed.",
       );
-      applyDetail(parsed);
+      // The durable acceptance retires this key. Any failure before this point,
+      // including a disconnected response, deliberately keeps it for replay.
+      actionKeys.current.delete(actionIdentity);
       setBackToStart(false);
+      await fetchDetail(focusRunId, true);
     } catch (error) {
       const message = error instanceof Error ? error.message : "The action could not be completed.";
       setActionError(message);

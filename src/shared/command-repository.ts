@@ -36,6 +36,7 @@ export interface RunCommandRepository {
   /** Atomically applies domain state, one existing queue action where applicable, command and activity. */
   submitCommand(command: RunCommand): Promise<CommandSubmissionResult>;
   findCommand?(idempotencyKey: string): Promise<RunCommand | null>;
+  configureEditorialCorrection?(handler: (runId: string) => Promise<unknown>): void;
   listCommandActivity(runId: string): Promise<RunActivity[]>;
 }
 

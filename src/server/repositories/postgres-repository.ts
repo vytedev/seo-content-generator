@@ -206,6 +206,7 @@ export class PostgresMilestoneRepository
     RunCommandRepository
 {
   private readonly transactionContext = new AsyncLocalStorage<PoolClient>();
+  private editorialCorrectionHandler: ((runId: string) => Promise<unknown>) | undefined;
 
   constructor(
     private readonly pool: Pool,
@@ -3781,6 +3782,10 @@ export class PostgresMilestoneRepository
     await this.transaction((client) => this.enqueueRunClient(client, runId, parsed));
   }
 
+  configureEditorialCorrection(handler: (runId: string) => Promise<unknown>): void {
+    this.editorialCorrectionHandler = handler;
+  }
+
   async findCommand(idempotencyKey: string) {
     const row = await this.pool.query<{ payload: unknown }>(
       "select payload from run_command_outbox where idempotency_key=$1",
@@ -3874,6 +3879,11 @@ export class PostgresMilestoneRepository
         case "cancel_run":
           await this.cancelRun(runId);
           result = { cancelled: true };
+          break;
+        case "open_editorial_correction":
+          if (!this.editorialCorrectionHandler)
+            throw new UnprocessableError("Editorial correction is not configured.");
+          result = await this.editorialCorrectionHandler(runId);
           break;
         case "authorise_exceptional_correction":
           result = {

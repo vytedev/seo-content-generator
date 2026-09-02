@@ -153,7 +153,7 @@ describe("live run advancement 1.1 → 1.9 → export", () => {
       .post("/api/runs")
       .set("Idempotency-Key", "queued-step-1-10-restart")
       .send(handoff);
-    expect(created.status).toBe(201);
+    expect(created.status).toBe(202);
     const runId = created.body.run_id as string;
     await vi.waitFor(async () =>
       expect((await setup.repository.getRunDetail(runId)).status).toBe("waiting"),
@@ -174,7 +174,7 @@ describe("live run advancement 1.1 → 1.9 → export", () => {
         })),
       });
     expect(submitted.status).toBe(202);
-    expect(submitted.body.continuation).toBe("queue_accepted");
+    expect(submitted.body.queue_accepted).toBe(true);
     expect(setup.revisionProvider.calls).toHaveLength(0);
 
     const restartedWorker = new PipelineQueueWorker(
@@ -231,7 +231,7 @@ describe("live run advancement 1.1 → 1.9 → export", () => {
       .post("/api/runs")
       .set("Idempotency-Key", "queued-step-1-11-takeover")
       .send(handoff)
-      .expect(201);
+      .expect(202);
     const runId = created.body.run_id as string;
     await vi.waitFor(async () =>
       expect((await repository.getRunDetail(runId)).status).toBe("waiting"),
@@ -356,7 +356,7 @@ describe("live run advancement 1.1 → 1.9 → export", () => {
       .post("/api/runs")
       .set("Idempotency-Key", "queued-step-1-11-pre-save-takeover")
       .send(handoff)
-      .expect(201);
+      .expect(202);
     const runId = created.body.run_id as string;
     await vi.waitFor(async () =>
       expect((await repository.getRunDetail(runId)).status).toBe("waiting"),

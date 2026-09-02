@@ -100,11 +100,10 @@ describe("findings API", () => {
         dispositions: [{ finding_id: "finding-1", decision: "accepted", rationale: "Apply" }],
       });
     expect(submitted.status).toBe(202);
-    expect(submitted.body).toEqual({
-      completed: true,
-      submitted: 1,
-      continuation_required: true,
-      continuation: "queue_accepted",
+    expect(submitted.body).toMatchObject({
+      run_id: "run-1",
+      replayed: false,
+      queue_accepted: true,
     });
   });
 
@@ -125,7 +124,7 @@ describe("findings API", () => {
       });
 
     expect(submitted.status).toBe(202);
-    expect(submitted.body.continuation).toBe("queue_accepted");
+    expect(submitted.body.queue_accepted).toBe(true);
     expect(run).not.toHaveBeenCalled();
   });
 

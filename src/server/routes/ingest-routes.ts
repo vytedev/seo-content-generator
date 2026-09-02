@@ -2,7 +2,7 @@ import type { Express } from "express";
 import { z, ZodError } from "zod";
 import { RepositoryConflictError, RepositoryUnavailableError } from "../../shared/errors.js";
 import type { RunCommandRepository } from "../../shared/command-repository.js";
-import { buildRouteCommand } from "./command-submission.js";
+import { buildRouteCommand, commandAcceptedBody } from "./command-submission.js";
 import {
   IdempotencyConflictError,
   canonicalHash,
@@ -114,25 +114,28 @@ export function registerIngestRoutes(
       )
         throw new RepositoryConflictError("The idempotency key is bound to a different handoff.");
       const prepared = existing ? null : await service.prepare(request.body);
-      const result = (
-        await commands.submitCommand(
-          buildRouteCommand({
-            kind: "create_run",
-            idempotency_key: keyResult.data,
-            body: existing
-              ? { handoff: existing.handoff, warnings: existing.warnings }
-              : { handoff: prepared!.handoff, warnings: prepared!.warnings },
-          }),
-        )
-      ).result as IngestResult;
+      const submission = await commands.submitCommand(
+        buildRouteCommand({
+          kind: "create_run",
+          idempotency_key: keyResult.data,
+          body: existing
+            ? { handoff: existing.handoff, warnings: existing.warnings }
+            : { handoff: prepared!.handoff, warnings: prepared!.warnings },
+        }),
+      );
       if (testOnlySynchronousContinuation) {
         try {
-          await testOnlySynchronousContinuation(result.run_id);
+          await testOnlySynchronousContinuation(submission.run_id);
         } catch {
-          // Test-only compatibility: orchestrators own their durable failure state.
+          // Explicit test-only compatibility adapter; production never invokes it.
         }
+        response.location(`/api/runs/${submission.run_id}`).status(201).json(submission.result);
+        return;
       }
-      response.location(`/api/runs/${result.run_id}`).status(201).json(result);
+      response
+        .location(`/api/runs/${submission.run_id}`)
+        .status(202)
+        .json(commandAcceptedBody(submission));
     } catch (error) {
       if (error instanceof ZodError) {
         response.status(400).json({

@@ -1,4 +1,4 @@
-import { type ChangeEvent, type FormEvent, useEffect, useId, useRef, useState } from "react";
+import { type ChangeEvent, type FormEvent, useId, useRef, useState } from "react";
 import { HandoffSchema } from "../../../shared/pipeline.js";
 import { AsyncNotice } from "../../components/AsyncNotice.js";
 import { Button } from "../../components/ui/button.js";
@@ -7,7 +7,6 @@ import { Input } from "../../components/ui/input.js";
 import { Textarea } from "../../components/ui/textarea.js";
 import { IngestApiError, parseIngestResponse } from "../../lib/ingest-api.js";
 import { apiFetch } from "../../lib/api.js";
-import { fetchRecentRuns } from "../../lib/run-list-api.js";
 
 const newKey = () => `run-${crypto.randomUUID()}`;
 const MAX_HANDOFF_FILE_BYTES = 100 * 1024;
@@ -23,11 +22,6 @@ export function NewRun({ onOpenRun }: { onOpenRun: (runId: string) => void }) {
   const [successId, setSuccessId] = useState("");
   const [warnings, setWarnings] = useState<Array<{ code: string; message: string }>>([]);
   const requestSequence = useRef(0);
-  const progressPollRef = useRef(0);
-
-  // Ingest runs steps 1.1–1.9 synchronously, so the POST can stay in flight for
-  // minutes with a real model. Stop polling when the form unmounts or is reset.
-  useEffect(() => () => window.clearInterval(progressPollRef.current), []);
 
   function edit(value: string) {
     if (attempted) {
@@ -35,7 +29,6 @@ export function NewRun({ onOpenRun }: { onOpenRun: (runId: string) => void }) {
       setAttempted(false);
       requestSequence.current += 1;
       setBusy(false);
-      window.clearInterval(progressPollRef.current);
     }
     setJson(value);
     setErrors([]);
@@ -94,33 +87,6 @@ export function NewRun({ onOpenRun }: { onOpenRun: (runId: string) => void }) {
     setSuccessId("");
     setWarnings([]);
     setNotice("Starting your blog post…");
-    // The ingest POST runs steps 1.1–1.9 synchronously and can stay in flight
-    // for minutes. Poll the run list in parallel and focus the run the moment
-    // it appears, so the operator watches live progress in 02 Production
-    // instead of staring at a submitting button. The POST result still governs
-    // warnings and errors when it lands.
-    let opened = false;
-    const maybeOpen = (runId: string) => {
-      if (opened || sequence !== requestSequence.current) return;
-      opened = true;
-      onOpenRun(runId);
-    };
-    window.clearInterval(progressPollRef.current);
-    progressPollRef.current = window.setInterval(() => {
-      if (sequence !== requestSequence.current) {
-        window.clearInterval(progressPollRef.current);
-        return;
-      }
-      void fetchRecentRuns()
-        .then((list) => {
-          const match = list.find((run) => run.plane_ticket === validation.data.plane_ticket);
-          if (match) {
-            window.clearInterval(progressPollRef.current);
-            maybeOpen(match.run_id);
-          }
-        })
-        .catch(() => {});
-    }, 2000);
     try {
       const response = await apiFetch("/api/runs", {
         method: "POST",
@@ -128,25 +94,24 @@ export function NewRun({ onOpenRun }: { onOpenRun: (runId: string) => void }) {
         body: JSON.stringify(validation.data),
       });
       const body: unknown = await response.json();
-      const result = parseIngestResponse(body, response.ok);
-      window.clearInterval(progressPollRef.current);
+      const result = parseIngestResponse(body, response.status);
       if (sequence !== requestSequence.current) return;
-      if (!result.warnings.length) {
-        // A clean handoff has nothing left to confirm — go straight to production
-        // rather than making the operator click a second "View progress" button.
-        maybeOpen(result.run_id);
+      // Rotate only after the server durably accepts this exact command. A
+      // disconnect or other ambiguous failure leaves the key unchanged so the
+      // operator's retry is a replay, never a second run.
+      setKey(newKey());
+      setAttempted(false);
+      if (!result.result.warnings.length) {
+        setNotice("Blog post accepted. Loading progress…");
+        onOpenRun(result.run_id);
         return;
       }
-      // A non-blocking warning (e.g. a SERP composition mismatch) is exactly the
-      // kind of thing the operator should actually see before continuing, so this
-      // path stops here and waits for a deliberate "View progress" click instead.
       setSuccessId(result.run_id);
-      setWarnings(result.warnings);
+      setWarnings(result.result.warnings);
       setNotice(
-        `Blog post started with ${result.warnings.length} non-blocking ${result.warnings.length === 1 ? "warning" : "warnings"}.`,
+        `Blog post started with ${result.result.warnings.length} non-blocking ${result.result.warnings.length === 1 ? "warning" : "warnings"}.`,
       );
     } catch (error) {
-      window.clearInterval(progressPollRef.current);
       if (sequence !== requestSequence.current) return;
       if (error instanceof IngestApiError) setErrors(error.details);
       setNotice(error instanceof Error ? error.message : "The handoff could not be ingested.");

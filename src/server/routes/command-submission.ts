@@ -40,13 +40,25 @@ export function buildRouteCommand(input: {
   return RunCommandSchema.parse({ ...draft, payload_hash: commandPayloadHash(draft) });
 }
 
+export function commandAcceptedBody(
+  submission: Awaited<ReturnType<RunCommandRepository["submitCommand"]>>,
+) {
+  return {
+    command_id: submission.command_id,
+    run_id: submission.run_id,
+    replayed: submission.replayed,
+    queue_accepted: submission.queue_accepted,
+    result: submission.result,
+  };
+}
+
 export async function submitQueueRouteCommand(input: {
   repository: RunCommandRepository;
   kind: "resume_run" | "retry_export";
   run_id: string;
   idempotency_key: string;
   options?: QueueOptions;
-}): Promise<void> {
+}) {
   const queueOptions = input.options ?? {};
   const commandOptions = {
     ...(queueOptions.refresh_link_discovery ? { refresh_link_discovery: true } : {}),
@@ -63,5 +75,5 @@ export async function submitQueueRouteCommand(input: {
     idempotency_key: input.idempotency_key,
     ...(input.kind === "resume_run" ? { body: { options: commandOptions } } : {}),
   });
-  await input.repository.submitCommand(command);
+  return input.repository.submitCommand(command);
 }

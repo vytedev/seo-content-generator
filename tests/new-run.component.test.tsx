@@ -13,6 +13,28 @@ const handoff = JSON.stringify({
   client_insights: "Compact homes",
 });
 
+function acceptedResponse(
+  runId: string,
+  warnings: Array<{ code: string; message: string }> = [],
+  replayed = false,
+) {
+  return new Response(
+    JSON.stringify({
+      command_id: replayed ? "command-replayed" : "command-1",
+      run_id: runId,
+      replayed,
+      queue_accepted: true,
+      result: {
+        run_id: runId,
+        input_hash: "a".repeat(64),
+        handoff: JSON.parse(handoff),
+        warnings,
+      },
+    }),
+    { status: 202, headers: { "Content-Type": "application/json" } },
+  );
+}
+
 afterEach(() => {
   cleanup();
   vi.restoreAllMocks();
@@ -56,8 +78,8 @@ it("rejects oversized files before reading and links the cleared file error", as
   expect(text).not.toHaveBeenCalled();
 });
 
-it("keeps the submitted payload visible while busy and renders every warning", async () => {
-  let resolveResponse!: (value: unknown) => void;
+it("keeps the submitted payload visible while awaiting durable acceptance", async () => {
+  let resolveResponse!: (value: Response) => void;
   vi.stubGlobal(
     "fetch",
     vi.fn().mockImplementation(
@@ -74,71 +96,68 @@ it("keeps the submitted payload visible while busy and renders every warning", a
   await user.click(screen.getByRole("button", { name: "Start blog post" }));
   expect(input).toBeDisabled();
   expect(screen.getByLabelText("Local JSON file")).toBeDisabled();
-  resolveResponse({
-    ok: true,
-    json: async () => ({
-      run_id: "run-warnings",
-      input_hash: "a".repeat(64),
-      handoff: JSON.parse(handoff),
-      warnings: [
-        { code: "serp_composition_mismatch", message: "Commercial composition." },
-        { code: "serp_probe_failed", message: "Probe failed safely." },
-      ],
-    }),
-  });
+  resolveResponse(acceptedResponse("run-accepted"));
+  expect(await screen.findByRole("status")).toHaveTextContent(
+    "Blog post accepted. Loading progress…",
+  );
+  expect(input).toHaveValue(handoff);
+});
+
+it("renders every warning from the command envelope result and waits for a deliberate view", async () => {
+  const open = vi.fn();
+  vi.spyOn(globalThis, "fetch").mockResolvedValue(
+    acceptedResponse("run-warnings", [
+      { code: "serp_composition_mismatch", message: "Commercial composition." },
+      { code: "serp_probe_failed", message: "Probe failed safely." },
+    ]),
+  );
+  const user = userEvent.setup();
+  render(<NewRun onOpenRun={open} />);
+  fireEvent.change(screen.getByLabelText("Handoff JSON"), { target: { value: handoff } });
+  await user.click(screen.getByRole("button", { name: "Start blog post" }));
   expect(
     await screen.findByText("Blog post started with 2 non-blocking warnings."),
   ).toBeInTheDocument();
   expect(screen.getByText(/Commercial composition/)).toBeInTheDocument();
   expect(screen.getByText(/Probe failed safely/)).toBeInTheDocument();
-  expect(input).toHaveValue(handoff);
+  expect(open).not.toHaveBeenCalled();
+  await user.click(screen.getByRole("button", { name: "View progress" }));
+  expect(open).toHaveBeenCalledWith("run-warnings");
 });
 
-it("creates a run with no warnings and goes straight to production, with no extra click", async () => {
+it("parses the 202 command identity, rotates the accepted key, and opens its exact run", async () => {
   const open = vi.fn();
-  vi.stubGlobal(
-    "fetch",
-    vi.fn().mockResolvedValue({
-      ok: true,
-      json: async () => ({
-        run_id: "run-1",
-        input_hash: "a".repeat(64),
-        handoff: JSON.parse(handoff),
-        warnings: [],
-      }),
-    }),
-  );
+  const fetchMock = vi.spyOn(globalThis, "fetch").mockResolvedValue(acceptedResponse("run-1"));
   const user = userEvent.setup();
   render(<NewRun onOpenRun={open} />);
+  const key = screen.getByLabelText("Idempotency key") as HTMLInputElement;
+  const submittedKey = key.value;
   fireEvent.change(screen.getByLabelText("Handoff JSON"), { target: { value: handoff } });
   await user.click(screen.getByRole("button", { name: "Start blog post" }));
   await waitFor(() => expect(open).toHaveBeenCalledWith("run-1"));
   expect(screen.queryByRole("button", { name: "View progress" })).not.toBeInTheDocument();
-  await waitFor(() => expect(fetch).toHaveBeenCalledTimes(1));
-});
-
-it("stops for a deliberate click when the ingest returns a non-blocking warning", async () => {
-  const open = vi.fn();
-  vi.stubGlobal(
-    "fetch",
-    vi.fn().mockResolvedValue({
-      ok: true,
-      json: async () => ({
-        run_id: "run-warned",
-        input_hash: "a".repeat(64),
-        handoff: JSON.parse(handoff),
-        warnings: [{ code: "serp_composition_mismatch", message: "Commercial composition." }],
-      }),
+  expect(fetchMock).toHaveBeenCalledWith(
+    "/api/runs",
+    expect.objectContaining({
+      headers: expect.objectContaining({ "Idempotency-Key": submittedKey }),
     }),
   );
+  expect(key.value).not.toBe(submittedKey);
+});
+
+it("reuses the create key after a disconnected response", async () => {
+  const fetchMock = vi
+    .spyOn(globalThis, "fetch")
+    .mockRejectedValueOnce(new TypeError("Network disconnected"))
+    .mockResolvedValueOnce(acceptedResponse("run-1", [], true));
   const user = userEvent.setup();
-  render(<NewRun onOpenRun={open} />);
+  render(<NewRun onOpenRun={() => undefined} />);
   fireEvent.change(screen.getByLabelText("Handoff JSON"), { target: { value: handoff } });
+  const key = (screen.getByLabelText("Idempotency key") as HTMLInputElement).value;
   await user.click(screen.getByRole("button", { name: "Start blog post" }));
-  expect(await screen.findByRole("status")).toHaveTextContent(
-    "Blog post started with 1 non-blocking warning.",
-  );
-  expect(open).not.toHaveBeenCalled();
-  await user.click(screen.getByRole("button", { name: "View progress" }));
-  expect(open).toHaveBeenCalledWith("run-warned");
+  await screen.findByText("Network disconnected");
+  await user.click(screen.getByRole("button", { name: "Start blog post" }));
+  await waitFor(() => expect(fetchMock).toHaveBeenCalledTimes(2));
+  for (const [, init] of fetchMock.mock.calls)
+    expect((init?.headers as Record<string, string>)["Idempotency-Key"]).toBe(key);
 });
