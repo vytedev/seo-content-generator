@@ -13,4 +13,5 @@ credentials*
 *token*
 Dockerfile*
 docker-compose*.yml
+!docker-compose.override.example.yml
 docker-compose*.yaml

@@ -12,16 +12,24 @@ FROM node:22-bookworm-slim AS development
 
 WORKDIR /app
 
-COPY package*.json ./
-RUN npm ci && chown -R node:node /app/node_modules
+ARG DEV_UID=1000
+ARG DEV_GID=1000
 
-COPY --chown=node:node . .
+RUN apt-get update \
+  && apt-get install -y --no-install-recommends procps \
+  && rm -rf /var/lib/apt/lists/*
+
+COPY package*.json ./
+RUN npm ci && chown -R "${DEV_UID}:${DEV_GID}" /app/node_modules
+
+COPY --chown=${DEV_UID}:${DEV_GID} . .
 
 ENV NODE_ENV=development
+ENV HOME=/tmp
 
-EXPOSE 3000 3100
+EXPOSE 3000 3110
 
-USER node
+USER ${DEV_UID}:${DEV_GID}
 
 CMD ["npm", "run", "dev:host"]
 
