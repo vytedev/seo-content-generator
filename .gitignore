@@ -9,3 +9,4 @@ coverage/
 credentials*
 *token*
 !src/client/styles/tokens.css
+/docker-compose.override.yml

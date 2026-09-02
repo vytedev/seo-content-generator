@@ -1,0 +1,29 @@
+# Optional development deployment override for content-generator.vyte.dev.
+#
+# Copy this file to docker-compose.override.yml (which is gitignored), then set
+# DEV_UID to the host checkout owner and DEV_GID to the checkout's shared group
+# so source files created with mode 0660 remain readable.
+
+services:
+  app:
+    build:
+      target: development
+      args:
+        DEV_UID: "${DEV_UID:-1000}"
+        DEV_GID: "${DEV_GID:-1024}"
+    container_name: content-generator
+    volumes:
+      - .:/app
+      - /app/node_modules
+    environment:
+      NODE_ENV: development
+      HOST: 0.0.0.0
+      PORT: 3110
+      CONTAINER_DEV: "true"
+    networks:
+      - app_network
+      - shared_network
+
+networks:
+  shared_network:
+    external: true

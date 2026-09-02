@@ -9,6 +9,9 @@ export const GOOGLE_DOCS_SCOPES = [
 export const GOOGLE_GSC_SCOPES = ["https://www.googleapis.com/auth/webmasters.readonly"] as const;
 export const GOOGLE_SCOPES = [...GOOGLE_DOCS_SCOPES, ...GOOGLE_GSC_SCOPES] as const;
 const GOOGLE_LOCK = "google_oauth:google";
+const APPROVED_HTTPS_REDIRECT_URIS = new Set([
+  "https://content-generator.vyte.dev/api/integrations/google/callback",
+]);
 
 const tokenResponseSchema = z.object({
   access_token: z.string().min(1),
@@ -59,15 +62,14 @@ export function googleOAuthConfigFromEnv(env: NodeJS.ProcessEnv): GoogleOAuthCon
   }
   try {
     const redirect = new URL(redirectUri);
-    if (
-      redirect.protocol !== "http:" ||
-      !new Set(["localhost", "127.0.0.1", "::1"]).has(redirect.hostname)
-    ) {
-      throw new Error("not local");
-    }
+    const isLocalHttp =
+      redirect.protocol === "http:" &&
+      new Set(["localhost", "127.0.0.1", "::1"]).has(redirect.hostname);
+    const isApprovedHttps = APPROVED_HTTPS_REDIRECT_URIS.has(redirect.toString());
+    if (!isLocalHttp && !isApprovedHttps) throw new Error("redirect not approved");
     return { clientId, clientSecret, redirectUri: redirect.toString(), encryptionKey };
   } catch {
-    throw new GoogleOAuthError("Google OAuth redirect URI must be a local HTTP URL.");
+    throw new GoogleOAuthError("Google OAuth redirect URI is not approved.");
   }
 }
 

@@ -1,6 +1,6 @@
 import type { Express, NextFunction, Request, RequestHandler, Response } from "express";
 import { z } from "zod";
-import { LOCAL_AUTH_ALLOWED_ORIGINS } from "../../shared/local-runtime.js";
+import { LOCAL_API_ORIGIN, LOCAL_FRONTEND_ORIGIN } from "../../shared/local-runtime.js";
 import type { AuthConfig } from "./config.js";
 import {
   csrfToken,
@@ -12,11 +12,16 @@ import {
 import type { SessionStore } from "./session-store.js";
 
 export const SESSION_COOKIE = "mm03_operator_session";
+export const AUTH_ALLOWED_ORIGINS = [
+  LOCAL_FRONTEND_ORIGIN,
+  LOCAL_API_ORIGIN,
+  "https://content-generator.vyte.dev",
+] as const;
 const loginSchema = z
   .object({ email: z.string().trim().email(), password: z.string().min(1).max(1024) })
   .strict();
 const SAFE_METHODS = new Set(["GET", "HEAD", "OPTIONS"]);
-const ALLOWED_ORIGINS = LOCAL_AUTH_ALLOWED_ORIGINS;
+const ALLOWED_ORIGINS = new Set<string>(AUTH_ALLOWED_ORIGINS);
 
 export interface AuthServiceOptions {
   config: AuthConfig;
@@ -24,6 +29,7 @@ export interface AuthServiceOptions {
   now?: () => Date;
   throttle?: LoginThrottle;
   operatorName?: string;
+  secureCookies?: boolean;
 }
 
 export interface AuthService {
@@ -69,6 +75,7 @@ export class LoginThrottle {
 export function createAuthService(options: AuthServiceOptions): AuthService {
   const now = options.now ?? (() => new Date());
   const throttle = options.throttle ?? new LoginThrottle();
+  const secureCookies = options.secureCookies ?? false;
   const config = options.config;
   const store = options.store;
   const operator = {
@@ -149,7 +156,7 @@ export function createAuthService(options: AuthServiceOptions): AuthService {
             tokenHash: keyedTokenHash(token, config.SESSION_SECRET),
             expiresAt,
           });
-          setSessionCookie(response, token, config.SESSION_TTL_HOURS);
+          setSessionCookie(response, token, config.SESSION_TTL_HOURS, secureCookies);
           response.status(200).json({
             authenticated: true,
             operator,
@@ -183,7 +190,7 @@ export function createAuthService(options: AuthServiceOptions): AuthService {
         async (request: AuthenticatedRequest, response, next) => {
           try {
             await store.revoke(request.operatorSession!.tokenHash, now());
-            clearSessionCookie(response);
+            clearSessionCookie(response, secureCookies);
             response.status(204).end();
           } catch (error) {
             next(error);
@@ -208,20 +215,25 @@ function unauthorised(response: Response) {
     .status(401)
     .json({ error: { code: "AUTH_REQUIRED", message: "Authentication is required." } });
 }
-function setSessionCookie(response: Response, token: string, ttlHours: number): void {
+function setSessionCookie(
+  response: Response,
+  token: string,
+  ttlHours: number,
+  secure: boolean,
+): void {
   response.cookie(SESSION_COOKIE, token, {
     httpOnly: true,
     sameSite: "strict",
-    secure: false,
+    secure,
     path: "/",
     maxAge: ttlHours * 3_600_000,
   });
 }
-function clearSessionCookie(response: Response): void {
+function clearSessionCookie(response: Response, secure: boolean): void {
   response.clearCookie(SESSION_COOKIE, {
     httpOnly: true,
     sameSite: "strict",
-    secure: false,
+    secure,
     path: "/",
   });
 }

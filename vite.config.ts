@@ -22,6 +22,12 @@ function conciseDevOutput(): Plugin {
   };
 }
 
+const rawContainerDev = process.env.CONTAINER_DEV?.trim().toLowerCase();
+if (rawContainerDev && !new Set(["true", "false"]).has(rawContainerDev)) {
+  throw new Error("CONTAINER_DEV must be exactly 'true' or 'false' when set.");
+}
+const containerDev = rawContainerDev === "true";
+
 export default defineConfig({
   plugins: [react(), tailwindcss(), conciseDevOutput()],
   resolve: {
@@ -31,9 +37,19 @@ export default defineConfig({
   },
   build: { outDir: "dist/client", emptyOutDir: true },
   server: {
-    host: "127.0.0.1",
-    port: LOCAL_FRONTEND_PORT,
+    host: containerDev ? "0.0.0.0" : "127.0.0.1",
+    port: containerDev ? 3000 : LOCAL_FRONTEND_PORT,
     strictPort: true,
+    allowedHosts: containerDev ? ["content-generator.vyte.dev"] : [],
+    ...(containerDev
+      ? {
+          hmr: {
+            protocol: "wss" as const,
+            host: "content-generator.vyte.dev",
+            clientPort: 443,
+          },
+        }
+      : {}),
     proxy: { "/api": LOCAL_API_ORIGIN },
   },
 });

@@ -19,6 +19,7 @@ async function authenticatedApp() {
         SESSION_SECRET: "test-secret-that-is-at-least-32-characters",
         SESSION_TTL_HOURS: 12,
       },
+      secureCookies: true,
     },
   });
   return { app, store };
@@ -57,6 +58,7 @@ describe("operator authentication", () => {
       .expect(200);
     const setCookie = String(login.headers["set-cookie"]?.[0]);
     expect(setCookie).toContain("HttpOnly");
+    expect(setCookie).toContain("Secure");
     expect(setCookie).toContain("SameSite=Strict");
     expect(setCookie).not.toContain("Domain=");
     expect(login.headers["access-control-allow-origin"]).toBe("http://127.0.0.1:5173");
@@ -107,6 +109,13 @@ describe("operator authentication", () => {
       .send({ email: "operator@example.com", password: "correct horse battery staple" })
       .expect(200)
       .expect("Access-Control-Allow-Origin", "http://127.0.0.1:3110");
+
+    await request(app)
+      .post("/api/auth/login")
+      .set("Origin", "https://content-generator.vyte.dev")
+      .send({ email: "operator@example.com", password: "correct horse battery staple" })
+      .expect(200)
+      .expect("Access-Control-Allow-Origin", "https://content-generator.vyte.dev");
   });
 
   it("uses generic errors, an origin allowlist and bounded per-IP throttling", async () => {
