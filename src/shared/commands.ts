@@ -110,6 +110,18 @@ export const RunActivitySchema = z
         path: ["command_id"],
         message: "Command activity needs a command id.",
       });
+    if (activity.type.startsWith("command_") && activity.step)
+      context.addIssue({
+        code: "custom",
+        path: ["step"],
+        message: "Command activity cannot claim a pipeline step.",
+      });
+    if (activity.type.startsWith("step_") && activity.command_id)
+      context.addIssue({
+        code: "custom",
+        path: ["command_id"],
+        message: "Step activity cannot claim a command.",
+      });
     if (activity.type.startsWith("step_") && !activity.step)
       context.addIssue({
         code: "custom",

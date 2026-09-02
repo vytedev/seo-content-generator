@@ -17,6 +17,13 @@ import {
   uuid,
 } from "drizzle-orm/pg-core";
 import type { RunBlockReason } from "../shared/contracts/run-detail.js";
+import type { RunActivity, RunCommand } from "../shared/commands.js";
+import type { HardFlagReason } from "../shared/hard-flags.js";
+import type { SerpComposition } from "../shared/ingest-contracts.js";
+import type {
+  PaidOperationAmbiguityReason,
+  PaidOperationReleaseReason,
+} from "../shared/paid-operation.js";
 import type { Handoff } from "../shared/pipeline.js";
 
 const createdAt = timestamp("created_at", { withTimezone: true }).notNull().defaultNow();
@@ -144,6 +151,120 @@ export const runs = pgTable(
     check(
       "runs_success_at_final_step",
       sql`${t.status} <> 'succeeded' or ${t.currentStep} = 'final_coherence_export'`,
+    ),
+  ],
+);
+
+/** Durable command intent. Identity/payload are immutable; workers append activity separately. */
+export const runCommandOutbox = pgTable(
+  "run_command_outbox",
+  {
+    commandId: text("command_id").primaryKey(),
+    runId: uuid("run_id").references(() => runs.id, { onDelete: "restrict" }),
+    kind: text("kind").notNull(),
+    idempotencyKey: text("idempotency_key").notNull(),
+    payloadHash: text("payload_hash").notNull(),
+    payload: jsonb("payload").$type<RunCommand>().notNull(),
+    status: text("status").notNull().default("pending"),
+    terminalResult: jsonb("terminal_result").$type<Record<string, unknown>>(),
+    completedAt: timestamp("completed_at", { withTimezone: true }),
+    createdAt,
+    updatedAt,
+  },
+  (t) => [
+    uniqueIndex("run_command_outbox_idempotency_unique").on(t.idempotencyKey),
+    index("run_command_outbox_claim_idx").on(t.status, t.createdAt),
+    check("run_command_outbox_payload_hash", sql`${t.payloadHash} ~ '^[a-f0-9]{64}$'`),
+    check(
+      "run_command_outbox_kind",
+      sql`${t.kind} in ('create_run','resume_run','cancel_run','submit_findings','open_editorial_correction','authorise_exceptional_correction','retry_export','acknowledge_warning','probe_serp')`,
+    ),
+    check(
+      "run_command_outbox_run_shape",
+      sql`(${t.kind}='create_run' and ${t.runId} is null) or (${t.kind}<>'create_run' and ${t.runId} is not null)`,
+    ),
+    check(
+      "run_command_outbox_payload_identity",
+      sql`coalesce(jsonb_typeof(${t.payload})='object' and ${t.payload}->>'command_id'=${t.commandId} and ${t.payload}->>'kind'=${t.kind} and ${t.payload}->>'idempotency_key'=${t.idempotencyKey} and ${t.payload}->>'payload_hash'=${t.payloadHash} and ((${t.kind}='create_run' and not (${t.payload} ? 'run_id')) or (${t.kind}<>'create_run' and ${t.payload}->>'run_id'=${t.runId}::text)), false)`,
+    ),
+    check(
+      "run_command_outbox_status",
+      sql`${t.status} in ('pending','processing','succeeded','failed')`,
+    ),
+    check(
+      "run_command_outbox_terminal_result",
+      sql`(${t.status} in ('pending','processing') and ${t.terminalResult} is null and ${t.completedAt} is null) or (${t.status} in ('succeeded','failed') and ${t.terminalResult} is not null and ${t.completedAt} is not null)`,
+    ),
+  ],
+);
+
+/** Append-only, sequence-ordered operator activity for one run. */
+export const runActivityEvents = pgTable(
+  "run_activity_events",
+  {
+    activityId: text("activity_id").primaryKey(),
+    runId: uuid("run_id")
+      .notNull()
+      .references(() => runs.id, { onDelete: "restrict" }),
+    sequence: integer("sequence").notNull(),
+    type: text("type").notNull(),
+    commandId: text("command_id").references(() => runCommandOutbox.commandId, {
+      onDelete: "restrict",
+    }),
+    step: pipelineStep("step"),
+    summary: text("summary").notNull(),
+    payload: jsonb("payload").$type<RunActivity>().notNull(),
+    occurredAt: timestamp("occurred_at", { withTimezone: true }).notNull(),
+    createdAt,
+  },
+  (t) => [
+    uniqueIndex("run_activity_events_run_sequence_unique").on(t.runId, t.sequence),
+    index("run_activity_events_run_occurred_idx").on(t.runId, t.occurredAt),
+    check("run_activity_events_sequence", sql`${t.sequence} > 0`),
+    check("run_activity_events_summary_bound", sql`length(${t.summary}) between 1 and 500`),
+    check(
+      "run_activity_events_type",
+      sql`${t.type} in ('command_accepted','command_rejected','step_started','step_waiting','step_failed','step_blocked','step_succeeded','run_cancelled','warning_recorded','warning_acknowledged','export_succeeded')`,
+    ),
+    check(
+      "run_activity_events_reference_shape",
+      sql`(${t.type} like 'command\\_%' escape '\\' and ${t.commandId} is not null and ${t.step} is null) or (${t.type} like 'step\\_%' escape '\\' and ${t.step} is not null and ${t.commandId} is null) or (${t.type} not like 'command\\_%' escape '\\' and ${t.type} not like 'step\\_%' escape '\\' and ${t.commandId} is null and ${t.step} is null)`,
+    ),
+    check(
+      "run_activity_events_payload_identity",
+      sql`coalesce(jsonb_typeof(${t.payload})='object' and ${t.payload}->>'activity_id'=${t.activityId} and ${t.payload}->>'run_id'=${t.runId}::text and (${t.payload}->>'sequence')::integer=${t.sequence} and ${t.payload}->>'type'=${t.type} and ${t.payload}->>'summary'=${t.summary} and (${t.payload}->>'occurred_at')::timestamptz=${t.occurredAt} and coalesce(${t.payload}->>'command_id','')=coalesce(${t.commandId},'') and coalesce(${t.payload}->>'step','')=coalesce(${t.step}::text,''), false)`,
+    ),
+  ],
+);
+
+/** Immutable evidence behind non-blocking SERP composition warnings. */
+export const serpEvidence = pgTable(
+  "serp_evidence",
+  {
+    evidenceId: text("evidence_id").primaryKey(),
+    runId: uuid("run_id")
+      .notNull()
+      .references(() => runs.id, { onDelete: "restrict" }),
+    handoffHash: text("handoff_hash").notNull(),
+    provider: text("provider").notNull(),
+    query: text("query").notNull(),
+    retrievedAt: timestamp("retrieved_at", { withTimezone: true }).notNull(),
+    status: text("status").notNull(),
+    composition: jsonb("composition").$type<SerpComposition>(),
+    failureReason: text("failure_reason"),
+    createdAt,
+  },
+  (t) => [
+    uniqueIndex("serp_evidence_run_handoff_hash_unique").on(t.runId, t.handoffHash),
+    check("serp_evidence_handoff_hash", sql`${t.handoffHash} ~ '^[a-f0-9]{64}$'`),
+    check("serp_evidence_status", sql`${t.status} in ('matched','mismatch','no_results','failed')`),
+    check(
+      "serp_evidence_result_shape",
+      sql`(${t.status} in ('matched','mismatch') and ${t.composition} is not null and ${t.failureReason} is null) or (${t.status}='no_results' and ${t.composition} is null and ${t.failureReason} is null) or (${t.status}='failed' and ${t.composition} is null and ${t.failureReason} is not null and length(btrim(${t.failureReason})) between 1 and 500)`,
+    ),
+    check(
+      "serp_evidence_composition_shape",
+      sql`${t.composition} is null or (jsonb_typeof(${t.composition})='object' and ${t.composition} ?& array['informational','commercial'] and ${t.composition} - array['informational','commercial']::text[]='{}'::jsonb and jsonb_typeof(${t.composition}->'informational')='number' and jsonb_typeof(${t.composition}->'commercial')='number' and (${t.composition}->>'informational')::integer >= 0 and (${t.composition}->>'commercial')::integer >= 0)`,
     ),
   ],
 );
@@ -333,6 +454,8 @@ export const reviewOperationStates = pgTable(
     provider: text("provider").notNull(),
     model: text("model").notNull(),
     status: text("status").notNull().default("started"),
+    releaseReason: text("release_reason").$type<PaidOperationReleaseReason>(),
+    ambiguityReason: text("ambiguity_reason").$type<PaidOperationAmbiguityReason>(),
     response: jsonb("response"),
     responseHash: text("response_hash"),
     createdAt,
@@ -366,6 +489,10 @@ export const reviewOperationStates = pgTable(
     check(
       "review_operation_states_response_pair",
       sql`(${t.status} in ('started','provider_in_flight') and ${t.response} is null and ${t.responseHash} is null and ${t.checkpointedAt} is null) or (${t.status}='checkpointed' and ${t.response} is not null and ${t.responseHash} is not null and ${t.checkpointedAt} is not null)`,
+    ),
+    check(
+      "review_operation_states_safety_reason",
+      sql`(${t.releaseReason} is null or (${t.status}='started' and ${t.releaseReason} in ('configuration_before_dispatch','authentication_before_dispatch','billing_before_dispatch','validation_before_dispatch'))) and (${t.ambiguityReason} is null or (${t.status}='provider_in_flight' and ${t.ambiguityReason} in ('provider_in_flight_without_checkpoint','external_side_effect_without_checkpoint','legacy_dispatch_outcome_unknown'))) and num_nonnulls(${t.releaseReason},${t.ambiguityReason}) <= 1`,
     ),
   ],
 );
@@ -533,6 +660,7 @@ export const findings = pgTable(
     evidence: text("evidence"),
     suggestedFix: text("suggested_fix").notNull(),
     hardFlag: boolean("hard_flag").notNull().default(false),
+    hardFlagReason: text("hard_flag_reason").$type<HardFlagReason>(),
     createdAt,
   },
   (t) => [
@@ -550,6 +678,10 @@ export const findings = pgTable(
       columns: [t.stepExecutionId, t.runId],
       foreignColumns: [stepExecutions.id, stepExecutions.runId],
     }).onDelete("restrict"),
+    check(
+      "findings_hard_flag_reason",
+      sql`(${t.hardFlag}=false and ${t.hardFlagReason} is null) or (${t.hardFlag}=true and ${t.hardFlagReason} in ('provenance','designer_attribution','unverified_figure','contradicted','policy','unknown_legacy'))`,
+    ),
   ],
 );
 
@@ -705,6 +837,7 @@ export const claims = pgTable(
     status: verificationStatus("status").notNull(),
     location: jsonb("location").$type<Record<string, unknown>>().notNull(),
     hardFlag: boolean("hard_flag").notNull().default(false),
+    hardFlagReason: text("hard_flag_reason").$type<HardFlagReason>(),
     createdAt,
   },
   (t) => [
@@ -717,6 +850,10 @@ export const claims = pgTable(
     check(
       "claims_provenance_always_flagged",
       sql`${t.type} <> 'provenance' or ${t.hardFlag} = true`,
+    ),
+    check(
+      "claims_hard_flag_reason",
+      sql`(${t.hardFlag}=false and ${t.hardFlagReason} is null) or (${t.hardFlag}=true and ${t.hardFlagReason} in ('provenance','designer_attribution','unverified_figure','contradicted','policy','unknown_legacy'))`,
     ),
   ],
 );
@@ -1257,6 +1394,8 @@ export const draftOperationStates = pgTable(
     response: jsonb("response"),
     responseHash: text("response_hash"),
     status: text("status").notNull().default("started"),
+    releaseReason: text("release_reason").$type<PaidOperationReleaseReason>(),
+    ambiguityReason: text("ambiguity_reason").$type<PaidOperationAmbiguityReason>(),
     createdAt,
     checkpointedAt: timestamp("checkpointed_at", { withTimezone: true }),
   },
@@ -1285,6 +1424,10 @@ export const draftOperationStates = pgTable(
     check(
       "draft_operation_states_response_pair",
       sql`((${t.status} in ('started','provider_in_flight') and ${t.response} is null and ${t.responseHash} is null and ${t.checkpointedAt} is null) or (${t.status} = 'checkpointed' and ${t.response} is not null and ${t.responseHash} is not null and ${t.checkpointedAt} is not null))`,
+    ),
+    check(
+      "draft_operation_states_safety_reason",
+      sql`(${t.releaseReason} is null or (${t.status}='started' and ${t.releaseReason} in ('configuration_before_dispatch','authentication_before_dispatch','billing_before_dispatch','validation_before_dispatch'))) and (${t.ambiguityReason} is null or (${t.status}='provider_in_flight' and ${t.ambiguityReason} in ('provider_in_flight_without_checkpoint','external_side_effect_without_checkpoint','legacy_dispatch_outcome_unknown'))) and num_nonnulls(${t.releaseReason},${t.ambiguityReason}) <= 1`,
     ),
   ],
 );
@@ -1355,6 +1498,8 @@ export const revisionOperationStates = pgTable(
     response: jsonb("response"),
     responseHash: text("response_hash"),
     status: text("status").notNull().default("started"),
+    releaseReason: text("release_reason").$type<PaidOperationReleaseReason>(),
+    ambiguityReason: text("ambiguity_reason").$type<PaidOperationAmbiguityReason>(),
     createdAt,
     checkpointedAt: timestamp("checkpointed_at", { withTimezone: true }),
   },
@@ -1370,7 +1515,15 @@ export const revisionOperationStates = pgTable(
     }).onDelete("restrict"),
     check(
       "revision_operation_states_status",
-      sql`${t.status} in ('started','provider_in_flight','response_validated')`,
+      sql`${t.status} in ('started','provider_in_flight','checkpointed')`,
+    ),
+    check(
+      "revision_operation_states_response_pair",
+      sql`(${t.status} in ('started','provider_in_flight') and ${t.response} is null and ${t.responseHash} is null and ${t.checkpointedAt} is null) or (${t.status}='checkpointed' and ${t.response} is not null and ${t.responseHash} is not null and ${t.checkpointedAt} is not null)`,
+    ),
+    check(
+      "revision_operation_states_safety_reason",
+      sql`(${t.releaseReason} is null or (${t.status}='started' and ${t.releaseReason} in ('configuration_before_dispatch','authentication_before_dispatch','billing_before_dispatch','validation_before_dispatch'))) and (${t.ambiguityReason} is null or (${t.status}='provider_in_flight' and ${t.ambiguityReason} in ('provider_in_flight_without_checkpoint','external_side_effect_without_checkpoint','legacy_dispatch_outcome_unknown'))) and num_nonnulls(${t.releaseReason},${t.ambiguityReason}) <= 1`,
     ),
   ],
 );
@@ -1619,6 +1772,10 @@ export const exportOperations = pgTable(
       columns: [t.documentVersionId, t.runId],
       foreignColumns: [documentVersions.id, documentVersions.runId],
     }).onDelete("restrict"),
+    check(
+      "export_operations_terminal_result",
+      sql`(${t.status}='succeeded' and ${t.externalDocumentId} is not null and ${t.externalUrl} is not null and ${t.lastError} is null) or (${t.status}='failed' and ${t.lastError} is not null) or (${t.status}='pending')`,
+    ),
   ],
 );
 
@@ -1690,6 +1847,8 @@ export const coherenceCheckpoints = pgTable(
     // Mirrors revision_operation_states: a durable pre-dispatch marker means a
     // process loss after dispatch cannot be mistaken for "never called".
     status: text("status").notNull().default("started"),
+    releaseReason: text("release_reason").$type<PaidOperationReleaseReason>(),
+    ambiguityReason: text("ambiguity_reason").$type<PaidOperationAmbiguityReason>(),
     createdAt,
     checkpointedAt: timestamp("checkpointed_at", { withTimezone: true }),
   },
@@ -1708,7 +1867,11 @@ export const coherenceCheckpoints = pgTable(
     ),
     check(
       "coherence_checkpoints_response_pair",
-      sql`((${t.status} in ('started','provider_in_flight') and ${t.response} is null and ${t.responseHash} is null) or (${t.status} = 'checkpointed' and ${t.response} is not null and ${t.responseHash} is not null))`,
+      sql`((${t.status} in ('started','provider_in_flight') and ${t.response} is null and ${t.responseHash} is null and ${t.checkpointedAt} is null) or (${t.status} = 'checkpointed' and ${t.response} is not null and ${t.responseHash} is not null and ${t.checkpointedAt} is not null))`,
+    ),
+    check(
+      "coherence_checkpoints_safety_reason",
+      sql`(${t.releaseReason} is null or (${t.status}='started' and ${t.releaseReason} in ('configuration_before_dispatch','authentication_before_dispatch','billing_before_dispatch','validation_before_dispatch'))) and (${t.ambiguityReason} is null or (${t.status}='provider_in_flight' and ${t.ambiguityReason} in ('provider_in_flight_without_checkpoint','external_side_effect_without_checkpoint','legacy_dispatch_outcome_unknown'))) and num_nonnulls(${t.releaseReason},${t.ambiguityReason}) <= 1`,
     ),
   ],
 );
@@ -1748,5 +1911,9 @@ export const exports = pgTable(
       columns: [t.exportArtifactId, t.runId],
       foreignColumns: [artifacts.id, artifacts.runId],
     }).onDelete("restrict"),
+    check(
+      "exports_terminal_result",
+      sql`(${t.status}='succeeded' and ${t.externalDocumentId} is not null and ${t.externalUrl} is not null and ${t.response} is not null) or (${t.status} in ('pending','failed') and ${t.response} is null)`,
+    ),
   ],
 );

@@ -29,6 +29,7 @@ DECLARE
   queue_id uuid;
   queue_token uuid;
   review_operation_id text := 'db-test-review-operation';
+  test_command_id text := 'db-test-command';
 BEGIN
   INSERT INTO operator_sessions(token_hash, expires_at)
   VALUES(repeat('a', 64), clock_timestamp() + interval '1 hour') RETURNING id INTO session_id;
@@ -75,6 +76,77 @@ BEGIN
     'db-test-run', 'input-hash', 'MOB-TEST',
     '{"plane_ticket":"MOB-TEST","primary_keyword":"chair","related_keywords":["seat"],"page_type":"blog","word_count_target":1200,"locales_for_translation":[]}'::jsonb
   ) RETURNING id INTO run_id;
+
+  INSERT INTO run_command_outbox(command_id,run_id,kind,idempotency_key,payload_hash,payload)
+  VALUES(test_command_id,run_id,'resume_run','db-test-command-key',repeat('a',64),
+    jsonb_build_object('command_id',test_command_id,'idempotency_key','db-test-command-key','payload_hash',repeat('a',64),'requested_at','2026-09-02T12:00:00Z','kind','resume_run','run_id',run_id,'options','{}'::jsonb));
+  BEGIN
+    UPDATE run_command_outbox SET status='succeeded' WHERE run_command_outbox.command_id=test_command_id;
+    RAISE EXCEPTION 'terminal command without result unexpectedly succeeded';
+  EXCEPTION WHEN check_violation OR raise_exception THEN
+    IF SQLERRM = 'terminal command without result unexpectedly succeeded' THEN RAISE; END IF;
+  END;
+  UPDATE run_command_outbox SET status='processing' WHERE run_command_outbox.command_id=test_command_id;
+  UPDATE run_command_outbox SET status='succeeded',terminal_result='{"accepted":true}'::jsonb,
+    completed_at=clock_timestamp() WHERE run_command_outbox.command_id=test_command_id;
+  BEGIN
+    UPDATE run_command_outbox SET terminal_result='{"changed":true}'::jsonb WHERE run_command_outbox.command_id=test_command_id;
+    RAISE EXCEPTION 'terminal command mutation unexpectedly succeeded';
+  EXCEPTION WHEN raise_exception THEN
+    IF SQLERRM = 'terminal command mutation unexpectedly succeeded' THEN RAISE; END IF;
+  END;
+  BEGIN
+    INSERT INTO run_command_outbox(command_id,run_id,kind,idempotency_key,payload_hash,payload)
+    VALUES('db-test-missing-payload',run_id,'resume_run','db-test-missing-payload',repeat('a',64),'{}'::jsonb);
+    RAISE EXCEPTION 'command with incomplete payload unexpectedly succeeded';
+  EXCEPTION WHEN check_violation THEN NULL;
+  END;
+  INSERT INTO run_activity_events(activity_id,run_id,sequence,type,command_id,summary,payload,occurred_at)
+  VALUES('db-test-activity',run_id,1,'command_accepted',test_command_id,'Command accepted.',
+    jsonb_build_object('activity_id','db-test-activity','run_id',run_id,'sequence',1,'type','command_accepted','occurred_at',statement_timestamp(),'command_id',test_command_id,'summary','Command accepted.'),statement_timestamp());
+  BEGIN
+    INSERT INTO run_activity_events(activity_id,run_id,sequence,type,command_id,summary,payload,occurred_at)
+    VALUES('db-test-activity-missing-payload',run_id,2,'command_accepted',test_command_id,'Command accepted.','{}'::jsonb,statement_timestamp());
+    RAISE EXCEPTION 'activity with incomplete payload unexpectedly succeeded';
+  EXCEPTION WHEN check_violation THEN NULL;
+  END;
+  BEGIN
+    INSERT INTO runs(id,idempotency_key,input_hash,plane_ticket,handoff,status,current_step)
+    VALUES(gen_random_uuid(),'db-invariant-second-run',repeat('e',64),'MOB-998','{}'::jsonb,'running','internal_link_discovery')
+    RETURNING id INTO document_id;
+    INSERT INTO run_activity_events(activity_id,run_id,sequence,type,command_id,summary,payload,occurred_at)
+    VALUES('db-test-cross-run-activity',document_id,1,'command_accepted',test_command_id,'Command accepted.',
+      jsonb_build_object('activity_id','db-test-cross-run-activity','run_id',document_id,'sequence',1,'type','command_accepted','occurred_at',statement_timestamp(),'command_id',test_command_id,'summary','Command accepted.'),statement_timestamp());
+    RAISE EXCEPTION 'cross-run command activity unexpectedly succeeded';
+  EXCEPTION WHEN raise_exception THEN
+    IF SQLERRM = 'cross-run command activity unexpectedly succeeded' THEN RAISE; END IF;
+  END;
+  BEGIN
+    DELETE FROM run_activity_events WHERE activity_id='db-test-activity';
+    RAISE EXCEPTION 'activity deletion unexpectedly succeeded';
+  EXCEPTION WHEN raise_exception THEN
+    IF SQLERRM = 'activity deletion unexpectedly succeeded' THEN RAISE; END IF;
+  END;
+  INSERT INTO serp_evidence(evidence_id,run_id,handoff_hash,provider,query,retrieved_at,status,composition)
+  VALUES('db-test-serp',run_id,repeat('b',64),'test-serp','chair',clock_timestamp(),'mismatch','{"informational":2,"commercial":8}'::jsonb);
+  BEGIN
+    INSERT INTO serp_evidence(evidence_id,run_id,handoff_hash,provider,query,retrieved_at,status,composition,failure_reason)
+    VALUES('db-test-serp-failed-null',run_id,repeat('c',64),'test-serp','chair',clock_timestamp(),'failed',null,null);
+    RAISE EXCEPTION 'failed SERP evidence without reason unexpectedly succeeded';
+  EXCEPTION WHEN check_violation THEN NULL;
+  END;
+  BEGIN
+    INSERT INTO serp_evidence(evidence_id,run_id,handoff_hash,provider,query,retrieved_at,status,composition)
+    VALUES('db-test-serp-missing-key',run_id,repeat('d',64),'test-serp','chair',clock_timestamp(),'matched','{"informational":2}'::jsonb);
+    RAISE EXCEPTION 'SERP evidence missing composition key unexpectedly succeeded';
+  EXCEPTION WHEN check_violation THEN NULL;
+  END;
+  BEGIN
+    UPDATE serp_evidence SET status='matched' WHERE evidence_id='db-test-serp';
+    RAISE EXCEPTION 'SERP evidence mutation unexpectedly succeeded';
+  EXCEPTION WHEN raise_exception THEN
+    IF SQLERRM = 'SERP evidence mutation unexpectedly succeeded' THEN RAISE; END IF;
+  END;
 
   INSERT INTO pipeline_queue_jobs(run_id) VALUES(run_id) RETURNING id INTO queue_id;
   BEGIN
@@ -323,9 +395,15 @@ BEGIN
   INSERT INTO sources (run_id, source_type, uri, retrieved_at, content_hash, snapshot)
   VALUES (run_id, 'medusa', 'https://example.test/product', clock_timestamp(), 'source-hash', '{}'::jsonb)
   RETURNING id INTO source_id;
-  INSERT INTO claims (run_id, document_version_id, claim_text, claim_hash, type, status, location, hard_flag)
-  VALUES (run_id, document_id, 'Designed by Example', 'claim-hash', 'provenance', 'unverified', '{}'::jsonb, true)
+  INSERT INTO claims (run_id, document_version_id, claim_text, claim_hash, type, status, location, hard_flag, hard_flag_reason)
+  VALUES (run_id, document_id, 'Designed by Example', 'claim-hash', 'provenance', 'unverified', '{}'::jsonb, true, 'designer_attribution')
   RETURNING id INTO claim_id;
+  BEGIN
+    INSERT INTO claims (run_id,document_version_id,claim_text,claim_hash,type,status,location,hard_flag,hard_flag_reason)
+    VALUES(run_id,document_id,'Invalid reason','invalid-reason','general','unverified','{}',false,'policy');
+    RAISE EXCEPTION 'non-flagged claim reason unexpectedly succeeded';
+  EXCEPTION WHEN check_violation THEN NULL;
+  END;
   INSERT INTO claim_sources (run_id, claim_id, source_id, status, evidence)
   VALUES (run_id, claim_id, source_id, 'unverified', 'Product record contains no verified attribution');
 
@@ -340,6 +418,14 @@ BEGIN
     run_id, execution_id, document_id, export_artifact_id,
     'export-test', expected_export_hash, 'google_docs'
   );
+  BEGIN
+    INSERT INTO exports(run_id,step_execution_id,document_version_id,export_artifact_id,
+      idempotency_key,input_hash,destination,status)
+    VALUES(run_id,execution_id,document_id,export_artifact_id,
+      'export-invalid-terminal',expected_export_hash,'google_docs','succeeded');
+    RAISE EXCEPTION 'export terminal status without result unexpectedly succeeded';
+  EXCEPTION WHEN check_violation THEN NULL;
+  END;
 
   BEGIN
     UPDATE exports SET destination = 'changed' WHERE idempotency_key = 'export-test';
@@ -462,6 +548,25 @@ BEGIN
   FROM pg_constraint
   WHERE conname IN ('coherence_checkpoints_status_check','coherence_checkpoints_response_pair');
   IF constraint_count <> 2 THEN RAISE EXCEPTION 'coherence checkpoint status constraints missing'; END IF;
+END $$;
+
+DO $$
+DECLARE readiness_trigger_count integer; readiness_constraint_count integer;
+BEGIN
+  SELECT count(*) INTO readiness_trigger_count FROM pg_trigger
+  WHERE tgname IN ('run_command_outbox_guard','run_activity_events_immutable','serp_evidence_immutable')
+    AND NOT tgisinternal;
+  SELECT count(*) INTO readiness_constraint_count FROM pg_constraint
+  WHERE conname IN ('run_command_outbox_terminal_result','claims_hard_flag_reason',
+    'findings_hard_flag_reason','draft_operation_states_safety_reason',
+    'review_operation_states_safety_reason','revision_operation_states_safety_reason',
+    'coherence_checkpoints_safety_reason','export_operations_terminal_result','exports_terminal_result');
+  IF readiness_trigger_count <> 3 OR readiness_constraint_count <> 9 THEN
+    RAISE EXCEPTION 'production-readiness persistence invariants missing';
+  END IF;
+  IF EXISTS(SELECT 1 FROM revision_operation_states WHERE status='response_validated') THEN
+    RAISE EXCEPTION 'legacy revision operation status remains after backfill';
+  END IF;
 END $$;
 
 DO $$
