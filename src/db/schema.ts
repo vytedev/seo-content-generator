@@ -168,12 +168,16 @@ export const runCommandOutbox = pgTable(
     status: text("status").notNull().default("pending"),
     terminalResult: jsonb("terminal_result").$type<Record<string, unknown>>(),
     completedAt: timestamp("completed_at", { withTimezone: true }),
+    leaseOwner: text("lease_owner"),
+    leaseToken: uuid("lease_token"),
+    leaseExpiresAt: timestamp("lease_expires_at", { withTimezone: true }),
     createdAt,
     updatedAt,
   },
   (t) => [
     uniqueIndex("run_command_outbox_idempotency_unique").on(t.idempotencyKey),
     index("run_command_outbox_claim_idx").on(t.status, t.createdAt),
+    index("run_command_outbox_aux_lease_idx").on(t.kind, t.status, t.leaseExpiresAt),
     check("run_command_outbox_payload_hash", sql`${t.payloadHash} ~ '^[a-f0-9]{64}$'`),
     check(
       "run_command_outbox_kind",
@@ -194,6 +198,10 @@ export const runCommandOutbox = pgTable(
     check(
       "run_command_outbox_terminal_result",
       sql`(${t.status} in ('pending','processing') and ${t.terminalResult} is null and ${t.completedAt} is null) or (${t.status} in ('succeeded','failed') and ${t.terminalResult} is not null and ${t.completedAt} is not null)`,
+    ),
+    check(
+      "run_command_outbox_aux_lease_shape",
+      sql`(${t.kind}='probe_serp' and ${t.status}='processing' and ${t.leaseOwner} is not null and ${t.leaseToken} is not null and ${t.leaseExpiresAt} is not null) or not (${t.kind}='probe_serp' and ${t.status}='processing')`,
     ),
   ],
 );

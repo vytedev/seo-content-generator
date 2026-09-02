@@ -34,7 +34,7 @@ describe("S5 command-only pipeline routes", () => {
     expect(first.body).toMatchObject({ replayed: false, queue_accepted: true });
     expect(replay.body).toEqual({ ...first.body, replayed: true });
     expect(replay.body.run_id).toBe(first.body.run_id);
-    expect(repository.commands).toHaveLength(1);
+    expect(repository.commands).toHaveLength(2);
     expect(repository.queueJobs).toHaveLength(1);
   });
 

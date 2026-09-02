@@ -45,6 +45,9 @@ import { authConfigFromEnv } from "../auth/config.js";
 import { PostgresSessionStore } from "../auth/session-store.js";
 import { LOCAL_FRONTEND_ORIGIN } from "../../shared/local-runtime.js";
 import { PipelineQueueWorker } from "../pipeline/queue-worker.js";
+import { SerpProbeWorker } from "../pipeline/serp-probe-worker.js";
+import { ConfiguredSerpProbe, serpProbeConfigFromEnv } from "../providers/serp-probe.js";
+
 import { closePoolWithin, type ShutdownResult } from "../shutdown.js";
 import { classifyError, logger } from "../logger.js";
 import {
@@ -78,6 +81,7 @@ export function createLocalServices(config: LocalServicesConfig): {
   const authConfig = authConfigFromEnv(process.env);
   const factVerifierConfig = factVerifierConfigFromEnv(process.env);
   const linkDiscoveryConfig = linkDiscoveryConfigFromEnv(process.env);
+  const serpProbeConfig = serpProbeConfigFromEnv(process.env);
   // Temporary local test-only capability: allow drafting to proceed with an honest
   // empty verified shortlist before sitemap/GSC configuration exists. Rejected when the
   // database is not local; default remains the strict production gate.
@@ -231,6 +235,10 @@ export function createLocalServices(config: LocalServicesConfig): {
         ...classifyError(error),
       });
     },
+    new SerpProbeWorker(
+      repository,
+      serpProbeConfig ? new ConfiguredSerpProbe(serpProbeConfig) : null,
+    ),
   );
   const ready = queueWorker.start();
   // Mark the promise observed for compositions that only inspect providers in tests; the same

@@ -17,6 +17,9 @@ import {
 import { QueueOptionsSchema, type QueueLease, type QueueOptions } from "../../shared/queue.js";
 import { PaidOperationProjectionSchema } from "../../shared/paid-operation.js";
 import { paidOperationAmbiguity } from "../providers/paid-operation-lifecycle.js";
+import { SerpEvidenceSchema, type SerpEvidence } from "../../shared/ingest-contracts.js";
+import { SerpProbeWorkSchema, type SerpProbeWork } from "../../shared/serp-evidence.js";
+import { serpWarning } from "../pipeline/serp-probe-worker.js";
 import {
   CommandSubmissionResultSchema,
   commandPayloadHash,
@@ -151,6 +154,11 @@ export class InMemoryMilestoneRepository
   readonly commands: import("../../shared/commands.js").RunCommand[] = [];
   readonly commandActivity: import("../../shared/commands.js").RunActivity[] = [];
   private readonly commandResults = new Map<string, CommandSubmissionResult>();
+  readonly serpEvidence = new Map<string, SerpEvidence>();
+  private readonly serpLeases = new Map<
+    string,
+    { owner: string; token: string; expiresAt: number }
+  >();
   private editorialCorrectionHandler: ((runId: string) => Promise<unknown>) | undefined;
   readonly queueJobs: Array<{
     id: string;
@@ -2671,6 +2679,14 @@ export class InMemoryMilestoneRepository
       draft_recovery: draftRecovery,
       blocked_for_operator: run.status === "blocked" || paidOperationAmbiguities.length > 0,
       paid_operation_ambiguities: paidOperationAmbiguities,
+      serp_probe: (() => {
+        const evidence = this.serpEvidence.get(`${runId}:${run.ingest.input_hash}`) ?? null;
+        return {
+          status: evidence?.status ?? "pending",
+          evidence,
+          warning: evidence ? serpWarning(evidence) : null,
+        };
+      })(),
       can_recover_deterministic_block:
         run.status === "blocked" &&
         run.blockReason === "deterministic_blockers" &&
@@ -2740,6 +2756,85 @@ export class InMemoryMilestoneRepository
     const run = this.requireRun(runId);
     return { status: run.status, current_step: run.currentStep };
   }
+  async claimNextSerpWork(owner: string, leaseMs: number): Promise<SerpProbeWork | null> {
+    if (!owner.trim() || leaseMs <= 0) throw new Error("SERP lease claim is invalid");
+    for (const command of this.commands)
+      if (
+        command.kind === "probe_serp" &&
+        !this.serpEvidence.has(`${command.run_id}:${command.handoff_hash}`)
+      ) {
+        const previous = this.serpLeases.get(command.command_id);
+        if (previous && previous.expiresAt > this.now()) continue;
+        const token = randomUUID();
+        const expiresAt = this.now() + leaseMs;
+        this.serpLeases.set(command.command_id, { owner, token, expiresAt });
+        return {
+          run_id: command.run_id,
+          handoff_hash: command.handoff_hash,
+          command_id: command.command_id,
+          mode: previous ? "recover_without_dispatch" : "dispatch",
+          lease_owner: owner,
+          lease_token: token,
+          lease_expires_at: new Date(expiresAt).toISOString(),
+        };
+      }
+    return null;
+  }
+
+  async heartbeatSerpWork(rawWork: SerpProbeWork, leaseMs: number): Promise<void> {
+    const work = this.requireSerpWorkIdentity(rawWork);
+    const lease = this.serpLeases.get(work.command_id);
+    if (
+      !lease ||
+      lease.token !== work.lease_token ||
+      lease.owner !== work.lease_owner ||
+      lease.expiresAt <= this.now()
+    )
+      throw new Error("SERP lease fencing rejected heartbeat");
+    lease.expiresAt = this.now() + leaseMs;
+  }
+
+  async getSerpProbeHandoff(rawWork: SerpProbeWork): Promise<Handoff> {
+    const work = this.requireSerpWorkIdentity(rawWork);
+    const run = this.requireRun(work.run_id);
+    if (run.ingest.input_hash !== work.handoff_hash) throw new Error("SERP handoff hash mismatch");
+    return structuredClone(run.handoff);
+  }
+
+  async recordSerpEvidence(rawWork: SerpProbeWork, raw: SerpEvidence): Promise<void> {
+    const work = this.requireSerpWorkIdentity(rawWork);
+    const evidence = SerpEvidenceSchema.parse(raw);
+    if (evidence.handoff_hash !== work.handoff_hash) throw new Error("SERP handoff hash mismatch");
+    const key = `${work.run_id}:${work.handoff_hash}`;
+    const existing = this.serpEvidence.get(key);
+    const lease = this.serpLeases.get(work.command_id);
+    if (!lease || lease.token !== work.lease_token || lease.owner !== work.lease_owner)
+      throw new Error("SERP completion requires a matching lease fence");
+    if (existing) {
+      if (canonicalHash(existing) !== canonicalHash(evidence))
+        throw new Error("Immutable SERP evidence conflict");
+      return;
+    }
+    if (lease.expiresAt <= this.now())
+      throw new Error("SERP completion requires a matching unexpired lease fence");
+    this.serpEvidence.set(key, structuredClone(evidence));
+  }
+
+  private requireSerpWorkIdentity(rawWork: SerpProbeWork): SerpProbeWork {
+    const work = SerpProbeWorkSchema.parse(rawWork);
+    const command = this.commands.find(
+      (candidate) => candidate.kind === "probe_serp" && candidate.command_id === work.command_id,
+    );
+    if (
+      !command ||
+      command.kind !== "probe_serp" ||
+      command.run_id !== work.run_id ||
+      command.handoff_hash !== work.handoff_hash
+    )
+      throw new Error("SERP work command identity mismatch");
+    return work;
+  }
+
   async findCommand(idempotencyKey: string) {
     return this.commands.find((command) => command.idempotency_key === idempotencyKey) ?? null;
   }
@@ -2785,6 +2880,17 @@ export class InMemoryMilestoneRepository
           );
           runId = (result as IngestResult).run_id;
           queueAccepted = true;
+          const handoffHash = canonicalHash(command.handoff);
+          const probe = parseRunCommand({
+            command_id: stableId("command", "probe-serp", runId, handoffHash),
+            idempotency_key: `probe_serp:${runId}:${handoffHash}`,
+            payload_hash: "0".repeat(64),
+            requested_at: command.requested_at,
+            kind: "probe_serp",
+            run_id: runId,
+            handoff_hash: handoffHash,
+          });
+          this.commands.push({ ...probe, payload_hash: commandPayloadHash(probe) });
           break;
         case "resume_run": {
           const run = this.requireRun(runId);
@@ -2821,6 +2927,12 @@ export class InMemoryMilestoneRepository
             }),
           };
           await this.enqueueRun(runId);
+          queueAccepted = true;
+          break;
+        case "probe_serp":
+          if (this.requireRun(runId).ingest.input_hash !== command.handoff_hash)
+            throw new ConflictError("SERP handoff hash mismatch.");
+          result = { queued: true };
           queueAccepted = true;
           break;
         case "retry_export": {

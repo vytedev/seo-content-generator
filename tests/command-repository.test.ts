@@ -142,7 +142,7 @@ describe("memory command repository command-kind parity", () => {
           )
         : command(kind, key, { ...body!, run_id: "run-changed" }, "changed");
     await assertReplayConflict({ repository, first, changed, expectedQueue });
-    expect(repository.commands).toHaveLength(1);
+    expect(repository.commands).toHaveLength(kind === "create_run" ? 2 : 1);
     expect(repository.commandActivity).toHaveLength(1);
   });
 

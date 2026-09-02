@@ -557,11 +557,11 @@ BEGIN
   WHERE tgname IN ('run_command_outbox_guard','run_activity_events_immutable','serp_evidence_immutable')
     AND NOT tgisinternal;
   SELECT count(*) INTO readiness_constraint_count FROM pg_constraint
-  WHERE conname IN ('run_command_outbox_terminal_result','claims_hard_flag_reason',
+  WHERE conname IN ('run_command_outbox_terminal_result','run_command_outbox_aux_lease_shape','claims_hard_flag_reason',
     'findings_hard_flag_reason','draft_operation_states_safety_reason',
     'review_operation_states_safety_reason','revision_operation_states_safety_reason',
     'coherence_checkpoints_safety_reason','export_operations_terminal_result','exports_terminal_result');
-  IF readiness_trigger_count <> 3 OR readiness_constraint_count <> 9 THEN
+  IF readiness_trigger_count <> 3 OR readiness_constraint_count <> 10 THEN
     RAISE EXCEPTION 'production-readiness persistence invariants missing';
   END IF;
   IF EXISTS(SELECT 1 FROM revision_operation_states WHERE status='response_validated') THEN

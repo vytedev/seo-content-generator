@@ -9,7 +9,6 @@ import {
   ingestHandoff,
   type IngestResult,
   type IngestStore,
-  type SerpCompositionProbe,
 } from "../../shared/milestone-two.js";
 import { HandoffSchema } from "../../shared/pipeline.js";
 
@@ -53,10 +52,7 @@ function isPostgresUnavailable(error: unknown): boolean {
   );
 }
 
-export function createIngestService(
-  store: IngestStore,
-  probe?: SerpCompositionProbe,
-): IngestService {
+export function createIngestService(store: IngestStore): IngestService {
   const prepare = async (input: unknown) => {
     const collector: IngestStore = {
       findIngest: async () => null,
@@ -67,14 +63,14 @@ export function createIngestService(
         warnings,
       }),
     };
-    const prepared = await ingestHandoff(input, "preflight-key", collector, probe);
+    const prepared = await ingestHandoff(input, "preflight-key", collector);
     return { handoff: prepared.handoff, warnings: prepared.warnings };
   };
   return {
     prepare,
     async ingest(input, key) {
       try {
-        return await ingestHandoff(input, key, store, probe);
+        return await ingestHandoff(input, key, store);
       } catch (error) {
         if (isPostgresUnavailable(error))
           throw new RepositoryUnavailableError("PostgreSQL is unavailable.");

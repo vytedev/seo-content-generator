@@ -1,6 +1,9 @@
 import { randomUUID } from "node:crypto";
 import { AsyncLocalStorage } from "node:async_hooks";
 import { z } from "zod";
+import { SerpEvidenceSchema, type SerpEvidence } from "../../shared/ingest-contracts.js";
+import { SerpProbeWorkSchema, type SerpProbeWork } from "../../shared/serp-evidence.js";
+import { serpWarning } from "../pipeline/serp-probe-worker.js";
 import { FindingLocationSchema } from "../../shared/checker/index.js";
 import { revisionBindingExclusions } from "../../shared/revision-planning.js";
 import type { FindingLocation } from "../../shared/revision-application.js";
@@ -3514,6 +3517,27 @@ export class PostgresMilestoneRepository
     const paidOperationAmbiguities = paidOperationRows.map((row) =>
       PaidOperationProjectionSchema.parse(paidOperationAmbiguity(row)),
     );
+    const serpRow = (
+      await this.pool.query<{
+        evidence_id: string;
+        handoff_hash: string;
+        provider: string;
+        query: string;
+        retrieved_at: Date;
+        status: "matched" | "mismatch" | "no_results" | "failed";
+        composition: unknown;
+        failure_reason: string | null;
+      }>(
+        "select evidence_id,handoff_hash,provider,query,retrieved_at,status,composition,failure_reason from serp_evidence where run_id=$1",
+        [runId],
+      )
+    ).rows[0];
+    const serpEvidence = serpRow
+      ? SerpEvidenceSchema.parse({
+          ...serpRow,
+          retrieved_at: serpRow.retrieved_at.toISOString(),
+        })
+      : null;
     const draftRecovery =
       run.status === "retryable_failed" && run.current_step === "draft" && !current
         ? draftOperation?.status === "provider_in_flight"
@@ -3632,6 +3656,11 @@ export class PostgresMilestoneRepository
       draft_recovery: draftRecovery,
       blocked_for_operator: run.status === "blocked" || paidOperationAmbiguities.length > 0,
       paid_operation_ambiguities: paidOperationAmbiguities,
+      serp_probe: {
+        status: serpEvidence?.status ?? "pending",
+        evidence: serpEvidence,
+        warning: serpEvidence ? serpWarning(serpEvidence) : null,
+      },
       can_recover_deterministic_block:
         run.status === "blocked" &&
         blockReason === "deterministic_blockers" &&
@@ -3847,6 +3876,187 @@ export class PostgresMilestoneRepository
     this.editorialCorrectionHandler = handler;
   }
 
+  async claimNextSerpWork(owner: string, leaseMs: number): Promise<SerpProbeWork | null> {
+    if (!owner.trim() || leaseMs <= 0) throw new Error("SERP lease claim is invalid");
+    const token = randomUUID();
+    const row = (
+      await this.pool.query<{
+        command_id: string;
+        run_id: string;
+        handoff_hash: string;
+        previous_status: string;
+        lease_expires_at: Date;
+      }>(
+        `with candidate as (
+           select command_id,status previous_status
+             from run_command_outbox c
+            where kind='probe_serp'
+              and (status='pending' or (status='processing' and lease_expires_at<=clock_timestamp()))
+              and not exists(select 1 from serp_evidence e where e.run_id=c.run_id and e.handoff_hash=c.payload->>'handoff_hash')
+            order by created_at limit 1 for update skip locked
+         )
+         update run_command_outbox c
+            set status='processing',lease_owner=$1,lease_token=$2,
+                lease_expires_at=clock_timestamp()+($3::text||' milliseconds')::interval,
+                updated_at=clock_timestamp()
+           from candidate
+          where c.command_id=candidate.command_id
+         returning c.command_id,c.run_id,c.payload->>'handoff_hash' handoff_hash,
+                   candidate.previous_status,c.lease_expires_at`,
+        [owner, token, leaseMs],
+      )
+    ).rows[0];
+    if (!row) return null;
+    return {
+      run_id: row.run_id,
+      handoff_hash: row.handoff_hash,
+      command_id: row.command_id,
+      mode: row.previous_status === "processing" ? "recover_without_dispatch" : "dispatch",
+      lease_owner: owner,
+      lease_token: token,
+      lease_expires_at: row.lease_expires_at.toISOString(),
+    };
+  }
+
+  async heartbeatSerpWork(rawWork: SerpProbeWork, leaseMs: number): Promise<void> {
+    const work = SerpProbeWorkSchema.parse(rawWork);
+    const updated = await this.pool.query(
+      `update run_command_outbox set lease_expires_at=clock_timestamp()+($5::text||' milliseconds')::interval,updated_at=clock_timestamp()
+        where command_id=$1 and run_id=$2 and kind='probe_serp' and status='processing'
+          and payload->>'handoff_hash'=$3 and lease_owner=$4 and lease_token=$6
+          and lease_expires_at>clock_timestamp()`,
+      [
+        work.command_id,
+        work.run_id,
+        work.handoff_hash,
+        work.lease_owner,
+        leaseMs,
+        work.lease_token,
+      ],
+    );
+    if (updated.rowCount !== 1) throw new Error("SERP lease fencing rejected heartbeat");
+  }
+
+  async getSerpProbeHandoff(rawWork: SerpProbeWork): Promise<Handoff> {
+    const work = SerpProbeWorkSchema.parse(rawWork);
+    const row = (
+      await this.pool.query<{ handoff: unknown; input_hash: string }>(
+        `select r.handoff,r.input_hash
+           from runs r join run_command_outbox c on c.run_id=r.id
+          where r.id=$1 and c.command_id=$2 and c.kind='probe_serp'
+            and c.payload->>'handoff_hash'=$3`,
+        [work.run_id, work.command_id, work.handoff_hash],
+      )
+    ).rows[0];
+    if (!row) throw new Error("SERP work command identity mismatch");
+    if (row.input_hash !== work.handoff_hash) throw new Error("SERP handoff hash mismatch");
+    return HandoffSchema.parse(row.handoff);
+  }
+
+  async recordSerpEvidence(rawWork: SerpProbeWork, raw: SerpEvidence): Promise<void> {
+    const work = SerpProbeWorkSchema.parse(rawWork);
+    const evidence = SerpEvidenceSchema.parse(raw);
+    if (evidence.handoff_hash !== work.handoff_hash) throw new Error("SERP handoff hash mismatch");
+    await this.transaction(async (client) => {
+      const command = (
+        await client.query<{
+          status: string;
+          lease_owner: string | null;
+          lease_token: string | null;
+          lease_expires_at: Date | null;
+        }>(
+          `select status,lease_owner,lease_token,lease_expires_at from run_command_outbox
+            where command_id=$1 and run_id=$2 and kind='probe_serp'
+              and payload->>'handoff_hash'=$3 for update`,
+          [work.command_id, work.run_id, work.handoff_hash],
+        )
+      ).rows[0];
+      if (!command) throw new Error("SERP work command identity mismatch");
+
+      const existingRow = (
+        await client.query<{
+          evidence_id: string;
+          handoff_hash: string;
+          provider: string;
+          query: string;
+          retrieved_at: Date;
+          status: "matched" | "mismatch" | "no_results" | "failed";
+          composition: unknown;
+          failure_reason: string | null;
+        }>(
+          `select evidence_id,handoff_hash,provider,query,retrieved_at,status,composition,failure_reason
+             from serp_evidence where run_id=$1 and handoff_hash=$2`,
+          [work.run_id, work.handoff_hash],
+        )
+      ).rows[0];
+      if (
+        command.lease_owner !== work.lease_owner ||
+        command.lease_token !== work.lease_token ||
+        !command.lease_expires_at ||
+        command.lease_expires_at.getTime() <= Date.now()
+      ) {
+        // Observation-only replay after terminal completion keeps the original evidence.
+        if (existingRow && (command.status === "succeeded" || command.status === "failed")) {
+          const existing = SerpEvidenceSchema.parse({
+            ...existingRow,
+            retrieved_at: existingRow.retrieved_at.toISOString(),
+          });
+          if (canonicalHash(existing) !== canonicalHash(evidence))
+            throw new Error("Immutable SERP evidence conflict");
+          return;
+        }
+        throw new Error("SERP completion requires a matching lease fence");
+      }
+      if (existingRow) {
+        const existing = SerpEvidenceSchema.parse({
+          ...existingRow,
+          retrieved_at: existingRow.retrieved_at.toISOString(),
+        });
+        if (canonicalHash(existing) !== canonicalHash(evidence))
+          throw new Error("Immutable SERP evidence conflict");
+        return;
+      }
+      if (
+        command.status !== "processing" ||
+        !command.lease_expires_at ||
+        command.lease_expires_at.getTime() <= Date.now()
+      )
+        throw new Error("SERP completion requires a matching unexpired lease fence");
+
+      await client.query(
+        `insert into serp_evidence(evidence_id,run_id,handoff_hash,provider,query,retrieved_at,status,composition,failure_reason)
+         values($1,$2,$3,$4,$5,$6,$7,$8::jsonb,$9)`,
+        [
+          evidence.evidence_id,
+          work.run_id,
+          evidence.handoff_hash,
+          evidence.provider,
+          evidence.query,
+          evidence.retrieved_at,
+          evidence.status,
+          evidence.composition ? JSON.stringify(evidence.composition) : null,
+          evidence.failure_reason,
+        ],
+      );
+      const completed = await client.query(
+        `update run_command_outbox set status='succeeded',terminal_result=jsonb_build_object('run_id',run_id::text,'queue_accepted',false,'result',jsonb_build_object('evidence_id',$2::text)),completed_at=clock_timestamp(),lease_owner=null,lease_token=null,lease_expires_at=null
+         where command_id=$1 and run_id=$3 and kind='probe_serp' and status='processing'
+           and payload->>'handoff_hash'=$4 and lease_owner=$5 and lease_token=$6
+           and lease_expires_at>clock_timestamp()`,
+        [
+          work.command_id,
+          evidence.evidence_id,
+          work.run_id,
+          work.handoff_hash,
+          work.lease_owner,
+          work.lease_token,
+        ],
+      );
+      if (completed.rowCount !== 1)
+        throw new Error("SERP completion requires exactly one claimed processing row");
+    });
+  }
+
   async findCommand(idempotencyKey: string) {
     const row = await this.pool.query<{ payload: unknown }>(
       "select payload from run_command_outbox where idempotency_key=$1",
@@ -3911,6 +4121,29 @@ export class PostgresMilestoneRepository
           runId = created.run_id;
           result = created;
           queueAccepted = true;
+          const handoffHash = canonicalHash(command.handoff);
+          const probeId = stableId("command", "probe-serp", runId, handoffHash);
+          const probeBase = {
+            command_id: probeId,
+            idempotency_key: `probe_serp:${runId}:${handoffHash}`,
+            payload_hash: "0".repeat(64),
+            requested_at: command.requested_at,
+            kind: "probe_serp" as const,
+            run_id: runId,
+            handoff_hash: handoffHash,
+          };
+          const probe = { ...probeBase, payload_hash: commandPayloadHash(probeBase) };
+          await client.query(
+            `insert into run_command_outbox(command_id,run_id,kind,idempotency_key,payload_hash,payload,status,terminal_result,completed_at)
+             values($1,$2,'probe_serp',$3,$4,$5::jsonb,'pending',null,null)`,
+            [
+              probe.command_id,
+              runId,
+              probe.idempotency_key,
+              probe.payload_hash,
+              JSON.stringify(probe),
+            ],
+          );
           break;
         }
         case "resume_run": {
@@ -3956,6 +4189,17 @@ export class PostgresMilestoneRepository
           };
           queueAccepted = true;
           break;
+        case "probe_serp": {
+          const source = await client.query<{ input_hash: string }>(
+            "select input_hash from runs where id=$1",
+            [runId],
+          );
+          if (source.rows[0]?.input_hash !== command.handoff_hash)
+            throw new ConflictError("SERP handoff hash mismatch.");
+          result = { queued: true };
+          queueAccepted = false;
+          break;
+        }
         case "retry_export": {
           const eligible = await client.query(
             `select 1 from runs r

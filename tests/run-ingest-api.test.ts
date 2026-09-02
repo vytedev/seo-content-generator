@@ -286,7 +286,7 @@ describe("POST /api/runs with milestone two wired", () => {
     expect(first.status).toBe(202);
     expect(replay.status).toBe(202);
     expect(replay.body).toEqual({ ...first.body, replayed: true });
-    expect(setup.repository.commands).toHaveLength(2);
+    expect(setup.repository.commands).toHaveLength(3);
     expect(setup.repository.commandActivity).toHaveLength(2);
     expect(setup.repository.queueJobs).toHaveLength(1);
   });

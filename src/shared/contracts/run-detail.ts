@@ -1,5 +1,6 @@
 import { z } from "zod";
 import { PaidOperationProjectionSchema } from "../paid-operation.js";
+import { IngestWarningSchema, SerpEvidenceSchema } from "../ingest-contracts.js";
 import { InternalLinkSchema, LinkDiscoveryMetadataSchema } from "./link-discovery.js";
 import { PipelineStepIdSchema } from "../pipeline.js";
 import { EvidenceSourceProjectionSchema } from "../milestone-three.js";
@@ -125,6 +126,14 @@ export const RunDetailSchema = z
       .default("none"),
     blocked_for_operator: z.boolean(),
     paid_operation_ambiguities: z.array(PaidOperationProjectionSchema).default([]),
+    serp_probe: z
+      .object({
+        status: z.enum(["pending", "matched", "mismatch", "no_results", "failed"]),
+        evidence: SerpEvidenceSchema.nullable(),
+        warning: IngestWarningSchema.nullable(),
+      })
+      .strict()
+      .default({ status: "pending", evidence: null, warning: null }),
     /** Narrow recovery for legacy deterministic blocks with correction budget remaining. */
     can_recover_deterministic_block: z.boolean().default(false),
     /** One exceptional correction after the automatic cap, bound to the exact current rerun. */

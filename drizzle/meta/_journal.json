@@ -358,6 +358,13 @@
       "when": 1788363605451,
       "tag": "0050_lyrical_the_professor",
       "breakpoints": true
+    },
+    {
+      "idx": 52,
+      "version": "7",
+      "when": 1788364800000,
+      "tag": "0052_real_screwball",
+      "breakpoints": true
     }
   ]
 }

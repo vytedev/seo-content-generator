@@ -9,6 +9,7 @@ import type { MilestoneTwoOrchestrator } from "./milestone-two.js";
 import type { MilestoneThreeOrchestrator } from "./milestone-three.js";
 import type { MilestoneFourOrchestrator } from "./milestone-four.js";
 import { classifyError, logger } from "../logger.js";
+import type { SerpProbeWorker } from "./serp-probe-worker.js";
 
 export interface QueueWorkerOrchestrators {
   milestoneTwo: MilestoneTwoOrchestrator;
@@ -42,6 +43,7 @@ export class PipelineQueueWorker {
     private readonly random = Math.random,
     private readonly drainMs = 10_000,
     private readonly onFailure: (error: unknown) => void = () => undefined,
+    private readonly serpWorker?: SerpProbeWorker,
   ) {}
 
   health(): { status: "running" | "stopped" | "failed"; error?: unknown } {
@@ -105,6 +107,7 @@ export class PipelineQueueWorker {
 
   private async loop(): Promise<void> {
     while (!this.stopping) {
+      if (this.serpWorker && (await this.serpWorker.runOnce())) continue;
       const job = await this.repository.claimQueueJob(this.owner, this.leaseMs);
       if (!job) {
         await new Promise<void>((resolve) => {
