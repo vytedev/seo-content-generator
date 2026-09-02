@@ -4159,6 +4159,104 @@ export class PostgresMilestoneRepository
          last_error_code='startup_lease_expired',updated_at=clock_timestamp()
          where state='leased' and lease_expires_at<=clock_timestamp()`,
       );
+      await client.query(
+        `update step_executions e set status='retryable_failed',lease_token=null,lease_owner=null,
+         lease_expires_at=null,error='{"message":"lease expired during startup recovery"}'::jsonb,
+         updated_at=clock_timestamp()
+         where e.status in ('leased','running') and e.lease_expires_at<=clock_timestamp()
+           and not exists(select 1 from draft_operation_states d where d.producing_step_execution_id=e.id and d.status='provider_in_flight')
+           and not exists(select 1 from review_operation_states w where w.producing_step_execution_id=e.id and w.status='provider_in_flight')
+           and not exists(select 1 from revision_operation_states v where v.producing_step_execution_id=e.id and v.status='provider_in_flight')
+           and not exists(select 1 from coherence_checkpoints c where c.producing_step_execution_id=e.id and c.status='provider_in_flight')`,
+      );
+      await client.query(
+        `update runs r set status='retryable_failed',current_step=e.step,updated_at=clock_timestamp()
+         from step_executions e where e.run_id=r.id and e.status='retryable_failed'
+           and e.error->>'message'='lease expired during startup recovery'
+           and r.status='running'`,
+      );
+      await client.query(
+        `update pipeline_queue_jobs q set state='operator_action',lease_token=null,lease_owner=null,
+         lease_expires_at=null,last_error_code='ambiguous_paid_operation',updated_at=clock_timestamp()
+         where q.state in ('ready','leased','retry_wait') and (
+           exists(select 1 from draft_operation_states d where d.run_id=q.run_id and d.status='provider_in_flight') or
+           exists(select 1 from review_operation_states w where w.run_id=q.run_id and w.status='provider_in_flight') or
+           exists(select 1 from revision_operation_states v where v.run_id=q.run_id and v.status='provider_in_flight') or
+           exists(select 1 from coherence_checkpoints c where c.run_id=q.run_id and c.status='provider_in_flight') or
+           exists(select 1 from export_operations x where x.run_id=q.run_id and x.status='pending' and x.external_document_id is not null))`,
+      );
+      await client.query(
+        `with resolved_commands as (
+           select c.*,r.id resolved_run_id
+           from run_command_outbox c
+           join runs r on r.id::text=c.terminal_result->>'run_id'
+             and (c.run_id=r.id or (c.run_id is null and c.kind='create_run'))
+           where c.status='succeeded'
+             and c.kind in ('create_run','resume_run','submit_findings','authorise_exceptional_correction','retry_export')
+             and jsonb_typeof(c.terminal_result)='object'
+             and c.terminal_result ?& array['run_id','queue_accepted','result']
+             and not c.terminal_result ?| array['command_id','replayed']
+             and (select count(*) from jsonb_object_keys(c.terminal_result))=3
+             and jsonb_typeof(c.terminal_result->'run_id')='string'
+             and jsonb_typeof(c.terminal_result->'queue_accepted')='boolean'
+             and (c.terminal_result->>'queue_accepted')::boolean=true
+         )
+         insert into pipeline_queue_jobs(run_id,state,last_error_code)
+         select c.resolved_run_id,
+           case when exists(select 1 from draft_operation_states d where d.run_id=c.resolved_run_id and d.status='provider_in_flight')
+                  or exists(select 1 from review_operation_states w where w.run_id=c.resolved_run_id and w.status='provider_in_flight')
+                  or exists(select 1 from revision_operation_states v where v.run_id=c.resolved_run_id and v.status='provider_in_flight')
+                  or exists(select 1 from coherence_checkpoints h where h.run_id=c.resolved_run_id and h.status='provider_in_flight')
+                  or exists(select 1 from export_operations x where x.run_id=c.resolved_run_id and x.status='pending' and x.external_document_id is not null)
+                then 'operator_action'::queue_job_state else 'ready'::queue_job_state end,
+           case when exists(select 1 from draft_operation_states d where d.run_id=c.resolved_run_id and d.status='provider_in_flight')
+                  or exists(select 1 from review_operation_states w where w.run_id=c.resolved_run_id and w.status='provider_in_flight')
+                  or exists(select 1 from revision_operation_states v where v.run_id=c.resolved_run_id and v.status='provider_in_flight')
+                  or exists(select 1 from coherence_checkpoints h where h.run_id=c.resolved_run_id and h.status='provider_in_flight')
+                  or exists(select 1 from export_operations x where x.run_id=c.resolved_run_id and x.status='pending' and x.external_document_id is not null)
+                then 'ambiguous_paid_operation' else null end
+         from resolved_commands c join runs r on r.id=c.resolved_run_id
+         where r.status in ('running','retryable_failed')
+           and not exists(select 1 from pipeline_queue_jobs q where q.run_id=c.resolved_run_id and q.state in ('ready','leased','retry_wait','parked','operator_action'))
+         on conflict do nothing`,
+      );
+      // Serialise sequence allocation by run, then allocate all missing projections in one stable window.
+      await client.query("select id from runs order by id for update");
+      await client.query(
+        `with resolved_commands as (
+           select c.*,r.id resolved_run_id
+           from run_command_outbox c
+           join runs r on r.id::text=c.terminal_result->>'run_id'
+             and (c.run_id=r.id or (c.run_id is null and c.kind='create_run'))
+           where c.status='succeeded'
+             and jsonb_typeof(c.terminal_result)='object'
+             and c.terminal_result ?& array['run_id','queue_accepted','result']
+             and not c.terminal_result ?| array['command_id','replayed']
+             and (select count(*) from jsonb_object_keys(c.terminal_result))=3
+             and jsonb_typeof(c.terminal_result->'run_id')='string'
+             and jsonb_typeof(c.terminal_result->'queue_accepted')='boolean'
+         ), missing as (
+           select c.resolved_run_id run_id,'command:'||c.command_id||':accepted' activity_id,'command_accepted' type,
+             c.command_id,'Command accepted.' summary,c.completed_at occurred_at
+           from resolved_commands c
+           where not exists(select 1 from run_activity_events a where a.command_id=c.command_id)
+           union all
+           select r.id,'run:'||r.id||':terminal',
+             case when r.status='cancelled' then 'run_cancelled' else 'export_succeeded' end,
+             null,case when r.status='cancelled' then 'Run cancelled.' else 'Export succeeded.' end,r.updated_at
+           from runs r where r.status in ('cancelled','succeeded')
+             and not exists(select 1 from run_activity_events a where a.activity_id='run:'||r.id||':terminal')
+         ), numbered as (
+           select m.*,(select coalesce(max(a.sequence),0) from run_activity_events a where a.run_id=m.run_id)
+             + row_number() over(partition by m.run_id order by m.occurred_at,m.activity_id) sequence
+           from missing m
+         )
+         insert into run_activity_events(activity_id,run_id,sequence,type,command_id,summary,payload,occurred_at)
+         select activity_id,run_id,sequence,type,command_id,summary,
+           jsonb_strip_nulls(jsonb_build_object('activity_id',activity_id,'run_id',run_id::text,
+             'sequence',sequence,'type',type,'occurred_at',occurred_at,'command_id',command_id,'summary',summary)),
+           occurred_at from numbered order by run_id,sequence`,
+      );
     });
   }
 

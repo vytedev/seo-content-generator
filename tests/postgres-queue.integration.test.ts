@@ -304,6 +304,432 @@ integration("PostgreSQL durable queue", () => {
     ).rejects.toThrow("immutable");
   });
 
+  it("reconciles orphan commands, expired claims, ambiguity and terminal activity on restart", async () => {
+    const run = await ingestHandoff(handoff, "pg-recovery-reconcile", repository!);
+    const queue = await repository!.claimQueueJob("dead-worker", 1);
+    await pool!.query(
+      "update pipeline_queue_jobs set lease_expires_at=clock_timestamp()-interval '1 second' where id=$1",
+      [queue!.id],
+    );
+    await pool!.query(
+      `insert into run_command_outbox(command_id,run_id,kind,idempotency_key,payload_hash,payload,status,terminal_result,completed_at)
+       values('orphan-command',$1,'resume_run','orphan-key',repeat('a',64),$2::jsonb,'succeeded',jsonb_build_object('run_id',($1::uuid)::text,'queue_accepted',true,'result',jsonb_build_object('queued',true)),clock_timestamp())`,
+      [
+        run.run_id,
+        JSON.stringify({
+          command_id: "orphan-command",
+          idempotency_key: "orphan-key",
+          payload_hash: "a".repeat(64),
+          requested_at: new Date().toISOString(),
+          kind: "resume_run",
+          run_id: run.run_id,
+          options: {},
+        }),
+      ],
+    );
+    await pool!.query("delete from pipeline_queue_jobs where run_id=$1", [run.run_id]);
+    await repository!.recoverQueueJobs();
+    expect(
+      (
+        await pool!.query("select count(*)::int c from pipeline_queue_jobs where run_id=$1", [
+          run.run_id,
+        ])
+      ).rows[0].c,
+    ).toBe(1);
+    expect(
+      (
+        await pool!.query(
+          "select count(*)::int c from run_activity_events where command_id='orphan-command'",
+          [],
+        )
+      ).rows[0].c,
+    ).toBe(1);
+    await pool!.query("update runs set status='cancelled' where id=$1", [run.run_id]);
+    await repository!.recoverQueueJobs();
+    await repository!.recoverQueueJobs();
+    expect(
+      (
+        await pool!.query("select count(*)::int c from run_activity_events where activity_id=$1", [
+          `run:${run.run_id}:terminal`,
+        ])
+      ).rows[0].c,
+    ).toBe(1);
+  });
+
+  it.each([false, true])(
+    "honours submit_findings queue_accepted=%s during orphan recovery",
+    async (queueAccepted) => {
+      const run = await ingestHandoff(
+        handoff,
+        `pg-findings-queue-accepted-${queueAccepted}`,
+        repository!,
+      );
+      await pool!.query("delete from pipeline_queue_jobs where run_id=$1", [run.run_id]);
+      const commandId = `findings-queue-${queueAccepted}`;
+      const idempotencyKey = `findings-queue-key-${queueAccepted}`;
+      const payloadHash = (queueAccepted ? "c" : "d").repeat(64);
+      await pool!.query(
+        `insert into run_command_outbox(command_id,run_id,kind,idempotency_key,payload_hash,payload,status,terminal_result,completed_at)
+         values($1,$2,'submit_findings',$3,$4,$5::jsonb,'succeeded',$6::jsonb,clock_timestamp())`,
+        [
+          commandId,
+          run.run_id,
+          idempotencyKey,
+          payloadHash,
+          JSON.stringify({
+            command_id: commandId,
+            run_id: run.run_id,
+            kind: "submit_findings",
+            idempotency_key: idempotencyKey,
+            payload_hash: payloadHash,
+            requested_at: new Date().toISOString(),
+            dispositions: {
+              document_version_id: "document-version",
+              idempotency_key: `domain-${queueAccepted}`,
+              dispositions: [{ finding_id: "finding", decision: "accepted" }],
+            },
+          }),
+          JSON.stringify({
+            run_id: run.run_id,
+            queue_accepted: queueAccepted,
+            result: { continuation_required: queueAccepted },
+          }),
+        ],
+      );
+      await repository!.recoverQueueJobs();
+      await repository!.recoverQueueJobs();
+      expect(
+        (
+          await pool!.query("select count(*)::int count from pipeline_queue_jobs where run_id=$1", [
+            run.run_id,
+          ])
+        ).rows[0],
+      ).toEqual({ count: queueAccepted ? 1 : 0 });
+      expect(
+        (
+          await pool!.query(
+            "select count(*)::int count from run_activity_events where command_id=$1",
+            [commandId],
+          )
+        ).rows[0],
+      ).toEqual({ count: 1 });
+    },
+  );
+
+  it("parks orphan recovery for a pending export with an existing external document", async () => {
+    const run = await ingestHandoff(handoff, "pg-export-ambiguity", repository!);
+    await pool!.query("delete from pipeline_queue_jobs where run_id=$1", [run.run_id]);
+    const execution = await pool!.query<{ id: string }>(
+      `insert into step_executions(run_id,step,attempt,status)
+       values($1,'final_coherence_export',2,'retryable_failed') returning id`,
+      [run.run_id],
+    );
+    const artifact = await pool!.query<{ id: string }>(
+      `insert into artifacts(run_id,step_execution_id,kind,media_type,body_text,content_hash,size_bytes)
+       values($1,$2,'export-test','application/json','{}','export-hash',2) returning id`,
+      [run.run_id, execution.rows[0]!.id],
+    );
+    const document = await pool!.query<{ id: string }>(
+      `insert into document_versions(run_id,artifact_id,revision,content_hash)
+       values($1,$2,1,'export-document') returning id`,
+      [run.run_id, artifact.rows[0]!.id],
+    );
+    await pool!.query(
+      `insert into export_operations(run_id,document_version_id,destination,idempotency_key,provider_idempotency_key,input_hash,status,external_document_id,external_url)
+       values($1,$2,'google_docs','export-orphan-key','export-orphan-provider','export-input','pending','google-document','https://docs.google.com/document/d/google-document')`,
+      [run.run_id, document.rows[0]!.id],
+    );
+    const commandId = "export-ambiguity-command";
+    const payloadHash = "e".repeat(64);
+    await pool!.query(
+      `insert into run_command_outbox(command_id,run_id,kind,idempotency_key,payload_hash,payload,status,terminal_result,completed_at)
+       values($1,$2,'resume_run','export-ambiguity-key',$3,$4::jsonb,'succeeded',$5::jsonb,clock_timestamp())`,
+      [
+        commandId,
+        run.run_id,
+        payloadHash,
+        JSON.stringify({
+          command_id: commandId,
+          run_id: run.run_id,
+          kind: "resume_run",
+          idempotency_key: "export-ambiguity-key",
+          payload_hash: payloadHash,
+          requested_at: new Date().toISOString(),
+          options: {},
+        }),
+        JSON.stringify({
+          run_id: run.run_id,
+          queue_accepted: true,
+          result: { queued: true },
+        }),
+      ],
+    );
+    await repository!.recoverQueueJobs();
+    await repository!.recoverQueueJobs();
+    expect(
+      (
+        await pool!.query("select state,last_error_code from pipeline_queue_jobs where run_id=$1", [
+          run.run_id,
+        ])
+      ).rows,
+    ).toEqual([{ state: "operator_action", last_error_code: "ambiguous_paid_operation" }]);
+    expect(
+      (
+        await pool!.query(
+          "select status,external_document_id from export_operations where run_id=$1",
+          [run.run_id],
+        )
+      ).rows[0],
+    ).toEqual({
+      status: "pending",
+      external_document_id: "google-document",
+    });
+  });
+
+  it.each([false, true])(
+    "recovers a null-run create_run orphan safely (ambiguous=%s)",
+    async (ambiguous) => {
+      const run = await ingestHandoff(handoff, `pg-create-orphan-${ambiguous}`, repository!);
+      await pool!.query("delete from pipeline_queue_jobs where run_id=$1", [run.run_id]);
+      const commandId = `create-orphan-${ambiguous}`;
+      const idempotencyKey = `create-orphan-key-${ambiguous}`;
+      const payloadHash = "a".repeat(64);
+      await pool!.query(
+        `insert into run_command_outbox(command_id,run_id,kind,idempotency_key,payload_hash,payload,status,terminal_result,completed_at)
+         values($1,null,'create_run',$2,$3,$4::jsonb,'succeeded',$5::jsonb,clock_timestamp())`,
+        [
+          commandId,
+          idempotencyKey,
+          payloadHash,
+          JSON.stringify({
+            command_id: commandId,
+            kind: "create_run",
+            idempotency_key: idempotencyKey,
+            payload_hash: payloadHash,
+            requested_at: new Date().toISOString(),
+            handoff,
+            warnings: [],
+          }),
+          JSON.stringify({ run_id: run.run_id, queue_accepted: true, result: run }),
+        ],
+      );
+      if (ambiguous) {
+        const execution = await pool!.query<{ id: string }>(
+          `insert into step_executions(run_id,step,attempt,status)
+           values($1,'draft',2,'retryable_failed') returning id`,
+          [run.run_id],
+        );
+        await pool!.query(
+          `insert into draft_operation_states(operation_id,run_id,producing_step_execution_id,request_hash,provider,model,contract_identity,purpose,status,ambiguity_reason)
+           values($1,$2,$3,'hash','test','model','contract','initial','provider_in_flight','provider_in_flight_without_checkpoint')`,
+          [`create-op-${run.run_id}`, run.run_id, execution.rows[0]!.id],
+        );
+      }
+      await repository!.recoverQueueJobs();
+      await repository!.recoverQueueJobs();
+      expect(
+        (
+          await pool!.query(
+            "select state,last_error_code from pipeline_queue_jobs where run_id=$1",
+            [run.run_id],
+          )
+        ).rows,
+      ).toEqual([
+        {
+          state: ambiguous ? "operator_action" : "ready",
+          last_error_code: ambiguous ? "ambiguous_paid_operation" : null,
+        },
+      ]);
+      expect(
+        (
+          await pool!.query(
+            "select run_id::text,command_id from run_activity_events where command_id=$1",
+            [commandId],
+          )
+        ).rows,
+      ).toEqual([{ run_id: run.run_id, command_id: commandId }]);
+      if (ambiguous)
+        expect(
+          (
+            await pool!.query("select status from draft_operation_states where run_id=$1", [
+              run.run_id,
+            ])
+          ).rows[0],
+        ).toEqual({ status: "provider_in_flight" });
+    },
+  );
+
+  it("fails closed for a malformed null-run create_run terminal result", async () => {
+    const run = await ingestHandoff(handoff, "pg-create-orphan-malformed", repository!);
+    await pool!.query("delete from pipeline_queue_jobs where run_id=$1", [run.run_id]);
+    const malformedHash = "b".repeat(64);
+    await pool!.query(
+      `insert into run_command_outbox(command_id,run_id,kind,idempotency_key,payload_hash,payload,status,terminal_result,completed_at)
+       values('malformed-create',null,'create_run','malformed-create-key',$1,$2::jsonb,'succeeded',$3::jsonb,clock_timestamp())`,
+      [
+        malformedHash,
+        JSON.stringify({
+          command_id: "malformed-create",
+          kind: "create_run",
+          idempotency_key: "malformed-create-key",
+          payload_hash: malformedHash,
+          requested_at: new Date().toISOString(),
+          handoff,
+          warnings: [],
+        }),
+        JSON.stringify({ run_id: run.run_id, result: run, unexpected: true }),
+      ],
+    );
+    await repository!.recoverQueueJobs();
+    expect(
+      (
+        await pool!.query("select count(*)::int count from pipeline_queue_jobs where run_id=$1", [
+          run.run_id,
+        ])
+      ).rows[0],
+    ).toEqual({ count: 0 });
+    expect(
+      (
+        await pool!.query(
+          "select count(*)::int count from run_activity_events where command_id='malformed-create'",
+        )
+      ).rows[0],
+    ).toEqual({ count: 0 });
+  });
+
+  it.each([
+    "draft_operation_states",
+    "review_operation_states",
+    "revision_operation_states",
+    "coherence_checkpoints",
+  ] as const)(
+    "parks an orphan outbox for %s provider_in_flight without releasing authority",
+    async (table) => {
+      const run = await ingestHandoff(handoff, `pg-ambiguous-orphan-${table}`, repository!);
+      await pool!.query("delete from pipeline_queue_jobs where run_id=$1", [run.run_id]);
+      const execution = await pool!.query<{ id: string }>(
+        `insert into step_executions(run_id,step,attempt,status) values($1,$2,2,'retryable_failed') returning id`,
+        [
+          run.run_id,
+          table === "draft_operation_states"
+            ? "draft"
+            : table === "review_operation_states"
+              ? "review_writing_style"
+              : table === "revision_operation_states"
+                ? "revision_pass"
+                : "final_coherence_export",
+        ],
+      );
+      const artifact = await pool!.query<{ id: string }>(
+        `insert into artifacts(run_id,step_execution_id,kind,media_type,body_text,content_hash,size_bytes)
+         values($1,$2,'recovery-test','application/json','{}',$3,2) returning id`,
+        [run.run_id, execution.rows[0]!.id, `hash-${table}`],
+      );
+      const document = await pool!.query<{ id: string }>(
+        `insert into document_versions(run_id,artifact_id,revision,content_hash)
+         values($1,$2,1,$3) returning id`,
+        [run.run_id, artifact.rows[0]!.id, `document-${table}`],
+      );
+      if (table === "draft_operation_states")
+        await pool!.query(
+          `insert into draft_operation_states(operation_id,run_id,producing_step_execution_id,request_hash,provider,model,contract_identity,purpose,status,ambiguity_reason) values($1,$2,$3,'hash','test','model','contract','initial','provider_in_flight','provider_in_flight_without_checkpoint')`,
+          [`op-${table}-${run.run_id}`, run.run_id, execution.rows[0]!.id],
+        );
+      else if (table === "review_operation_states")
+        await pool!.query(
+          `insert into review_operation_states(operation_id,run_id,document_version_id,producing_step_execution_id,step,request_hash,provider,model,status,ambiguity_reason) values($1,$2,$3,$4,'review_writing_style','hash','test','model','provider_in_flight','provider_in_flight_without_checkpoint')`,
+          [`op-${table}-${run.run_id}`, run.run_id, document.rows[0]!.id, execution.rows[0]!.id],
+        );
+      else if (table === "revision_operation_states")
+        await pool!.query(
+          `insert into revision_operation_states(operation_id,run_id,document_version_id,producing_step_execution_id,request_hash,status,ambiguity_reason) values($1,$2,$3,$4,'hash','provider_in_flight','provider_in_flight_without_checkpoint')`,
+          [`op-${table}-${run.run_id}`, run.run_id, document.rows[0]!.id, execution.rows[0]!.id],
+        );
+      else
+        await pool!.query(
+          `insert into coherence_checkpoints(operation_id,run_id,document_version_id,producing_step_execution_id,request_hash,status,ambiguity_reason) values($1,$2,$3,$4,'hash','provider_in_flight','provider_in_flight_without_checkpoint')`,
+          [`op-${table}-${run.run_id}`, run.run_id, document.rows[0]!.id, execution.rows[0]!.id],
+        );
+      await pool!.query(
+        `insert into run_command_outbox(command_id,run_id,kind,idempotency_key,payload_hash,payload,status,terminal_result,completed_at) values($1,$2,'resume_run',$3,repeat('a',64),$4,'succeeded',jsonb_build_object('run_id',($2::uuid)::text,'queue_accepted',true,'result',jsonb_build_object('queued',true)),clock_timestamp())`,
+        [
+          `cmd-${table}-${run.run_id}`,
+          run.run_id,
+          `key-${table}-${run.run_id}`,
+          JSON.stringify({
+            command_id: `cmd-${table}-${run.run_id}`,
+            idempotency_key: `key-${table}-${run.run_id}`,
+            payload_hash: "a".repeat(64),
+            requested_at: new Date().toISOString(),
+            kind: "resume_run",
+            run_id: run.run_id,
+            options: {},
+          }),
+        ],
+      );
+      await repository!.recoverQueueJobs();
+      expect(
+        (
+          await pool!.query(
+            "select state,last_error_code from pipeline_queue_jobs where run_id=$1",
+            [run.run_id],
+          )
+        ).rows,
+      ).toEqual([{ state: "operator_action", last_error_code: "ambiguous_paid_operation" }]);
+      expect(
+        (
+          await pool!.query(`select status,ambiguity_reason from ${table} where run_id=$1`, [
+            run.run_id,
+          ])
+        ).rows[0],
+      ).toMatchObject({
+        status: "provider_in_flight",
+        ambiguity_reason: "provider_in_flight_without_checkpoint",
+      });
+    },
+  );
+
+  it("allocates multiple missing command and terminal activities uniquely and idempotently", async () => {
+    const run = await ingestHandoff(handoff, "pg-multiple-activity", repository!);
+    await pool!.query("delete from pipeline_queue_jobs where run_id=$1", [run.run_id]);
+    for (const suffix of ["a", "b"])
+      await pool!.query(
+        `insert into run_command_outbox(command_id,run_id,kind,idempotency_key,payload_hash,payload,status,terminal_result,completed_at) values($1,$2,'resume_run',$3,repeat($4,64),$5,'succeeded',jsonb_build_object('run_id',($2::uuid)::text,'queue_accepted',true,'result',jsonb_build_object('queued',true)),clock_timestamp())`,
+        [
+          `multi-${suffix}`,
+          run.run_id,
+          `multi-key-${suffix}`,
+          suffix,
+          JSON.stringify({
+            command_id: `multi-${suffix}`,
+            idempotency_key: `multi-key-${suffix}`,
+            payload_hash: suffix.repeat(64),
+            requested_at: new Date().toISOString(),
+            kind: "resume_run",
+            run_id: run.run_id,
+            options: {},
+          }),
+        ],
+      );
+    await pool!.query("update runs set status='cancelled' where id=$1", [run.run_id]);
+    await repository!.recoverQueueJobs();
+    await repository!.recoverQueueJobs();
+    const events = (
+      await pool!.query(
+        "select sequence,activity_id from run_activity_events where run_id=$1 order by sequence",
+        [run.run_id],
+      )
+    ).rows;
+    expect(new Set(events.map((event) => event.sequence)).size).toBe(events.length);
+    expect(events.map((event) => event.activity_id)).toEqual(
+      expect.arrayContaining(
+        ["multi-a", "multi-b"]
+          .map((id) => `command:${id}:accepted`)
+          .concat(`run:${run.run_id}:terminal`),
+      ),
+    );
+  });
+
   it("startup recovery excludes waiting/terminal runs and fails closed on ambiguity", async () => {
     const run = await ingestHandoff(handoff, "pg-queue-recovery", repository!);
     await pool!.query(

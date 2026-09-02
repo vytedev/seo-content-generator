@@ -235,7 +235,8 @@ export class InMemoryMilestoneRepository
     run_id: string;
     document_version_id: string;
     external_url: string;
-    status?: "succeeded" | "failed";
+    external_document_id?: string;
+    status?: "succeeded" | "failed" | "pending";
   }> = [];
   readonly exceptionalCorrectionAuthorisations: Array<{
     run_id: string;
@@ -2276,6 +2277,8 @@ export class InMemoryMilestoneRepository
         run_id: input.run_id,
         document_version_id: input.document_version_id,
         external_url: `https://docs.google.local/document/d/${id}`,
+        external_document_id: id,
+        status: "pending",
       });
     return GoogleDocsExportSchema.parse({
       external_document_id: id,
@@ -3023,6 +3026,106 @@ export class InMemoryMilestoneRepository
   }
 
   async recoverQueueJobs(): Promise<void> {
+    for (const run of this.runs.values()) {
+      for (const step of run.steps) {
+        if (
+          step.status === "running" &&
+          step.expiresAt !== null &&
+          step.expiresAt <= this.now() &&
+          ![...this.outputKeys.entries()].some(
+            ([key, value]) =>
+              key.includes(run.ingest.result.run_id) && value === "provider_in_flight",
+          )
+        ) {
+          step.status = "retryable_failed";
+          step.token = null;
+          step.expiresAt = null;
+          step.error = "lease expired during startup recovery";
+          run.status = "retryable_failed";
+          run.currentStep = step.step;
+        }
+      }
+      const runId = run.ingest.result.run_id;
+      const resolvedCommands = this.commands
+        .filter((command) => {
+          const terminal = CommandSubmissionResultSchema.safeParse(
+            this.commandResults.get(command.command_id),
+          );
+          if (!terminal.success || terminal.data.run_id !== runId || !this.runs.has(runId))
+            return false;
+          return "run_id" in command ? command.run_id === runId : command.kind === "create_run";
+        })
+        .sort(
+          (left, right) =>
+            left.requested_at.localeCompare(right.requested_at) ||
+            left.command_id.localeCompare(right.command_id),
+        );
+      for (const command of resolvedCommands)
+        if (!this.commandActivity.some((activity) => activity.command_id === command.command_id))
+          this.commandActivity.push(
+            parseCommandActivity({
+              activity_id: `command:${command.command_id}:accepted`,
+              run_id: runId,
+              sequence:
+                this.commandActivity.filter((activity) => activity.run_id === runId).length + 1,
+              type: "command_accepted",
+              occurred_at: command.requested_at,
+              command_id: command.command_id,
+              summary: "Command accepted.",
+            }),
+          );
+      const terminal = run.status === "cancelled" || run.status === "succeeded";
+      if (
+        terminal &&
+        !this.commandActivity.some((activity) => activity.activity_id === `run:${runId}:terminal`)
+      )
+        this.commandActivity.push(
+          parseCommandActivity({
+            activity_id: `run:${runId}:terminal`,
+            run_id: runId,
+            sequence:
+              this.commandActivity.filter((activity) => activity.run_id === runId).length + 1,
+            type: run.status === "cancelled" ? "run_cancelled" : "export_succeeded",
+            occurred_at: new Date(run.updatedAt).toISOString(),
+            summary: run.status === "cancelled" ? "Run cancelled." : "Export succeeded.",
+          }),
+        );
+      const ambiguous =
+        [...this.outputKeys.entries()].some(
+          ([key, value]) => key.includes(runId) && value === "provider_in_flight",
+        ) ||
+        this.exports.some(
+          (item) =>
+            item.run_id === runId &&
+            (item.status ?? "pending") === "pending" &&
+            item.external_document_id !== undefined,
+        );
+      const existingQueue = this.queueJobs.find(
+        (job) => job.run_id === runId && !["completed", "cancelled"].includes(job.state),
+      );
+      if (ambiguous && existingQueue) {
+        existingQueue.state = "operator_action";
+        existingQueue.token = null;
+        existingQueue.expiresAt = null;
+        existingQueue.error = "ambiguous_paid_operation";
+      }
+      const orphan = resolvedCommands.find(
+        (command) =>
+          command.kind !== "cancel_run" &&
+          CommandSubmissionResultSchema.parse(this.commandResults.get(command.command_id))
+            .queue_accepted,
+      );
+      if (orphan && ["running", "retryable_failed"].includes(run.status) && !existingQueue) {
+        await this.enqueueRun(runId);
+        if (ambiguous) {
+          const recoveredQueue = this.queueJobs.find((job) => job.run_id === runId);
+          if (recoveredQueue) {
+            recoveredQueue.state = "operator_action";
+            recoveredQueue.error = "ambiguous_paid_operation";
+          }
+        }
+      }
+    }
     for (const job of this.queueJobs) {
       const status = this.requireRun(job.run_id).status;
       if (status === "cancelled") {
@@ -3058,9 +3161,16 @@ export class InMemoryMilestoneRepository
 
   async queueExecutionState(runId: string) {
     const run = this.requireRun(runId);
-    const ambiguous = [...this.outputKeys.entries()].some(
-      ([key, value]) => key.includes(runId) && value === "provider_in_flight",
-    );
+    const ambiguous =
+      [...this.outputKeys.entries()].some(
+        ([key, value]) => key.includes(runId) && value === "provider_in_flight",
+      ) ||
+      this.exports.some(
+        (item) =>
+          item.run_id === runId &&
+          (item.status ?? "pending") === "pending" &&
+          item.external_document_id !== undefined,
+      );
     const coordination_wait = run.steps.some(
       (step) => step.status === "running" && step.expiresAt !== null && step.expiresAt > this.now(),
     );
