@@ -1,4 +1,6 @@
 import type { Express } from "express";
+import type { RunCommandRepository } from "../../shared/command-repository.js";
+import { buildRouteCommand } from "./command-submission.js";
 import {
   BulkDispositionSchema,
   FindingFiltersSchema,
@@ -8,7 +10,10 @@ import {
 export function registerFindingsRoutes(
   app: Express,
   findingsRepository: MilestoneThreeRepository,
-  options: { testOnlyLegacyContinuation?: (runId: string) => Promise<void> } = {},
+  options: {
+    commands: RunCommandRepository;
+    testOnlyLegacyContinuation?: (runId: string) => Promise<void>;
+  },
 ): void {
   app.get("/api/runs/:runId/findings", async (request, response, next) => {
     const parsed = FindingFiltersSchema.safeParse(request.query);
@@ -50,10 +55,16 @@ export function registerFindingsRoutes(
       return;
     }
     try {
-      const result = await findingsRepository.submitDispositions(
-        request.params.runId!,
-        parsed.data,
-      );
+      const result = (
+        await options.commands.submitCommand(
+          buildRouteCommand({
+            kind: "submit_findings",
+            run_id: request.params.runId!,
+            idempotency_key: parsed.data.idempotency_key,
+            body: { dispositions: parsed.data },
+          }),
+        )
+      ).result as Awaited<ReturnType<typeof findingsRepository.submitDispositions>>;
       if (result.continuation_required && options.testOnlyLegacyContinuation) {
         try {
           await options.testOnlyLegacyContinuation(request.params.runId!);

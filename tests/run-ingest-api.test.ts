@@ -9,7 +9,7 @@ import {
   type LinkDiscoverer,
 } from "../src/server/pipeline/milestone-two.js";
 import { MockDraftProvider } from "../src/server/providers/draft-provider.js";
-import { RepositoryConflictError } from "../src/shared/errors.js";
+import { RepositoryConflictError, RepositoryUnavailableError } from "../src/shared/errors.js";
 
 const handoff = {
   plane_ticket: "MOB-123",
@@ -28,6 +28,7 @@ const app = () => {
     app: createApp({
       testOnlySynchronousPipeline: true,
       ingestService: createIngestService(repository),
+      commands: repository,
     }),
   };
 };
@@ -74,7 +75,14 @@ describe("POST /api/runs", () => {
   it("maps typed repository conflicts without message matching", async () => {
     const typedConflict = createApp({
       testOnlySynchronousPipeline: true,
+      commands: {
+        submitCommand: async () => {
+          throw new RepositoryConflictError("a deliberately unrelated message");
+        },
+        listCommandActivity: async () => [],
+      },
       ingestService: {
+        prepare: async () => ({ handoff: handoff as never, warnings: [] }),
         ingest: async () => {
           throw new RepositoryConflictError("a deliberately unrelated message");
         },
@@ -97,6 +105,12 @@ describe("POST /api/runs", () => {
       createApp({
         testOnlySynchronousPipeline: true,
         ingestService: createIngestService(unavailableStore),
+        commands: {
+          submitCommand: async () => {
+            throw new RepositoryUnavailableError("PostgreSQL is unavailable.");
+          },
+          listCommandActivity: async () => [],
+        },
       }),
     )
       .post("/api/runs")
@@ -115,10 +129,12 @@ describe("POST /api/runs", () => {
     expect(oversized.status).toBe(413);
     const broken = createApp({
       testOnlySynchronousPipeline: true,
-      ingestService: {
-        ingest: async () => {
+      ingestService: createIngestService(new InMemoryMilestoneRepository()),
+      commands: {
+        submitCommand: async () => {
           throw new Error("secret database detail");
         },
+        listCommandActivity: async () => [],
       },
     });
     const response = await request(broken)
@@ -153,6 +169,7 @@ function wiredApp(discoverer?: LinkDiscoverer) {
       testOnlySynchronousPipeline: true,
       serveClient: false,
       ingestService: createIngestService(repository),
+      commands: repository,
       milestoneTwo: { repository, orchestrator },
     }),
   };
@@ -224,7 +241,9 @@ describe("POST /api/runs with milestone two wired", () => {
     expect(created.status).toBe(201);
     const runId = created.body.run_id;
 
-    const resumed = await request(setup.app).post(`/api/runs/${runId}/milestone-two/resume`);
+    const resumed = await request(setup.app)
+      .post(`/api/runs/${runId}/milestone-two/resume`)
+      .set("Idempotency-Key", "resume-route-key-1");
     expect(resumed.status).toBe(200);
     expect(resumed.body).toMatchObject({
       run_id: runId,
@@ -232,11 +251,43 @@ describe("POST /api/runs with milestone two wired", () => {
       current_step: "automated_checks",
       current_document: { draft: expect.any(Object) },
     });
+    expect(setup.repository.queueJobs).toHaveLength(1);
     expect(setup.provider.calls).toHaveLength(1);
 
-    const rerun = await request(setup.app).post(`/api/runs/${runId}/milestone-two/resume`);
+    const rerun = await request(setup.app)
+      .post(`/api/runs/${runId}/milestone-two/resume`)
+      .set("Idempotency-Key", "resume-route-key-2");
     expect(rerun.status).toBe(200);
     expect(setup.provider.calls).toHaveLength(1);
+  });
+
+  it("submits route continuations through the command outbox and replays the same key", async () => {
+    const setup = wiredApp();
+    const created = await request(setup.app)
+      .post("/api/runs")
+      .set("Idempotency-Key", "route-command-ingest")
+      .send(handoff);
+    setup.repository.queueJobs.splice(0);
+    const commandApp = createApp({
+      serveClient: false,
+      milestoneTwo: { repository: setup.repository, orchestrator: {} as never },
+      queue: setup.repository,
+      commands: setup.repository,
+    });
+    const endpoint = `/api/runs/${created.body.run_id}/milestone-two/resume`;
+    const first = await request(commandApp)
+      .post(endpoint)
+      .set("Idempotency-Key", "route-command-resume")
+      .send({});
+    const replay = await request(commandApp)
+      .post(endpoint)
+      .set("Idempotency-Key", "route-command-resume")
+      .send({});
+    expect(first.status).toBe(200);
+    expect(replay.status).toBe(200);
+    expect(setup.repository.commands).toHaveLength(2);
+    expect(setup.repository.commandActivity).toHaveLength(2);
+    expect(setup.repository.queueJobs).toHaveLength(1);
   });
 
   it("records refresh=true through the route while an active job keeps its exact options", async () => {
@@ -258,6 +309,7 @@ describe("POST /api/runs with milestone two wired", () => {
     job.options = {};
     const response = await request(queueApp)
       .post(`/api/runs/${created.body.run_id}/milestone-two/resume`)
+      .set("Idempotency-Key", "refresh-route-key")
       .send({ refresh_link_discovery: true });
     expect(response.status).toBe(200);
     expect(job.options).toEqual({});

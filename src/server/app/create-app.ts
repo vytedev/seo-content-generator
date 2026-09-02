@@ -1,9 +1,11 @@
 import express, { type ErrorRequestHandler, type Express } from "express";
+import { ZodError } from "zod";
 import { existsSync } from "node:fs";
 import path from "node:path";
 import {
   ConflictError,
   NotFoundError,
+  RepositoryConflictError,
   ServiceUnavailableError,
   UnprocessableError,
 } from "../../shared/errors.js";
@@ -68,6 +70,7 @@ export interface CreateAppOptions {
   googleOAuth?: GoogleOAuthRoutes;
   modelDiagnostic?: ModelDiagnosticService;
   queue?: import("../../shared/queue.js").PipelineQueueRepository;
+  commands?: import("../../shared/command-repository.js").RunCommandRepository;
   workerHealth?: () => { status: "running" | "stopped" | "failed" };
   /** Test-only compatibility. Production-like composition must supply the durable queue. */
   testOnlySynchronousPipeline?: boolean;
@@ -231,22 +234,42 @@ export function createApp(options: CreateAppOptions = {}): Express {
     app.use(jsonParser);
   }
 
+  const commandRepository =
+    options.commands ??
+    (options.milestoneFour?.repository && "submitCommand" in options.milestoneFour.repository
+      ? (options.milestoneFour
+          .repository as unknown as import("../../shared/command-repository.js").RunCommandRepository)
+      : options.milestoneThree?.repository && "submitCommand" in options.milestoneThree.repository
+        ? (options.milestoneThree
+            .repository as unknown as import("../../shared/command-repository.js").RunCommandRepository)
+        : options.milestoneTwo?.repository && "submitCommand" in options.milestoneTwo.repository
+          ? (options.milestoneTwo
+              .repository as unknown as import("../../shared/command-repository.js").RunCommandRepository)
+          : options.findingsRepository && "submitCommand" in options.findingsRepository
+            ? (options.findingsRepository as unknown as import("../../shared/command-repository.js").RunCommandRepository)
+            : undefined);
+
+  if ((options.ingestService || options.findingsRepository) && !commandRepository)
+    throw new Error("Command repository is required for ingest and findings composition.");
+
   if (options.findingsRepository) {
     const testOnlyLegacyContinuation =
       options.testOnlySynchronousPipeline && !options.queue && options.milestoneFour
         ? (runId: string) => options.milestoneFour!.orchestrator.run(runId)
         : undefined;
     registerFindingsRoutes(app, options.findingsRepository, {
+      commands: commandRepository!,
       ...(testOnlyLegacyContinuation ? { testOnlyLegacyContinuation } : {}),
     });
   }
 
   if (options.pipelineUnavailable) registerPipelineUnavailableRoutes(app);
 
-  if (options.ingestService)
+  if (options.ingestService && commandRepository)
     registerIngestRoutes(
       app,
       options.ingestService,
+      commandRepository,
       options.testOnlySynchronousPipeline && options.milestoneTwo
         ? async (runId) => {
             await options.milestoneTwo!.orchestrator.run(runId);
@@ -261,27 +284,39 @@ export function createApp(options: CreateAppOptions = {}): Express {
   registerGoogleOAuthRoutes(app, options.googleOAuth ?? { configured: false });
   registerModelDiagnosticRoutes(app, options.modelDiagnostic);
   if (options.milestoneTwo || options.milestoneThree || options.milestoneFour) {
-    const testOnlyQueue =
-      !options.queue && options.testOnlySynchronousPipeline
-        ? ({
-            enqueueRun: async (runId: string, queueOptions = {}) => {
-              if (options.milestoneTwo)
-                await options.milestoneTwo.orchestrator.run(runId, "test-only-worker", {
-                  refreshLinkDiscovery: queueOptions.refresh_link_discovery ?? false,
-                  operatorAuthorisedDraftRecovery:
-                    queueOptions.authorise_legacy_draft_recovery ?? false,
-                });
-              if (options.milestoneThree) await options.milestoneThree.orchestrator.run(runId);
-              if (options.milestoneFour) await options.milestoneFour.orchestrator.run(runId);
+    const commands = commandRepository;
+    if (!commands) {
+      app.use(
+        [
+          "/api/runs/:runId/milestone-two/resume",
+          "/api/runs/:runId/milestone-three/resume",
+          "/api/runs/:runId/milestone-four/resume",
+          "/api/runs/:runId/export/retry",
+        ],
+        (_request, response) =>
+          response.status(503).json({
+            error: {
+              code: "SERVICE_UNAVAILABLE",
+              message:
+                "Pipeline continuation is unavailable because the command repository is not configured.",
             },
-          } as import("../../shared/queue.js").PipelineQueueRepository)
-        : undefined;
-    registerRunRoutes(app, {
-      milestoneTwo: options.milestoneTwo,
-      milestoneThree: options.milestoneThree,
-      milestoneFour: options.milestoneFour,
-      queue: options.queue ?? testOnlyQueue,
-    });
+          }),
+      );
+    } else
+      registerRunRoutes(app, {
+        milestoneTwo: options.milestoneTwo,
+        milestoneThree: options.milestoneThree,
+        milestoneFour: options.milestoneFour,
+        commands,
+        testOnlySynchronousContinuation:
+          options.testOnlySynchronousPipeline && !options.queue
+            ? async (runId) => {
+                if (options.milestoneTwo) await options.milestoneTwo.orchestrator.run(runId);
+                if (options.milestoneThree) await options.milestoneThree.orchestrator.run(runId);
+                if (options.milestoneFour) await options.milestoneFour.orchestrator.run(runId);
+              }
+            : undefined,
+      });
   }
 
   if (options.calibration)
@@ -311,6 +346,20 @@ export function createApp(options: CreateAppOptions = {}): Express {
 
   const errorHandler: ErrorRequestHandler = (error, request, response, _next) => {
     response.locals.failureClassification = classifyError(error);
+    if (error instanceof ZodError) {
+      response.locals.failureClassification = classifyHttpStatus(400);
+      response.status(400).json({
+        error: {
+          code: "INVALID_INPUT",
+          message: "The command request is invalid.",
+          details: error.issues.map((issue) => ({
+            path: issue.path.map(String).join("."),
+            message: issue.message,
+          })),
+        },
+      });
+      return;
+    }
     if (error instanceof SyntaxError && "body" in error) {
       logger.warn("request.invalid_json", {
         method: request.method,
@@ -341,7 +390,7 @@ export function createApp(options: CreateAppOptions = {}): Express {
       response.status(404).json({ error: { code: error.code, message: error.message } });
       return;
     }
-    if (error instanceof ConflictError) {
+    if (error instanceof ConflictError || error instanceof RepositoryConflictError) {
       response.locals.failureClassification = classifyHttpStatus(409);
       // Expected races (cancel vs resume, duplicate disposition) — informational.
       logger.info("request.conflict", {

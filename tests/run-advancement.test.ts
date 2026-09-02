@@ -114,6 +114,7 @@ function wiredApp(repository = new InMemoryMilestoneRepository()) {
       testOnlySynchronousPipeline: true,
       findingsRepository: repository,
       ingestService: createIngestService(repository),
+      commands: repository,
       milestoneTwo: { repository, orchestrator: milestoneTwo },
       milestoneThree: { repository, orchestrator: milestoneThree },
       milestoneFour: { repository, orchestrator: milestoneFour },
@@ -128,6 +129,7 @@ describe("live run advancement 1.1 → 1.9 → export", () => {
       serveClient: false,
       findingsRepository: setup.repository,
       ingestService: createIngestService(setup.repository),
+      commands: setup.repository,
       queue: setup.repository,
       milestoneTwo: { repository: setup.repository, orchestrator: setup.milestoneTwo },
       milestoneThree: { repository: setup.repository, orchestrator: setup.milestoneThree },
@@ -207,6 +209,7 @@ describe("live run advancement 1.1 → 1.9 → export", () => {
       serveClient: false,
       findingsRepository: repository,
       ingestService: createIngestService(repository),
+      commands: repository,
       queue: repository,
       milestoneTwo: { repository, orchestrator: setup.milestoneTwo },
       milestoneThree: { repository, orchestrator: setup.milestoneThree },
@@ -331,6 +334,7 @@ describe("live run advancement 1.1 → 1.9 → export", () => {
       serveClient: false,
       findingsRepository: repository,
       ingestService: createIngestService(repository),
+      commands: repository,
       queue: repository,
       milestoneTwo: { repository, orchestrator: setup.milestoneTwo },
       milestoneThree: { repository, orchestrator: setup.milestoneThree },
@@ -519,6 +523,7 @@ describe("live run advancement 1.1 → 1.9 → export", () => {
     const milestoneTwoOnly = createApp({
       testOnlySynchronousPipeline: true,
       ingestService: createIngestService(setup.repository),
+      commands: setup.repository,
       milestoneTwo: { repository: setup.repository, orchestrator: setup.milestoneTwo },
     });
     const created = await request(milestoneTwoOnly)
@@ -529,7 +534,9 @@ describe("live run advancement 1.1 → 1.9 → export", () => {
     const before = await request(milestoneTwoOnly).get(`/api/runs/${runId}`);
     expect(before.body.current_step).toBe("automated_checks");
 
-    const resumed = await request(setup.app).post(`/api/runs/${runId}/milestone-two/resume`);
+    const resumed = await request(setup.app)
+      .post(`/api/runs/${runId}/milestone-two/resume`)
+      .set("Idempotency-Key", "advancement-resume-key");
     expect(resumed.status).toBe(200);
     expect(resumed.body.current_step).toBe("findings_review");
     expect(resumed.body.status).toBe("waiting");
@@ -542,6 +549,7 @@ describe("live run advancement 1.1 → 1.9 → export", () => {
     const milestoneTwoOnly = createApp({
       testOnlySynchronousPipeline: true,
       ingestService: createIngestService(setup.repository),
+      commands: setup.repository,
       milestoneTwo: { repository: setup.repository, orchestrator: setup.milestoneTwo },
     });
     const created = await request(milestoneTwoOnly)
@@ -551,9 +559,9 @@ describe("live run advancement 1.1 → 1.9 → export", () => {
     const milestoneThreeRun = vi.spyOn(setup.milestoneThree, "run");
     const milestoneFourRun = vi.spyOn(setup.milestoneFour, "run");
 
-    const resumed = await request(setup.app).post(
-      `/api/runs/${created.body.run_id}/milestone-three/resume`,
-    );
+    const resumed = await request(setup.app)
+      .post(`/api/runs/${created.body.run_id}/milestone-three/resume`)
+      .set("Idempotency-Key", `advancement-${created.body.run_id}`);
 
     expect(resumed.status).toBe(200);
     expect(resumed.body.status).toBe("waiting");
@@ -567,6 +575,7 @@ describe("live run advancement 1.1 → 1.9 → export", () => {
     const milestoneTwoOnly = createApp({
       testOnlySynchronousPipeline: true,
       ingestService: createIngestService(setup.repository),
+      commands: setup.repository,
       milestoneTwo: { repository: setup.repository, orchestrator: setup.milestoneTwo },
     });
     const created = await request(milestoneTwoOnly)
@@ -580,9 +589,9 @@ describe("live run advancement 1.1 → 1.9 → export", () => {
       throw new Error(safeError);
     });
 
-    const resumed = await request(setup.app).post(
-      `/api/runs/${created.body.run_id}/milestone-three/resume`,
-    );
+    const resumed = await request(setup.app)
+      .post(`/api/runs/${created.body.run_id}/milestone-three/resume`)
+      .set("Idempotency-Key", `advancement-${created.body.run_id}`);
 
     expect(resumed.status).toBe(200);
     expect(resumed.body).toMatchObject({
@@ -604,6 +613,7 @@ describe("live run advancement 1.1 → 1.9 → export", () => {
     const milestoneTwoOnly = createApp({
       testOnlySynchronousPipeline: true,
       ingestService: createIngestService(setup.repository),
+      commands: setup.repository,
       milestoneTwo: { repository: setup.repository, orchestrator: setup.milestoneTwo },
     });
     const created = await request(milestoneTwoOnly)
@@ -612,9 +622,9 @@ describe("live run advancement 1.1 → 1.9 → export", () => {
       .send(handoff);
     vi.spyOn(setup.milestoneThree, "run").mockRejectedValue(new Error("raw internal failure"));
 
-    const resumed = await request(setup.app).post(
-      `/api/runs/${created.body.run_id}/milestone-three/resume`,
-    );
+    const resumed = await request(setup.app)
+      .post(`/api/runs/${created.body.run_id}/milestone-three/resume`)
+      .set("Idempotency-Key", `advancement-${created.body.run_id}`);
 
     expect(resumed.status).toBe(500);
     expect(resumed.body.error).toMatchObject({ code: "INTERNAL_ERROR" });
@@ -626,6 +636,7 @@ describe("live run advancement 1.1 → 1.9 → export", () => {
     const milestoneTwoOnly = createApp({
       testOnlySynchronousPipeline: true,
       ingestService: createIngestService(setup.repository),
+      commands: setup.repository,
       milestoneTwo: { repository: setup.repository, orchestrator: setup.milestoneTwo },
     });
     const created = await request(milestoneTwoOnly)
@@ -637,9 +648,9 @@ describe("live run advancement 1.1 → 1.9 → export", () => {
       throw new Error("provider completed after cancellation");
     });
 
-    const resumed = await request(setup.app).post(
-      `/api/runs/${created.body.run_id}/milestone-three/resume`,
-    );
+    const resumed = await request(setup.app)
+      .post(`/api/runs/${created.body.run_id}/milestone-three/resume`)
+      .set("Idempotency-Key", `advancement-${created.body.run_id}`);
 
     expect(resumed.status).toBe(200);
     expect(resumed.body).toMatchObject({ status: "cancelled", can_retry: false });

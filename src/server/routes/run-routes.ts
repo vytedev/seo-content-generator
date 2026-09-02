@@ -1,6 +1,6 @@
 import type { Express, Response } from "express";
 import { z } from "zod";
-import { ConflictError, ServiceUnavailableError, UnprocessableError } from "../../shared/errors.js";
+import { ConflictError, UnprocessableError } from "../../shared/errors.js";
 import type { RunDetail, RunSummary, UsageTotals } from "../../shared/contracts/run-detail.js";
 import {
   RunListQuerySchema,
@@ -12,7 +12,13 @@ import type { MilestoneFourOrchestrator } from "../pipeline/milestone-four.js";
 import type { MilestoneThreeOrchestrator } from "../pipeline/milestone-three.js";
 import type { EditorialCorrectionOrchestrator } from "../pipeline/editorial-correction.js";
 import type { MilestoneTwoOrchestrator } from "../pipeline/milestone-two.js";
-import type { PipelineQueueRepository, QueueOptions } from "../../shared/queue.js";
+import type { QueueOptions } from "../../shared/queue.js";
+import type { RunCommandRepository } from "../../shared/command-repository.js";
+import {
+  buildRouteCommand,
+  routeCommandKey,
+  submitQueueRouteCommand,
+} from "./command-submission.js";
 
 export interface MilestoneFourRoutes {
   repository: MilestoneFourRepository;
@@ -42,7 +48,8 @@ export interface RunRouteOptions {
   milestoneTwo?: MilestoneTwoRoutes | undefined;
   milestoneThree?: MilestoneThreeRoutes | undefined;
   milestoneFour?: MilestoneFourRoutes | undefined;
-  queue?: PipelineQueueRepository | undefined;
+  commands: RunCommandRepository;
+  testOnlySynchronousContinuation?: ((runId: string) => Promise<void>) | undefined;
 }
 
 /** Exact durable state in which the dedicated export retry action is permitted. */
@@ -90,13 +97,21 @@ export function registerRunRoutes(app: Express, options: RunRouteOptions): void 
     return error;
   }
 
-  const optionsQueue = options.queue;
-  async function enqueue(runId: string, queueOptions: QueueOptions = {}): Promise<void> {
-    if (!optionsQueue)
-      throw new ServiceUnavailableError(
-        "Pipeline continuation is unavailable because the durable queue is not configured.",
-      );
-    await optionsQueue.enqueueRun(runId, queueOptions);
+  async function enqueue(
+    runId: string,
+    queueOptions: QueueOptions = {},
+    idempotencyKey?: string,
+    kind: "resume_run" | "retry_export" = "resume_run",
+  ): Promise<void> {
+    await submitQueueRouteCommand({
+      repository: options.commands,
+      kind,
+      run_id: runId,
+      idempotency_key: routeCommandKey(idempotencyKey),
+      options: queueOptions,
+    });
+    if (options.testOnlySynchronousContinuation)
+      await options.testOnlySynchronousContinuation(runId);
   }
 
   async function respondWithDetail(
@@ -134,13 +149,14 @@ export function registerRunRoutes(app: Express, options: RunRouteOptions): void 
             })
             .strict()
             .parse(request.body);
-          await milestoneFour.repository.authoriseExceptionalCorrection({
-            run_id: request.params.runId!,
-            ...body,
-          });
-          // Both a fresh authorisation and an idempotent replay are continuation signals. If the
-          // client disconnected after the authorisation commit, replay must resume the durable run.
-          await enqueue(request.params.runId!);
+          await options.commands.submitCommand(
+            buildRouteCommand({
+              kind: "authorise_exceptional_correction",
+              run_id: request.params.runId!,
+              idempotency_key: body.idempotency_key,
+              body: { explicit_confirmation: true },
+            }),
+          );
           await respondWithDetail(response, request.params.runId!, 200);
         } catch (error) {
           if (await respondWithDurableOutcome(response, request.params.runId!)) return;
@@ -150,7 +166,13 @@ export function registerRunRoutes(app: Express, options: RunRouteOptions): void 
     );
     app.post("/api/runs/:runId/cancel", async (request, response, next) => {
       try {
-        await milestoneFour.repository.cancelRun(request.params.runId!);
+        await options.commands.submitCommand(
+          buildRouteCommand({
+            kind: "cancel_run",
+            run_id: request.params.runId!,
+            idempotency_key: routeCommandKey(request.get("Idempotency-Key")),
+          }),
+        );
         await respondWithDetail(response, request.params.runId!, 200);
       } catch (error) {
         next(error);
@@ -170,10 +192,14 @@ export function registerRunRoutes(app: Express, options: RunRouteOptions): void 
           })
           .strict()
           .parse(request.body ?? {});
-        await enqueue(request.params.runId!, {
-          refresh_link_discovery: body.refresh_link_discovery ?? false,
-          authorise_legacy_draft_recovery: body.authorise_legacy_draft_recovery ?? false,
-        });
+        await enqueue(
+          request.params.runId!,
+          {
+            refresh_link_discovery: body.refresh_link_discovery ?? false,
+            authorise_legacy_draft_recovery: body.authorise_legacy_draft_recovery ?? false,
+          },
+          request.get("Idempotency-Key"),
+        );
         await respondWithDetail(response, request.params.runId!, 200);
       } catch (error) {
         if (await respondWithDurableOutcome(response, request.params.runId!)) return;
@@ -213,7 +239,7 @@ export function registerRunRoutes(app: Express, options: RunRouteOptions): void 
           .object({ authorise_legacy_review_recovery: z.literal(true).optional() })
           .strict()
           .parse(request.body ?? {});
-        await enqueue(request.params.runId!, body);
+        await enqueue(request.params.runId!, body, request.get("Idempotency-Key"));
         await respondWithDetail(response, request.params.runId!, 200);
       } catch (error) {
         if (await respondWithDurableOutcome(response, request.params.runId!)) return;
@@ -227,17 +253,8 @@ export function registerRunRoutes(app: Express, options: RunRouteOptions): void 
     app.post("/api/runs/:runId/milestone-four/resume", async (request, response, next) => {
       try {
         await assertNotCancelled(request.params.runId!);
-        const detail = await milestoneFour.repository.getRunDetail(request.params.runId!);
-        if (detail.status === "blocked") {
-          const recovered = await milestoneFour.repository.recoverDeterministicBlock(
-            request.params.runId!,
-          );
-          if (!recovered)
-            throw new ConflictError(
-              "Only a deterministic blocker with remaining correction budget can be resumed.",
-            );
-        }
-        await enqueue(request.params.runId!);
+        await milestoneFour.repository.getRunDetail(request.params.runId!);
+        await enqueue(request.params.runId!, {}, request.get("Idempotency-Key"));
         await respondWithDetail(response, request.params.runId!, 200);
       } catch (error) {
         // Revision guards retain their established 422 contract even though the failed attempt is
@@ -297,26 +314,11 @@ export function registerRunRoutes(app: Express, options: RunRouteOptions): void 
     app.post("/api/runs/:runId/export/retry", async (request, response, next) => {
       try {
         await assertNotCancelled(request.params.runId!);
-        const detail = await milestoneFour.repository.getRunDetail(request.params.runId!);
-        if (!isExportRetryEligible(detail))
-          throw new ConflictError("The export is not available for retry.");
-        await enqueue(request.params.runId!);
+        await enqueue(request.params.runId!, {}, request.get("Idempotency-Key"), "retry_export");
         response
           .status(200)
           .json(await milestoneFour.repository.getRunDetail(request.params.runId!));
       } catch (error) {
-        // An invalid retry remains a typed 409 even when the run already has durable failure state.
-        if (error instanceof ConflictError) {
-          next(error);
-          return;
-        }
-        const refreshed = await milestoneFour.repository
-          .getRunDetail(request.params.runId!)
-          .catch(() => null);
-        if (refreshed && isExportRetryEligible(refreshed)) {
-          response.status(200).json(refreshed);
-          return;
-        }
         next(error);
       }
     });

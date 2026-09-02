@@ -1,4 +1,5 @@
 import { randomUUID } from "node:crypto";
+import { AsyncLocalStorage } from "node:async_hooks";
 import { z } from "zod";
 import { FindingLocationSchema } from "../../shared/checker/index.js";
 import { revisionBindingExclusions } from "../../shared/revision-planning.js";
@@ -107,6 +108,14 @@ import {
   type MilestoneRepository,
 } from "../../shared/milestone-two.js";
 import { QueueOptionsSchema, type QueueLease, type QueueOptions } from "../../shared/queue.js";
+import {
+  CommandSubmissionResultSchema,
+  commandPayloadHash,
+  parseCommandActivity,
+  parseRunCommand,
+  type CommandSubmissionResult,
+  type RunCommandRepository,
+} from "../../shared/command-repository.js";
 
 function projectEvidenceSource(row: any) {
   const snapshot = row.snapshot as Record<string, unknown> | null;
@@ -190,8 +199,14 @@ const authorisedReadabilityFromBindings = (
   );
 
 export class PostgresMilestoneRepository
-  implements MilestoneRepository, MilestoneThreeRepository, MilestoneFourRepository
+  implements
+    MilestoneRepository,
+    MilestoneThreeRepository,
+    MilestoneFourRepository,
+    RunCommandRepository
 {
+  private readonly transactionContext = new AsyncLocalStorage<PoolClient>();
+
   constructor(
     private readonly pool: Pool,
     // Long enough to cover a worst-case model operation (3 × 60s HTTP
@@ -3766,6 +3781,192 @@ export class PostgresMilestoneRepository
     await this.transaction((client) => this.enqueueRunClient(client, runId, parsed));
   }
 
+  async findCommand(idempotencyKey: string) {
+    const row = await this.pool.query<{ payload: unknown }>(
+      "select payload from run_command_outbox where idempotency_key=$1",
+      [idempotencyKey],
+    );
+    return row.rows[0] ? parseRunCommand(row.rows[0].payload) : null;
+  }
+
+  async submitCommand(
+    rawCommand: import("../../shared/commands.js").RunCommand,
+  ): Promise<CommandSubmissionResult> {
+    const command = parseRunCommand(rawCommand);
+    const expectedHash = commandPayloadHash(command);
+    if (command.payload_hash !== expectedHash)
+      throw new RepositoryConflictError(
+        "The command payload hash does not match its canonical input.",
+      );
+    return this.transaction(async (client) => {
+      const existing = await client.query<{
+        command_id: string;
+        run_id: string | null;
+        payload_hash: string;
+        payload: unknown;
+        terminal_result: unknown;
+      }>(
+        "select command_id,run_id,payload_hash,payload,terminal_result from run_command_outbox where idempotency_key=$1 for update",
+        [command.idempotency_key],
+      );
+      const row = existing.rows[0];
+      if (row) {
+        if (
+          row.payload_hash !== expectedHash ||
+          commandPayloadHash(parseRunCommand(row.payload)) !== expectedHash
+        )
+          throw new RepositoryConflictError(
+            "The command idempotency key is bound to different input.",
+          );
+        const terminal = z
+          .object({ run_id: z.string(), queue_accepted: z.boolean(), result: z.unknown() })
+          .strict()
+          .parse(row.terminal_result);
+        return CommandSubmissionResultSchema.parse({
+          command_id: row.command_id,
+          run_id: terminal.run_id,
+          replayed: true,
+          queue_accepted: terminal.queue_accepted,
+          result: terminal.result,
+        });
+      }
+
+      let runId = "run_id" in command ? command.run_id : "";
+      let result: unknown;
+      let queueAccepted = false;
+      switch (command.kind) {
+        case "create_run": {
+          const created = await this.createIngest(
+            command.idempotency_key,
+            canonicalHash(command.handoff),
+            command.handoff,
+            command.warnings,
+          );
+          runId = created.run_id;
+          result = created;
+          queueAccepted = true;
+          break;
+        }
+        case "resume_run": {
+          const state = await client.query<{ status: string }>(
+            "select status from runs where id=$1 for update",
+            [runId],
+          );
+          if (!state.rows[0]) throw new NotFoundError("The run was not found.");
+          const recovered =
+            state.rows[0].status === "blocked"
+              ? await this.recoverDeterministicBlock(runId)
+              : false;
+          if (state.rows[0].status === "blocked" && !recovered)
+            throw new ConflictError(
+              "Only a deterministic blocker with remaining correction budget can be resumed.",
+            );
+          if (!recovered)
+            await this.enqueueRunClient(client, runId, QueueOptionsSchema.parse(command.options));
+          result = { queued: true, deterministic_recovery: recovered };
+          queueAccepted = true;
+          break;
+        }
+        case "submit_findings":
+          result = await this.submitDispositions(runId, command.dispositions);
+          queueAccepted = (result as { continuation_required: boolean }).continuation_required;
+          break;
+        case "cancel_run":
+          await this.cancelRun(runId);
+          result = { cancelled: true };
+          break;
+        case "authorise_exceptional_correction":
+          result = {
+            outcome: await this.authoriseExceptionalCorrection({
+              run_id: runId,
+              idempotency_key: command.idempotency_key,
+              explicit_confirmation: command.explicit_confirmation,
+            }),
+          };
+          queueAccepted = true;
+          break;
+        case "retry_export": {
+          const eligible = await client.query(
+            `select 1 from runs r
+             join lateral (select status,error from step_executions where run_id=r.id and step='final_coherence_export' order by attempt desc limit 1) e on true
+             where r.id=$1 and r.status='retryable_failed' and r.current_step='final_coherence_export'
+               and e.status='retryable_failed' and e.error->>'message' like '%STEP_1_12_FAILED;stage=google_docs_export;%'
+               and exists(select 1 from export_operations x
+                 where x.run_id=r.id and x.document_version_id=(select id from document_versions where run_id=r.id order by revision desc limit 1)
+                   and x.status='failed')
+             for update of r`,
+            [runId],
+          );
+          if (!eligible.rows[0]) throw new ConflictError("The export is not available for retry.");
+          await this.enqueueRunClient(client, runId, {});
+          result = { queued: true };
+          queueAccepted = true;
+          break;
+        }
+        default:
+          throw new UnprocessableError(`Command ${command.kind} is not implemented in S3.`);
+      }
+
+      await client.query(
+        `insert into run_command_outbox(command_id,run_id,kind,idempotency_key,payload_hash,payload,status,terminal_result,completed_at)
+         values($1,$2,$3,$4,$5,$6::jsonb,'succeeded',$7::jsonb,clock_timestamp())`,
+        [
+          command.command_id,
+          command.kind === "create_run" ? null : runId,
+          command.kind,
+          command.idempotency_key,
+          expectedHash,
+          JSON.stringify(command),
+          JSON.stringify({ run_id: runId, queue_accepted: queueAccepted, result }),
+        ],
+      );
+      const sequence = (
+        await client.query<{ sequence: number }>(
+          "select coalesce(max(sequence),0)::int+1 sequence from run_activity_events where run_id=$1",
+          [runId],
+        )
+      ).rows[0]!.sequence;
+      const activity = parseCommandActivity({
+        activity_id: `command:${command.command_id}:accepted`,
+        run_id: runId,
+        sequence,
+        type: "command_accepted",
+        occurred_at: command.requested_at,
+        command_id: command.command_id,
+        summary: "Command accepted.",
+      });
+      await client.query(
+        `insert into run_activity_events(activity_id,run_id,sequence,type,command_id,summary,payload,occurred_at)
+         values($1,$2,$3,$4,$5,$6,$7::jsonb,$8)`,
+        [
+          activity.activity_id,
+          runId,
+          sequence,
+          activity.type,
+          command.command_id,
+          activity.summary,
+          JSON.stringify(activity),
+          activity.occurred_at,
+        ],
+      );
+      return CommandSubmissionResultSchema.parse({
+        command_id: command.command_id,
+        run_id: runId,
+        replayed: false,
+        queue_accepted: queueAccepted,
+        result,
+      });
+    });
+  }
+
+  async listCommandActivity(runId: string) {
+    const rows = await this.pool.query<{ payload: unknown }>(
+      "select payload from run_activity_events where run_id=$1 order by sequence",
+      [runId],
+    );
+    return rows.rows.map((row) => parseCommandActivity(row.payload));
+  }
+
   async claimQueueJob(owner: string, leaseMs: number): Promise<QueueLease | null> {
     if (!owner.trim() || !Number.isSafeInteger(leaseMs) || leaseMs <= 0)
       throw new Error("Invalid queue lease request");
@@ -4099,10 +4300,12 @@ export class PostgresMilestoneRepository
   }
 
   private async transaction<T>(operation: (client: PoolClient) => Promise<T>): Promise<T> {
+    const active = this.transactionContext.getStore();
+    if (active) return operation(active);
     const client = await this.pool.connect();
     try {
       await client.query("begin");
-      const value = await operation(client);
+      const value = await this.transactionContext.run(client, () => operation(client));
       await client.query("commit");
       return value;
     } catch (error) {

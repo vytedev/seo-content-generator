@@ -1,13 +1,17 @@
 import type { Express } from "express";
 import { z, ZodError } from "zod";
 import { RepositoryConflictError, RepositoryUnavailableError } from "../../shared/errors.js";
+import type { RunCommandRepository } from "../../shared/command-repository.js";
+import { buildRouteCommand } from "./command-submission.js";
 import {
   IdempotencyConflictError,
+  canonicalHash,
   ingestHandoff,
   type IngestResult,
   type IngestStore,
   type SerpCompositionProbe,
 } from "../../shared/milestone-two.js";
+import { HandoffSchema } from "../../shared/pipeline.js";
 
 const IdempotencyKeySchema = z
   .string()
@@ -18,6 +22,9 @@ const IdempotencyKeySchema = z
 
 export interface IngestService {
   ingest(input: unknown, key: string): Promise<IngestResult>;
+  prepare(
+    input: unknown,
+  ): Promise<{ handoff: IngestResult["handoff"]; warnings: IngestResult["warnings"] }>;
 }
 
 const POSTGRES_UNAVAILABLE_CODES = new Set([
@@ -50,7 +57,21 @@ export function createIngestService(
   store: IngestStore,
   probe?: SerpCompositionProbe,
 ): IngestService {
+  const prepare = async (input: unknown) => {
+    const collector: IngestStore = {
+      findIngest: async () => null,
+      createIngest: async (_key, inputHash, handoff, warnings) => ({
+        run_id: "preflight",
+        input_hash: inputHash,
+        handoff,
+        warnings,
+      }),
+    };
+    const prepared = await ingestHandoff(input, "preflight-key", collector, probe);
+    return { handoff: prepared.handoff, warnings: prepared.warnings };
+  };
   return {
+    prepare,
     async ingest(input, key) {
       try {
         return await ingestHandoff(input, key, store, probe);
@@ -66,6 +87,7 @@ export function createIngestService(
 export function registerIngestRoutes(
   app: Express,
   service: IngestService,
+  commands: RunCommandRepository,
   testOnlySynchronousContinuation?: (runId: string) => Promise<void>,
 ): void {
   app.post("/api/runs", async (request, response, next) => {
@@ -83,7 +105,26 @@ export function registerIngestRoutes(
         });
         return;
       }
-      const result = await service.ingest(request.body, keyResult.data);
+      const existing = await commands.findCommand?.(keyResult.data);
+      if (existing && existing.kind !== "create_run")
+        throw new RepositoryConflictError("The idempotency key belongs to another command.");
+      if (
+        existing &&
+        canonicalHash(existing.handoff) !== canonicalHash(HandoffSchema.parse(request.body))
+      )
+        throw new RepositoryConflictError("The idempotency key is bound to a different handoff.");
+      const prepared = existing ? null : await service.prepare(request.body);
+      const result = (
+        await commands.submitCommand(
+          buildRouteCommand({
+            kind: "create_run",
+            idempotency_key: keyResult.data,
+            body: existing
+              ? { handoff: existing.handoff, warnings: existing.warnings }
+              : { handoff: prepared!.handoff, warnings: prepared!.warnings },
+          }),
+        )
+      ).result as IngestResult;
       if (testOnlySynchronousContinuation) {
         try {
           await testOnlySynchronousContinuation(result.run_id);

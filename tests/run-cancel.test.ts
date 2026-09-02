@@ -33,6 +33,7 @@ function wiredApp() {
   const app = createApp({
     serveClient: false,
     ingestService: createIngestService(repository),
+    commands: repository,
     milestoneTwo: { repository, orchestrator: two },
     // The cancel route hangs off the milestone-four group; the repository
     // satisfies all three interfaces, and only the repository is needed here.
@@ -60,7 +61,11 @@ describe("run cancellation", () => {
     const lease = await repository.claimStep(runId, "automated_checks", "test-worker");
     expect((await repository.getRunDetail(runId)).status).toBe("running");
 
-    const cancelled = await request(app).post(`/api/runs/${runId}/cancel`);
+    const cancelled = await request(app)
+      .post(`/api/runs/${runId}/cancel`)
+      .set("Idempotency-Key", `cancel-second-${runId}`)
+      .set("Idempotency-Key", `cancel-first-${runId}`)
+      .set("Idempotency-Key", `cancel-${runId}`);
     expect(cancelled.status).toBe(200);
     expect(cancelled.body.status).toBe("cancelled");
     expect(cancelled.body.can_retry).toBe(false);
@@ -104,15 +109,19 @@ describe("run cancellation", () => {
     const runId = created.body.run_id as string;
     await repository.claimStep(runId, "automated_checks", "test-worker");
     // First stop while running succeeds.
-    const first = await request(app).post(`/api/runs/${runId}/cancel`);
+    const first = await request(app)
+      .post(`/api/runs/${runId}/cancel`)
+      .set("Idempotency-Key", `cancel-first-${runId}`);
     expect(first.status).toBe(200);
     // A second stop on the now-cancelled run conflicts.
-    const second = await request(app).post(`/api/runs/${runId}/cancel`);
+    const second = await request(app)
+      .post(`/api/runs/${runId}/cancel`)
+      .set("Idempotency-Key", `cancel-second-${runId}`);
     expect(second.status).toBe(409);
     // Unknown runs 404.
-    const missing = await request(app).post(
-      "/api/runs/00000000-0000-4000-8000-000000000000/cancel",
-    );
+    const missing = await request(app)
+      .post("/api/runs/00000000-0000-4000-8000-000000000000/cancel")
+      .set("Idempotency-Key", "cancel-missing-run");
     expect(missing.status).toBe(404);
   });
 

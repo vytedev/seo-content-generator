@@ -169,8 +169,8 @@ describe("durable pipeline queue", () => {
       milestoneTwo: { repository, orchestrator: { run: runStep } as never },
     });
     const response = await request(app).post(`/api/runs/${run.run_id}/milestone-two/resume`);
-    expect(response.status).toBe(503);
-    expect(response.body.error.code).toBe("SERVICE_UNAVAILABLE");
+    expect(response.status).toBe(400);
+    expect(response.body.error.code).toBe("INVALID_INPUT");
     expect(runStep).not.toHaveBeenCalled();
   });
 

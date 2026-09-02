@@ -1,4 +1,5 @@
 import { z } from "zod";
+import { IngestWarningSchema } from "./ingest-contracts.js";
 import { BulkDispositionSchema } from "./milestone-three.js";
 import { HandoffSchema, PipelineStepIdSchema } from "./pipeline.js";
 
@@ -15,7 +16,14 @@ const baseCommand = {
 
 /** Complete operator intent set currently exposed by ingest, findings, and run routes. */
 export const RunCommandSchema = z.discriminatedUnion("kind", [
-  z.object({ ...baseCommand, kind: z.literal("create_run"), handoff: HandoffSchema }).strict(),
+  z
+    .object({
+      ...baseCommand,
+      kind: z.literal("create_run"),
+      handoff: HandoffSchema,
+      warnings: z.array(IngestWarningSchema),
+    })
+    .strict(),
   z
     .object({
       ...baseCommand,

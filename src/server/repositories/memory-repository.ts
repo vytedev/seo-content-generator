@@ -8,8 +8,21 @@ import {
   type ExportClaim,
   type ExportRejectedFinding,
 } from "../../shared/export.js";
-import { ConflictError, NotFoundError, UnprocessableError } from "../../shared/errors.js";
+import {
+  ConflictError,
+  NotFoundError,
+  RepositoryConflictError,
+  UnprocessableError,
+} from "../../shared/errors.js";
 import { QueueOptionsSchema, type QueueLease, type QueueOptions } from "../../shared/queue.js";
+import {
+  CommandSubmissionResultSchema,
+  commandPayloadHash,
+  parseCommandActivity,
+  parseRunCommand,
+  type CommandSubmissionResult,
+  type RunCommandRepository,
+} from "../../shared/command-repository.js";
 import { PIPELINE_STEPS, type Handoff, type PipelineStepId } from "../../shared/pipeline.js";
 import { FindingLocationSchema } from "../../shared/checker/index.js";
 import { revisionBindingExclusions } from "../../shared/revision-planning.js";
@@ -125,10 +138,17 @@ interface RunState {
 
 /** Contract-equivalent memory repository used by fast tests. Every retry is a new attempt. */
 export class InMemoryMilestoneRepository
-  implements MilestoneRepository, MilestoneThreeRepository, MilestoneFourRepository
+  implements
+    MilestoneRepository,
+    MilestoneThreeRepository,
+    MilestoneFourRepository,
+    RunCommandRepository
 {
   private readonly runs = new Map<string, RunState>();
   private readonly keys = new Map<string, string>();
+  readonly commands: import("../../shared/commands.js").RunCommand[] = [];
+  readonly commandActivity: import("../../shared/commands.js").RunActivity[] = [];
+  private readonly commandResults = new Map<string, CommandSubmissionResult>();
   readonly queueJobs: Array<{
     id: string;
     run_id: string;
@@ -211,8 +231,12 @@ export class InMemoryMilestoneRepository
   }> = [];
   readonly coherenceRequests: CoherenceRequest[] = [];
   private readonly coherenceOperations = new Map<string, PersistedCoherence>();
-  readonly exports: Array<{ run_id: string; document_version_id: string; external_url: string }> =
-    [];
+  readonly exports: Array<{
+    run_id: string;
+    document_version_id: string;
+    external_url: string;
+    status?: "succeeded" | "failed";
+  }> = [];
   readonly exceptionalCorrectionAuthorisations: Array<{
     run_id: string;
     document_version_id: string;
@@ -2631,6 +2655,151 @@ export class InMemoryMilestoneRepository
     const run = this.requireRun(runId);
     return { status: run.status, current_step: run.currentStep };
   }
+  async findCommand(idempotencyKey: string) {
+    return this.commands.find((command) => command.idempotency_key === idempotencyKey) ?? null;
+  }
+
+  async submitCommand(
+    rawCommand: import("../../shared/commands.js").RunCommand,
+  ): Promise<CommandSubmissionResult> {
+    const command = parseRunCommand(rawCommand);
+    const expectedHash = commandPayloadHash(command);
+    if (command.payload_hash !== expectedHash)
+      throw new RepositoryConflictError(
+        "The command payload hash does not match its canonical input.",
+      );
+    const existing = this.commands.find((item) => item.idempotency_key === command.idempotency_key);
+    if (existing) {
+      if (commandPayloadHash(existing) !== expectedHash)
+        throw new RepositoryConflictError(
+          "The command idempotency key is bound to different input.",
+        );
+      const stored = this.commandResults.get(existing.command_id);
+      if (!stored) throw new Error("Command terminal result is missing");
+      return CommandSubmissionResultSchema.parse({ ...structuredClone(stored), replayed: true });
+    }
+    const transactionSnapshot = new Map<string, unknown>();
+    for (const [key, value] of Object.entries(this))
+      if (Array.isArray(value) || value instanceof Map || value instanceof Set)
+        transactionSnapshot.set(key, structuredClone(value));
+    try {
+      let runId = "run_id" in command ? command.run_id : "";
+      let result: unknown;
+      let queueAccepted = false;
+      switch (command.kind) {
+        case "create_run":
+          result = await this.createIngest(
+            command.idempotency_key,
+            canonicalHash(command.handoff),
+            command.handoff,
+            command.warnings,
+          );
+          runId = (result as IngestResult).run_id;
+          queueAccepted = true;
+          break;
+        case "resume_run": {
+          const run = this.requireRun(runId);
+          if (run.status === "blocked") {
+            if (!(await this.recoverDeterministicBlock(runId)))
+              throw new ConflictError(
+                "Only a deterministic blocker with remaining correction budget can be resumed.",
+              );
+          }
+          await this.enqueueRun(runId, command.options);
+          result = { queued: true };
+          queueAccepted = true;
+          break;
+        }
+        case "submit_findings":
+          result = await this.submitDispositions(runId, command.dispositions);
+          queueAccepted = (result as { continuation_required: boolean }).continuation_required;
+          break;
+        case "cancel_run":
+          await this.cancelRun(runId);
+          result = { cancelled: true };
+          break;
+        case "authorise_exceptional_correction":
+          result = {
+            outcome: await this.authoriseExceptionalCorrection({
+              run_id: runId,
+              idempotency_key: command.idempotency_key,
+              explicit_confirmation: true,
+            }),
+          };
+          await this.enqueueRun(runId);
+          queueAccepted = true;
+          break;
+        case "retry_export": {
+          const run = this.requireRun(runId);
+          const final = [...run.steps]
+            .reverse()
+            .find((step) => step.step === "final_coherence_export");
+          if (
+            run.status !== "retryable_failed" ||
+            run.currentStep !== "final_coherence_export" ||
+            final?.status !== "retryable_failed" ||
+            !final.error?.includes("STEP_1_12_FAILED;stage=google_docs_export;") ||
+            !this.exports.some(
+              (item) =>
+                item.run_id === runId &&
+                item.document_version_id === run.draft?.version.id &&
+                item.status === "failed",
+            )
+          )
+            throw new ConflictError("The export is not available for retry.");
+          await this.enqueueRun(runId);
+          result = { queued: true };
+          queueAccepted = true;
+          break;
+        }
+        default:
+          throw new UnprocessableError(`Command ${command.kind} is not implemented in S3.`);
+      }
+      this.commands.push(structuredClone(command));
+      this.commandActivity.push(
+        parseCommandActivity({
+          activity_id: `command:${command.command_id}:accepted`,
+          run_id: runId,
+          sequence: this.commandActivity.filter((item) => item.run_id === runId).length + 1,
+          type: "command_accepted",
+          occurred_at: command.requested_at,
+          command_id: command.command_id,
+          summary: "Command accepted.",
+        }),
+      );
+      const terminal = CommandSubmissionResultSchema.parse({
+        command_id: command.command_id,
+        run_id: runId,
+        replayed: false,
+        queue_accepted: queueAccepted,
+        result,
+      });
+      this.commandResults.set(command.command_id, structuredClone(terminal));
+      return terminal;
+    } catch (error) {
+      for (const [key, snapshot] of transactionSnapshot) {
+        const current = (this as unknown as Record<string, unknown>)[key];
+        if (Array.isArray(current) && Array.isArray(snapshot))
+          current.splice(0, current.length, ...snapshot);
+        else if (current instanceof Map && snapshot instanceof Map) {
+          current.clear();
+          for (const [entryKey, entryValue] of snapshot) current.set(entryKey, entryValue);
+        } else if (current instanceof Set && snapshot instanceof Set) {
+          current.clear();
+          for (const entry of snapshot) current.add(entry);
+        }
+      }
+      throw error;
+    }
+  }
+
+  async listCommandActivity(runId: string) {
+    this.requireRun(runId);
+    return this.commandActivity
+      .filter((activity) => activity.run_id === runId)
+      .map((activity) => structuredClone(activity));
+  }
+
   async enqueueRun(runId: string, options: QueueOptions = {}): Promise<void> {
     const run = this.requireRun(runId);
     if (["succeeded", "cancelled", "waiting", "blocked"].includes(run.status))

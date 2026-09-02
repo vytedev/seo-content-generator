@@ -250,6 +250,7 @@ export function createLocalServices(config: LocalServicesConfig): {
             },
       findingsRepository: repository,
       queue: repository,
+      commands: repository,
       workerHealth: () => queueWorker.health(),
       modelDiagnostic,
       googleOAuth: {

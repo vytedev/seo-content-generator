@@ -30,6 +30,7 @@ function wiredApp() {
     app: createApp({
       serveClient: false,
       ingestService: createIngestService(repository),
+      commands: repository,
       milestoneTwo: { repository, orchestrator },
     }),
   };

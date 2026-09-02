@@ -3,6 +3,7 @@ export * from "./contracts/calibration.js";
 export * from "./contracts/content.js";
 export * from "./contracts/run-detail.js";
 export * from "./commands.js";
+export * from "./command-repository.js";
 export * from "./export.js";
 export * from "./hard-flags.js";
 export * from "./ingest-contracts.js";
