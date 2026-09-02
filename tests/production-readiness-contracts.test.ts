@@ -47,6 +47,7 @@ describe("production-readiness contracts", () => {
       RunCommandSchema.parse({
         ...base,
         kind: "create_run",
+        warnings: [],
         handoff: {
           plane_ticket: "MOB-1",
           primary_keyword: "walnut dining tables",

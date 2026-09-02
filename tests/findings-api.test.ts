@@ -23,7 +23,8 @@ const finding = {
   evidence_sources: [],
 };
 
-function repository(): MilestoneThreeRepository {
+function repository(): MilestoneThreeRepository &
+  import("../src/shared/command-repository.js").RunCommandRepository {
   return {
     stepSucceeded: async () => false,
     stepWaiting: async () => false,
@@ -61,6 +62,18 @@ function repository(): MilestoneThreeRepository {
       submitted: input.dispositions.length,
       continuation_required: true,
     }),
+    submitCommand: async (command: any) => ({
+      command_id: command.command_id,
+      run_id: command.run_id,
+      replayed: false,
+      queue_accepted: true,
+      result: {
+        completed: true,
+        submitted: command.dispositions.dispositions.length,
+        continuation_required: true,
+      },
+    }),
+    listCommandActivity: async () => [],
   };
 }
 
@@ -148,7 +161,7 @@ describe("findings API", () => {
     ],
   ] as const)("maps typed findings errors without internals", async (failure, status, code) => {
     const failing = repository();
-    failing.submitDispositions = async () => {
+    failing.submitCommand = async () => {
       throw failure;
     };
     const response = await request(createApp({ serveClient: false, findingsRepository: failing }))

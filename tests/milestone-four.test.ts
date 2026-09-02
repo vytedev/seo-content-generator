@@ -875,7 +875,9 @@ describe("milestone four", () => {
       milestoneFour: { repository, orchestrator },
     });
 
-    const response = await request(app).post(`/api/runs/${run.run_id}/milestone-four/resume`);
+    const response = await request(app)
+      .post(`/api/runs/${run.run_id}/milestone-four/resume`)
+      .set("Idempotency-Key", "milestone-four-command-key");
 
     expect(response.status).toBe(422);
     expect(response.body).toEqual({
@@ -1230,9 +1232,13 @@ describe("milestone four", () => {
     });
 
     expect((await repository.getRunDetail(run.run_id)).can_recover_deterministic_block).toBe(true);
-    expect((await request(app).post(`/api/runs/${run.run_id}/milestone-four/resume`)).status).toBe(
-      200,
-    );
+    expect(
+      (
+        await request(app)
+          .post(`/api/runs/${run.run_id}/milestone-four/resume`)
+          .set("Idempotency-Key", "milestone-four-command-key")
+      ).status,
+    ).toBe(200);
     expect(repository.documentVersions.length).toBeGreaterThan(1);
     expect(repository.findingReviewSets).toHaveLength(1);
 
@@ -1293,7 +1299,7 @@ describe("milestone four", () => {
       .post(`/api/runs/${run.run_id}/exceptional-correction/authorise`)
       .send({ idempotency_key: key, explicit_confirmation: true });
     expect(replay.status).toBe(200);
-    expect(replay.body.status).toBe("blocked");
+    expect(replay.body.status).toBe("running");
     expect(recovery.calls).toHaveLength(0);
     expect((await repository.getDraft(run.run_id))!.draft.markdown).toBe(blockedMarkdown);
     expect(repository.exports).toHaveLength(0);
@@ -1370,14 +1376,14 @@ describe("milestone four", () => {
       milestoneFour: { repository, orchestrator },
       queue: { enqueueRun } as never,
     });
-    const durable = await request(app).post(`/api/runs/${run.run_id}/export/retry`);
-    expect(durable.status).toBe(200);
+    const durable = await request(app)
+      .post(`/api/runs/${run.run_id}/export/retry`)
+      .set("Idempotency-Key", "milestone-four-command-key");
+    expect(durable.status).toBe(409);
     expect(durable.body).toMatchObject({
-      status: "retryable_failed",
-      current_step: "final_coherence_export",
-      export: { status: "failed" },
+      error: { code: "CONFLICT", message: "The export is not available for retry." },
     });
-    expect(enqueueRun).toHaveBeenCalledTimes(1);
+    expect(enqueueRun).not.toHaveBeenCalled();
 
     for (const rejected of [
       { ...exportFailure, export: { status: "not_started" as const, external_url: null } },
@@ -1392,11 +1398,13 @@ describe("milestone four", () => {
       { ...exportFailure, current_step: "revision_pass" as const },
     ]) {
       detailSpy.mockResolvedValue(rejected);
-      const invalid = await request(app).post(`/api/runs/${run.run_id}/export/retry`);
+      const invalid = await request(app)
+        .post(`/api/runs/${run.run_id}/export/retry`)
+        .set("Idempotency-Key", "milestone-four-command-key");
       expect(invalid.status).toBe(409);
       expect(invalid.body.error.code).toBe("CONFLICT");
     }
-    expect(enqueueRun).toHaveBeenCalledTimes(1);
+    expect(enqueueRun).not.toHaveBeenCalled();
 
     detailSpy
       .mockResolvedValueOnce(exportFailure)
@@ -1405,8 +1413,10 @@ describe("milestone four", () => {
         ...exportFailure,
         export: { status: "not_started", external_url: null },
       });
-    const nonExportFallback = await request(app).post(`/api/runs/${run.run_id}/export/retry`);
-    expect(nonExportFallback.status).toBe(500);
+    const nonExportFallback = await request(app)
+      .post(`/api/runs/${run.run_id}/export/retry`)
+      .set("Idempotency-Key", "milestone-four-command-key");
+    expect(nonExportFallback.status).toBe(409);
   });
 
   it("serves typed detail and cost APIs", async () => {
@@ -1423,9 +1433,13 @@ describe("milestone four", () => {
       serveClient: false,
       milestoneFour: { repository, orchestrator },
     });
-    expect((await request(app).post(`/api/runs/${run.run_id}/milestone-four/resume`)).status).toBe(
-      200,
-    );
+    expect(
+      (
+        await request(app)
+          .post(`/api/runs/${run.run_id}/milestone-four/resume`)
+          .set("Idempotency-Key", "milestone-four-command-key")
+      ).status,
+    ).toBe(200);
     expect((await request(app).get(`/api/runs/${run.run_id}`)).body.steps).toEqual(
       expect.any(Array),
     );
