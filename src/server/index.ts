@@ -9,6 +9,7 @@ const runtimeConfig = z
     HOST: z.enum(["127.0.0.1", "0.0.0.0"]).default("127.0.0.1"),
     PORT: z.coerce.number().int().min(1).max(65_535).default(LOCAL_API_PORT),
     ALLOW_NON_LOCAL_DATABASE: z.enum(["true", "false"]).default("false"),
+    RUNTIME_MODE: z.enum(["local", "test", "production"]).default("local"),
   })
   .parse(process.env);
 
@@ -19,8 +20,9 @@ const { app, ready, close } = createLocalApp(
     ? {
         databaseUrl,
         allowNonLocalDatabase: runtimeConfig.ALLOW_NON_LOCAL_DATABASE === "true",
+        runtimeMode: runtimeConfig.RUNTIME_MODE,
       }
-    : {},
+    : { runtimeMode: runtimeConfig.RUNTIME_MODE },
 );
 
 await ready;
@@ -30,6 +32,7 @@ const server = app.listen(port, runtimeConfig.HOST, () => {
     port,
     pipeline_configured: Boolean(databaseUrl),
     database_configured: Boolean(databaseUrl),
+    runtime_mode: runtimeConfig.RUNTIME_MODE,
   });
 });
 

@@ -8,6 +8,12 @@ export const GOOGLE_DOCS_SCOPES = [
 ] as const;
 export const GOOGLE_GSC_SCOPES = ["https://www.googleapis.com/auth/webmasters.readonly"] as const;
 export const GOOGLE_SCOPES = [...GOOGLE_DOCS_SCOPES, ...GOOGLE_GSC_SCOPES] as const;
+export type GoogleConsentPurpose = "docs" | "gsc";
+export function scopesForConsent(purpose: GoogleConsentPurpose): readonly string[] {
+  // The optional upgrade includes the already-required scopes so one encrypted
+  // connection remains sufficient and a GSC-only token can never replace Docs access.
+  return purpose === "gsc" ? GOOGLE_SCOPES : GOOGLE_DOCS_SCOPES;
+}
 const GOOGLE_LOCK = "google_oauth:google";
 const APPROVED_HTTPS_REDIRECT_URIS = new Set([
   "https://content-generator.vyte.dev/api/integrations/google/callback",
@@ -238,13 +244,17 @@ export class GoogleOAuthClient {
     private readonly fetchImpl: typeof fetch = fetch,
   ) {}
 
-  authorisationUrl(state: string, codeChallenge: string): string {
+  authorisationUrl(
+    state: string,
+    codeChallenge: string,
+    purpose: GoogleConsentPurpose = "docs",
+  ): string {
     const url = new URL("https://accounts.google.com/o/oauth2/v2/auth");
     url.search = new URLSearchParams({
       client_id: this.config.clientId,
       redirect_uri: this.config.redirectUri,
       response_type: "code",
-      scope: GOOGLE_SCOPES.join(" "),
+      scope: scopesForConsent(purpose).join(" "),
       access_type: "offline",
       prompt: "consent",
       include_granted_scopes: "false",
@@ -255,7 +265,11 @@ export class GoogleOAuthClient {
     return url.toString();
   }
 
-  async exchangeCode(code: string, verifier: string): Promise<void> {
+  async exchangeCode(
+    code: string,
+    verifier: string,
+    purpose: GoogleConsentPurpose = "docs",
+  ): Promise<void> {
     await this.store.serialised(async (_current, client) => {
       const tokens = await this.tokenRequest({
         grant_type: "authorization_code",
@@ -264,7 +278,7 @@ export class GoogleOAuthClient {
         redirect_uri: this.config.redirectUri,
       });
       if (!tokens.refresh_token) throw new GoogleOAuthError();
-      assertRequiredScopes(tokens.scope ?? "");
+      assertRequiredScopes(tokens.scope ?? "", scopesForConsent(purpose));
       await this.store.saveSerialised(client, toStoredTokens(tokens));
     });
   }

@@ -47,6 +47,7 @@ import { LOCAL_FRONTEND_ORIGIN } from "../../shared/local-runtime.js";
 import { PipelineQueueWorker } from "../pipeline/queue-worker.js";
 import { SerpProbeWorker } from "../pipeline/serp-probe-worker.js";
 import { ConfiguredSerpProbe, serpProbeConfigFromEnv } from "../providers/serp-probe.js";
+import { RuntimeModeSchema, permitsTestDoubles } from "../../shared/runtime-mode.js";
 
 import { closePoolWithin, type ShutdownResult } from "../shutdown.js";
 import { classifyError, logger } from "../logger.js";
@@ -68,6 +69,7 @@ export interface LocalServicesConfig {
   authMode?: "required" | "disabled-test";
   /** Explicit deployment opt-in for a non-loopback PostgreSQL endpoint. */
   allowNonLocalDatabase?: boolean;
+  runtimeMode?: "local" | "test" | "production";
 }
 
 export function createLocalServices(config: LocalServicesConfig): {
@@ -75,6 +77,8 @@ export function createLocalServices(config: LocalServicesConfig): {
   ready: Promise<void>;
   close(deadlineMs?: number): Promise<ShutdownResult>;
 } {
+  const runtimeMode = RuntimeModeSchema.parse(config.runtimeMode ?? "local");
+  const testDoublesAllowed = permitsTestDoubles(runtimeMode);
   // Validate any attempted Google configuration even when the database is unavailable;
   // only a wholly absent configuration is allowed to select credential-free behaviour.
   const googleConfig = googleOAuthConfigFromEnv(process.env);
@@ -94,8 +98,13 @@ export function createLocalServices(config: LocalServicesConfig): {
   if (!config.databaseUrl?.trim()) {
     if (config.authMode !== "disabled-test")
       throw new Error("Local PostgreSQL is required for operator authentication");
+    if (runtimeMode === "production") throw new Error("Production requires configured PostgreSQL.");
     return {
-      appOptions: { pipelineUnavailable: true, auth: { mode: "disabled" } },
+      appOptions: {
+        pipelineUnavailable: true,
+        auth: { mode: "disabled" },
+        runtimeMode,
+      },
       ready: Promise.resolve(),
       close: async () => "closed",
     };
@@ -117,16 +126,37 @@ export function createLocalServices(config: LocalServicesConfig): {
   const repository = new PostgresMilestoneRepository(pool, 300_000, {
     writer: { template_id: "mobelaris.writer-submission", version: "1.0.0" },
     schema: { template_id: "mobelaris.blog-schema", version: "1.0.0" },
-    allow_local_pending: databaseIsLocal,
+    allow_local_pending: testDoublesAllowed && databaseIsLocal,
   });
   const googleStore = googleConfig
     ? new GoogleTokenStore(pool, googleConfig.encryptionKey)
     : undefined;
   const googleClient =
     googleConfig && googleStore ? new GoogleOAuthClient(googleConfig, googleStore) : undefined;
+  const modelOptions = modelProviderOptionsFromEnv(process.env);
+  if (runtimeMode === "production") {
+    if (!modelOptions)
+      throw new Error("Production requires an explicitly configured model provider.");
+    if (!googleClient)
+      throw new Error("Production requires an explicitly configured Google OAuth client.");
+    if (!linkDiscoveryConfig)
+      throw new Error("Production requires configured live internal-link discovery.");
+    if (!factVerifierConfig)
+      throw new Error("Production requires configured public storefront verification.");
+    if (!serpProbeConfig) throw new Error("Production requires configured SERP probing.");
+    if (allowUnverifiedLinkBypass)
+      throw new Error("Production forbids the unverified-link bypass.");
+    if (config.fixture) throw new Error("Production forbids deterministic test fixtures.");
+    if (config.authMode === "disabled-test")
+      throw new Error("Production forbids the authentication test bypass.");
+  }
   const googleDocsAdapter = googleClient
     ? new RealGoogleDocsAdapter(googleClient)
-    : new MockGoogleDocsAdapter();
+    : testDoublesAllowed
+      ? new MockGoogleDocsAdapter()
+      : (() => {
+          throw new Error("Production forbids the mock Google Docs adapter.");
+        })();
   // The OAuth callback lives on this API origin (it must match GOOGLE_OAUTH_REDIRECT_URI
   // exactly), but the operator's browser needs sending back to wherever the SPA actually
   // is once the exchange completes. Only `npm start` serves the built client from this
@@ -158,7 +188,6 @@ export function createLocalServices(config: LocalServicesConfig): {
   // Model steps (1.3 drafting, 1.5–1.8 reviews, 1.10 revision, 1.12 coherence)
   // use exactly one explicitly configured OpenRouter or Hugging Face provider;
   // otherwise deterministic mocks keep local behaviour unchanged.
-  const modelOptions = modelProviderOptionsFromEnv(process.env);
   const modelDiagnostic = new ModelDiagnosticService({
     ...(modelOptions ? { provider: modelOptions } : {}),
     store: new PostgresModelDiagnosticRepository(pool),
@@ -240,7 +269,34 @@ export function createLocalServices(config: LocalServicesConfig): {
       serpProbeConfig ? new ConfiguredSerpProbe(serpProbeConfig) : null,
     ),
   );
-  const ready = queueWorker.start();
+  const ready = (async () => {
+    if (runtimeMode === "production") {
+      const [unsafeReferences, selectedTemplates] = await Promise.all([
+        pool.query(
+          `select 1 from reference_activations a
+            where a.provisional_local or not exists (
+              select 1 from reference_approval_attestations aa
+              join reference_attestation_verifications v on v.attestation_id=aa.id
+              where aa.reference_version_id=a.reference_version_id
+            ) limit 1`,
+        ),
+        pool.query<{ status: string }>(
+          `select status from content_templates where
+            (template_id=$1 and version=$2 and kind='writer') or
+            (template_id=$3 and version=$4 and kind='schema')`,
+          ["mobelaris.writer-submission", "1.0.0", "mobelaris.blog-schema", "1.0.0"],
+        ),
+      ]);
+      if (unsafeReferences.rows[0])
+        throw new Error("Production refuses provisional or unverified active references.");
+      if (
+        selectedTemplates.rows.length !== 2 ||
+        selectedTemplates.rows.some((row) => row.status !== "approved")
+      )
+        throw new Error("Production refuses missing or pending export templates.");
+    }
+    await queueWorker.start();
+  })();
   // Mark the promise observed for compositions that only inspect providers in tests; the same
   // rejecting promise is still returned and production awaits it before opening readiness.
   void ready.catch(() => undefined);
@@ -260,10 +316,12 @@ export function createLocalServices(config: LocalServicesConfig): {
       queue: repository,
       commands: repository,
       workerHealth: () => queueWorker.health(),
+      runtimeMode,
       modelDiagnostic,
       googleOAuth: {
         configured: Boolean(googleConfig),
         clientOrigin: googleClientOrigin,
+        secureCookies: runtimeMode === "production",
         ...(googleClient ? { client: googleClient } : {}),
         ...(googleStore ? { store: googleStore } : {}),
       },

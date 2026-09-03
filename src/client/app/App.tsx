@@ -1,4 +1,5 @@
-import { useState } from "react";
+import { useEffect, useState } from "react";
+import { z } from "zod";
 import { AppShell, type WorkspaceScreen } from "../components/AppShell.js";
 import { AuthGate } from "../features/auth/AuthGate.js";
 import { DraftCheckerPage } from "../pages/DraftCheckerPage.js";
@@ -6,8 +7,28 @@ import { CalibrationPage } from "../pages/CalibrationPage.js";
 import { BlogPostPage } from "../pages/BlogPostPage.js";
 import { WritingGuidesPage } from "../pages/WritingGuidesPage.js";
 
-export function App({ authMode = "enabled" }: { authMode?: "enabled" | "test-bypass" }) {
+const HealthRuntimeSchema = z.object({
+  runtime: z.object({ mode: z.enum(["local", "test", "production"]) }),
+});
+
+export function App({
+  authMode = "enabled",
+  runtimeMode: initialRuntimeMode,
+}: {
+  authMode?: "enabled" | "test-bypass";
+  runtimeMode?: "local" | "test" | "production";
+}) {
   const [mode, setMode] = useState<WorkspaceScreen>("blog-post");
+  const [runtimeMode, setRuntimeMode] = useState<"local" | "test" | "production">(
+    initialRuntimeMode ?? "local",
+  );
+  useEffect(() => {
+    if (initialRuntimeMode || authMode === "test-bypass") return;
+    fetch("/api/health", { headers: { Accept: "application/vnd.mobelaris.runtime+json" } })
+      .then(async (response) => HealthRuntimeSchema.parse(await response.json()).runtime.mode)
+      .then(setRuntimeMode)
+      .catch(() => undefined);
+  }, [authMode, initialRuntimeMode]);
   const workspace = (
     operator: {
       id: "local-operator";
@@ -17,7 +38,13 @@ export function App({ authMode = "enabled" }: { authMode?: "enabled" | "test-byp
     },
     signOut: () => Promise<void>,
   ) => (
-    <AppShell active={mode} onNavigate={setMode} operator={operator} onSignOut={signOut}>
+    <AppShell
+      active={mode}
+      onNavigate={setMode}
+      operator={operator}
+      onSignOut={signOut}
+      runtimeMode={runtimeMode}
+    >
       {mode === "blog-post" && <BlogPostPage />}
       {mode === "checker" && <DraftCheckerPage />}
       {mode === "reference-documents" && <WritingGuidesPage />}

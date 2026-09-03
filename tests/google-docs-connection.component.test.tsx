@@ -11,29 +11,50 @@ afterEach(() => {
 describe("Google Docs connection control", () => {
   it("is explicitly unavailable until configured", async () => {
     vi.spyOn(globalThis, "fetch").mockResolvedValue(
-      new Response(JSON.stringify({ configured: false, connected: false, connected_at: null }), {
-        status: 200,
-        headers: { "Content-Type": "application/json" },
-      }),
+      new Response(
+        JSON.stringify({
+          configured: false,
+          connected: false,
+          docs_connected: false,
+          gsc_connected: false,
+          connected_at: null,
+        }),
+        {
+          status: 200,
+          headers: { "Content-Type": "application/json" },
+        },
+      ),
     );
     render(<GoogleDocsConnection />);
     expect(
-      await screen.findByText("Connection unavailable until Google OAuth is configured locally."),
+      await screen.findByText(
+        "Google Docs is not configured. Add the required OAuth configuration before connecting.",
+      ),
     ).toBeInTheDocument();
-    expect(screen.queryByRole("link", { name: "Connect Google" })).not.toBeInTheDocument();
+    expect(screen.queryByRole("link", { name: "Connect Google Docs" })).not.toBeInTheDocument();
   });
 
   it("offers the server-side OAuth start route when configured", async () => {
     vi.spyOn(globalThis, "fetch").mockResolvedValue(
-      new Response(JSON.stringify({ configured: true, connected: false, connected_at: null }), {
-        status: 200,
-        headers: { "Content-Type": "application/json" },
-      }),
+      new Response(
+        JSON.stringify({
+          configured: true,
+          connected: false,
+          docs_connected: false,
+          gsc_connected: false,
+          connected_at: null,
+        }),
+        {
+          status: 200,
+          headers: { "Content-Type": "application/json" },
+        },
+      ),
     );
     render(<GoogleDocsConnection />);
-    expect(await screen.findByRole("link", { name: "Connect Google" })).toHaveAttribute(
+    expect(await screen.findByText("Configured, but not connected.")).toBeInTheDocument();
+    expect(await screen.findByRole("link", { name: "Connect Google Docs" })).toHaveAttribute(
       "href",
-      "/api/integrations/google/connect",
+      "/api/integrations/google/connect?purpose=docs",
     );
   });
 
@@ -45,6 +66,8 @@ describe("Google Docs connection control", () => {
           JSON.stringify({
             configured: true,
             connected: true,
+            docs_connected: true,
+            gsc_connected: false,
             connected_at: "2026-08-20T10:00:00.000Z",
           }),
           { status: 200, headers: { "Content-Type": "application/json" } },

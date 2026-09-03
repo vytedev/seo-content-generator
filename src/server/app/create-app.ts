@@ -37,6 +37,7 @@ import {
 import { AUTH_ALLOWED_ORIGINS, createAuthService, type AuthServiceOptions } from "../auth/auth.js";
 import { registerModelDiagnosticRoutes } from "../routes/model-diagnostic-routes.js";
 import type { ModelDiagnosticService } from "../services/model-diagnostic-service.js";
+import { runtimeState, type RuntimeMode } from "../../shared/runtime-mode.js";
 
 const JSON_BODY_LIMIT = "100kb";
 const AUTH_ALLOWED_ORIGIN_SET = new Set<string>(AUTH_ALLOWED_ORIGINS);
@@ -72,6 +73,7 @@ export interface CreateAppOptions {
   queue?: import("../../shared/queue.js").PipelineQueueRepository;
   commands?: import("../../shared/command-repository.js").RunCommandRepository;
   workerHealth?: () => { status: "running" | "stopped" | "failed" };
+  runtimeMode?: RuntimeMode;
   /** Test-only compatibility. Production-like composition must supply the durable queue. */
   testOnlySynchronousPipeline?: boolean;
   /** Explicitly disabled preserves isolated tests; local runtime always supplies enabled auth. */
@@ -215,7 +217,11 @@ export function createApp(options: CreateAppOptions = {}): Express {
       response.status(503).json({ status: "degraded", queue_worker: "failed" });
       return;
     }
-    response.status(200).json({ status: "ok", ...(worker ? { queue_worker: worker.status } : {}) });
+    response.status(200).json({
+      status: "ok",
+      ...(options.runtimeMode ? { runtime: runtimeState(options.runtimeMode) } : {}),
+      ...(worker ? { queue_worker: worker.status } : {}),
+    });
   });
 
   if (options.auth?.mode === "enabled") {

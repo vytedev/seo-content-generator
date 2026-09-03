@@ -5,7 +5,10 @@ import { createLocalApp, createLocalServices } from "../src/server/local-service
 describe("local server composition", () => {
   it("keeps the checker available and safely reports unconfigured pipeline routes", async () => {
     const { app, close } = createLocalApp({ authMode: "disabled-test" });
-    expect((await request(app).get("/api/health")).body).toEqual({ status: "ok" });
+    expect((await request(app).get("/api/health")).body).toMatchObject({
+      status: "ok",
+      runtime: { mode: "local", test_doubles: true },
+    });
     expect((await request(app).get("/api/runs/example")).body).toMatchObject({
       error: { code: "LOCAL_DATABASE_NOT_CONFIGURED" },
     });

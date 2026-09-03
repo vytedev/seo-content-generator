@@ -557,7 +557,12 @@ export function RunWorkspace({
             {(detail.current_step === "final_coherence_export" ||
               detail.status === "succeeded" ||
               detail.export.status === "failed") && <GoogleDocsConnection />}
-            {detail.export.external_url ? (
+            {detail.export.external_url?.endsWith(".local") ||
+            detail.export.external_url?.includes(".local/") ? (
+              <p className="mt-3 text-sm text-warning">
+                Simulated local export — no production Google document was created.
+              </p>
+            ) : detail.export.external_url ? (
               <a
                 className="mt-3 inline-flex max-w-full min-w-0 flex-wrap items-center gap-1 [overflow-wrap:anywhere] text-sm font-semibold text-action underline underline-offset-4 hover:text-action-hover"
                 href={detail.export.external_url}

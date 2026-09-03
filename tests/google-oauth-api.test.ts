@@ -3,15 +3,45 @@ import { describe, expect, it, vi } from "vitest";
 import { createApp } from "../src/server/app/create-app.js";
 import { logger } from "../src/server/logger.js";
 import {
+  GOOGLE_DOCS_SCOPES,
   GOOGLE_SCOPES,
   type GoogleOAuthClient,
   type GoogleTokenStore,
 } from "../src/server/providers/google-oauth.js";
 
 describe("Google OAuth API", () => {
-  it("requests Search Console read-only alongside existing export scopes", () => {
+  it("keeps Search Console read-only separate from required export scopes", () => {
     expect(GOOGLE_SCOPES).toContain("https://www.googleapis.com/auth/webmasters.readonly");
     expect(GOOGLE_SCOPES).not.toContain("https://www.googleapis.com/auth/webmasters");
+  });
+
+  it("passes the requested consent purpose through state and callback", async () => {
+    const authorisationUrl = vi.fn(
+      (state: string, _challenge: string, purpose: string) =>
+        `https://accounts.google.test/auth?state=${state}&purpose=${purpose}`,
+    );
+    const exchangeCode = vi.fn().mockResolvedValue(undefined);
+    const app = createApp({
+      serveClient: false,
+      googleOAuth: {
+        configured: true,
+        client: { authorisationUrl, exchangeCode } as unknown as GoogleOAuthClient,
+        store: {} as GoogleTokenStore,
+      },
+    });
+    const start = await request(app)
+      .get("/api/integrations/google/connect?purpose=gsc")
+      .expect(303);
+    const target = new URL(String(start.headers.location));
+    const state = target.searchParams.get("state")!;
+    const cookie = String(start.headers["set-cookie"]?.[0]).split(";")[0]!;
+    expect(target.searchParams.get("purpose")).toBe("gsc");
+    await request(app)
+      .get(`/api/integrations/google/callback?code=x&state=${state}`)
+      .set("Cookie", cookie)
+      .expect("Location", "/?google=success&code=gsc_connected")
+      .expect(303);
+    expect(exchangeCode).toHaveBeenCalledWith("x", expect.any(String), "gsc");
   });
 
   it("reports explicitly unavailable when credentials are not configured", async () => {
@@ -19,6 +49,8 @@ describe("Google OAuth API", () => {
     await request(app).get("/api/integrations/google/status").expect(200, {
       configured: false,
       connected: false,
+      docs_connected: false,
+      gsc_connected: false,
       connected_at: null,
     });
     await request(app).get("/api/integrations/google/connect").expect(503);
@@ -31,6 +63,12 @@ describe("Google OAuth API", () => {
         connected: true,
         connectedAt: "2026-08-20T10:00:00.000Z",
       }),
+      load: vi.fn().mockResolvedValue({
+        accessToken: "token",
+        refreshToken: "refresh",
+        expiresAt: new Date("2026-08-20T11:00:00.000Z"),
+        scope: GOOGLE_DOCS_SCOPES.join(" "),
+      }),
     } as unknown as GoogleTokenStore;
     const client = { disconnect } as unknown as GoogleOAuthClient;
     const app = createApp({
@@ -40,6 +78,8 @@ describe("Google OAuth API", () => {
     await request(app).get("/api/integrations/google/status").expect(200, {
       configured: true,
       connected: true,
+      docs_connected: true,
+      gsc_connected: false,
       connected_at: "2026-08-20T10:00:00.000Z",
     });
     await request(app).delete("/api/integrations/google").expect(204);
@@ -85,6 +125,7 @@ describe("Google OAuth API", () => {
     // Google's top-level redirect is cross-site, so Strict would omit this cookie
     // and make every legitimate callback fail as invalid_callback.
     expect(cookie).toContain("SameSite=Lax");
+    expect(client.authorisationUrl).toBeDefined();
 
     await request(app)
       .get(`/api/integrations/google/callback?code=x&state=${state}`)

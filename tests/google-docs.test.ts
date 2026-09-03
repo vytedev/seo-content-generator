@@ -185,10 +185,12 @@ describe("Google OAuth and Docs providers", () => {
     ).toThrow("not approved");
   });
 
-  it("requests all three authorisation scopes", () => {
+  it("requests required export and optional GSC scopes separately", () => {
     const oauth = new GoogleOAuthClient(config, {} as GoogleTokenStore, vi.fn());
-    const url = new URL(oauth.authorisationUrl("state", "challenge"));
-    expect(url.searchParams.get("scope")).toBe(scope);
+    const url = new URL(oauth.authorisationUrl("state", "challenge", "docs"));
+    expect(url.searchParams.get("scope")).toBe(GOOGLE_DOCS_SCOPES.join(" "));
+    const gsc = new URL(oauth.authorisationUrl("state", "challenge", "gsc"));
+    expect(gsc.searchParams.get("scope")).toBe(GOOGLE_SCOPES.join(" "));
     expect(url.searchParams.get("include_granted_scopes")).toBe("false");
     expect(url.toString()).not.toContain(config.clientSecret);
   });

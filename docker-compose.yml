@@ -16,6 +16,7 @@ services:
       HOST: 0.0.0.0
       PORT: 3000
       ALLOW_NON_LOCAL_DATABASE: "true"
+      RUNTIME_MODE: production
       GOOGLE_OAUTH_REDIRECT_URI: https://content-generator.vyte.dev/api/integrations/google/callback
     healthcheck:
       test: ["CMD-SHELL", "curl --fail --silent http://127.0.0.1:3000/api/health || exit 1"]

@@ -44,7 +44,7 @@ export function GoogleDocsConnection() {
   if (!status.configured)
     return (
       <p className="mt-3 text-sm text-muted">
-        Connection unavailable until Google OAuth is configured locally.
+        Google Docs is not configured. Add the required OAuth configuration before connecting.
       </p>
     );
 
@@ -53,7 +53,13 @@ export function GoogleDocsConnection() {
     setError("");
     try {
       await disconnectGoogle();
-      setStatus({ configured: true, connected: false, connected_at: null });
+      setStatus({
+        configured: true,
+        connected: false,
+        docs_connected: false,
+        gsc_connected: false,
+        connected_at: null,
+      });
     } catch {
       setError("Google could not be disconnected.");
     } finally {
@@ -68,19 +74,34 @@ export function GoogleDocsConnection() {
           {error}
         </p>
       ) : null}
-      {status.connected ? (
-        <div className="flex flex-wrap items-center gap-2">
-          <span className="text-sm text-success" role="status" aria-live="polite">
-            ● Connected
-          </span>
-          <Button type="button" variant="outline" size="sm" loading={busy} onClick={disconnect}>
-            Disconnect
-          </Button>
+      {status.docs_connected ? (
+        <div className="space-y-2">
+          <div className="flex flex-wrap items-center gap-2">
+            <span className="text-sm text-success" role="status" aria-live="polite">
+              ● Google Docs connected
+            </span>
+            <Button type="button" variant="outline" size="sm" loading={busy} onClick={disconnect}>
+              Disconnect
+            </Button>
+          </div>
+          {status.gsc_connected ? (
+            <p className="text-sm text-success">● Search Console enrichment connected</p>
+          ) : (
+            <div className="flex flex-wrap items-center gap-2">
+              <span className="text-sm text-muted">Search Console enrichment is optional.</span>
+              <Button type="button" variant="outline" size="sm" asChild>
+                <a href="/api/integrations/google/connect?purpose=gsc">Connect Search Console</a>
+              </Button>
+            </div>
+          )}
         </div>
       ) : (
-        <Button type="button" variant="outline" size="sm" asChild>
-          <a href="/api/integrations/google/connect">Connect Google</a>
-        </Button>
+        <div>
+          <p className="mb-2 text-sm text-muted">Configured, but not connected.</p>
+          <Button type="button" variant="outline" size="sm" asChild>
+            <a href="/api/integrations/google/connect?purpose=docs">Connect Google Docs</a>
+          </Button>
+        </div>
       )}
     </div>
   );

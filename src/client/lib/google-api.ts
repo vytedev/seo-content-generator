@@ -4,6 +4,8 @@ import { apiFetch } from "./api.js";
 export const GoogleConnectionStatusSchema = z.object({
   configured: z.boolean(),
   connected: z.boolean(),
+  docs_connected: z.boolean(),
+  gsc_connected: z.boolean(),
   connected_at: z.string().datetime().nullable(),
 });
 export type GoogleConnectionStatus = z.infer<typeof GoogleConnectionStatusSchema>;
