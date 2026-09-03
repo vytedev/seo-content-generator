@@ -683,6 +683,14 @@ function ReviewRow({
   const generatedId = useId().replaceAll(":", "");
   const rationaleId = `finding-rationale-${generatedId}`;
   const hardFlag = finding.hard_flag;
+  const hardFlagLabel =
+    finding.hard_flag_reason === "designer_attribution"
+      ? "Designer attribution"
+      : finding.hard_flag_reason === "provenance"
+        ? "Provenance"
+        : finding.hard_flag_reason === "unknown_legacy" || !finding.hard_flag_reason
+          ? "Historical mandatory review"
+          : finding.hard_flag_reason.replaceAll("_", " ");
   const readOnly = finding.disposition !== null;
   const decision = staged?.decision ?? finding.disposition;
   const severityMeta = SEVERITY_META[finding.severity];
@@ -717,7 +725,7 @@ function ReviewRow({
           {hardFlag && (
             <span className="inline-flex items-center gap-1.5 text-xs font-semibold text-danger">
               <span aria-hidden="true" className="size-1.5 rounded-full bg-danger" />
-              Hard flag · provenance/attribution
+              Hard flag · {hardFlagLabel}
             </span>
           )}
           {decision && (
@@ -745,6 +753,18 @@ function ReviewRow({
             className="mt-3 grid min-w-0 gap-x-3 gap-y-1 border-t border-rule pt-3 text-xs sm:grid-cols-[8rem_minmax(0,1fr)]"
             aria-label="Source evidence details"
           >
+            {source.title && (
+              <>
+                <dt className="font-semibold text-ink">Title</dt>
+                <dd className="[overflow-wrap:anywhere]">{source.title}</dd>
+              </>
+            )}
+            {source.publisher && (
+              <>
+                <dt className="font-semibold text-ink">Publisher</dt>
+                <dd className="[overflow-wrap:anywhere]">{source.publisher}</dd>
+              </>
+            )}
             <dt className="font-semibold text-ink">Source URL</dt>
             <dd className="min-w-0 [overflow-wrap:anywhere]">
               <a
@@ -757,7 +777,9 @@ function ReviewRow({
               </a>
             </dd>
             <dt className="font-semibold text-ink">Extraction</dt>
-            <dd className="font-mono [overflow-wrap:anywhere]">{source.extraction_method}</dd>
+            <dd className="font-mono [overflow-wrap:anywhere]">
+              {source.evidence_location ?? source.extraction_method}
+            </dd>
             <dt className="font-semibold text-ink">Retrieved</dt>
             <dd>{new Date(source.retrieved_at).toLocaleString("en-GB")}</dd>
             <dt className="font-semibold text-ink">Content hash</dt>

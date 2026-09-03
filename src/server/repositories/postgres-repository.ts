@@ -5,6 +5,7 @@ import { SerpEvidenceSchema, type SerpEvidence } from "../../shared/ingest-contr
 import { SerpProbeWorkSchema, type SerpProbeWork } from "../../shared/serp-evidence.js";
 import { serpWarning } from "../pipeline/serp-probe-worker.js";
 import { FindingLocationSchema } from "../../shared/checker/index.js";
+import { projectHardFlagReason } from "../../shared/hard-flags.js";
 import { revisionBindingExclusions } from "../../shared/revision-planning.js";
 import type { FindingLocation } from "../../shared/revision-application.js";
 import {
@@ -137,6 +138,11 @@ function projectEvidenceSource(row: any) {
   return [
     {
       url: String(row.uri).slice(0, 2_048),
+      ...(row.title ? { title: String(row.title).slice(0, 300) } : {}),
+      ...(row.publisher ? { publisher: String(row.publisher).slice(0, 200) } : {}),
+      ...(row.evidence_location
+        ? { evidence_location: String(row.evidence_location).slice(0, 500) }
+        : {}),
       extraction_method: snapshot.extraction_method.slice(0, 120),
       retrieved_at: new Date(row.retrieved_at).toISOString(),
       content_hash: String(snapshot.content_hash ?? row.content_hash),
@@ -1498,8 +1504,8 @@ export class PostgresMilestoneRepository
             evidence: [source.evidence],
           });
         const inserted = await client.query<{ id: string }>(
-          `insert into sources(id,run_id,source_type,uri,title,retrieved_at,content_hash,snapshot)
-           values($1,$2,$3,$4,$5,$6,$7,$8::jsonb)
+          `insert into sources(id,run_id,source_type,uri,title,publisher,retrieved_at,content_hash,snapshot)
+           values($1,$2,$3,$4,$5,$6,$7,$8,$9::jsonb)
            on conflict(run_id,uri,content_hash) do nothing returning id`,
           [
             id,
@@ -1507,6 +1513,7 @@ export class PostgresMilestoneRepository
             source.source_type,
             source.uri,
             source.title,
+            source.source_type === "public_storefront" ? "Mobelaris" : null,
             source.retrieved_at,
             hash,
             snapshot,
@@ -1550,7 +1557,7 @@ export class PostgresMilestoneRepository
         if (!source || !sourceId) throw new Error("Claim source is missing");
         const claimId = randomUUID();
         await client.query(
-          `insert into claims(id,run_id,document_version_id,claim_text,claim_hash,type,status,location,hard_flag) values($1,$2,$3,$4,$5,$6,$7,$8::jsonb,$9)`,
+          `insert into claims(id,run_id,document_version_id,claim_text,claim_hash,type,status,location,hard_flag,hard_flag_reason) values($1,$2,$3,$4,$5,$6,$7,$8::jsonb,$9,$10)`,
           [
             claimId,
             runId,
@@ -1561,11 +1568,21 @@ export class PostgresMilestoneRepository
             claim.status,
             JSON.stringify(claim.location),
             claim.hard_flag,
+            claim.hard_flag_reason ?? null,
           ],
         );
         await client.query(
           `insert into claim_sources(run_id,claim_id,source_id,status,evidence_location,evidence) values($1,$2,$3,$4,$5,$6)`,
-          [runId, claimId, sourceId, claim.status, source.uri, source.evidence],
+          [
+            runId,
+            claimId,
+            sourceId,
+            claim.status,
+            typeof source.snapshot.extraction_method === "string"
+              ? source.snapshot.extraction_method
+              : null,
+            source.evidence,
+          ],
         );
       }
       await client.query(
@@ -1821,7 +1838,7 @@ export class PostgresMilestoneRepository
     const sourceRows = result.rows.length
       ? (
           await this.pool.query<any>(
-            `select f.id finding_id,s.uri,s.retrieved_at,s.content_hash,s.snapshot,cs.evidence
+            `select f.id finding_id,s.uri,s.title,s.publisher,s.retrieved_at,s.content_hash,s.snapshot,cs.evidence_location,cs.evidence
              from findings f
              join claims c on c.run_id=f.run_id and c.document_version_id=f.document_version_id and c.location=f.location
              join claim_sources cs on cs.run_id=c.run_id and cs.claim_id=c.id
@@ -1846,6 +1863,7 @@ export class PostgresMilestoneRepository
       ...(row.evidence ? { evidence: row.evidence } : {}),
       suggested_fix: row.suggested_fix,
       hard_flag: row.hard_flag,
+      hard_flag_reason: projectHardFlagReason(row),
       disposition: row.disposition,
       rationale: row.rationale,
       evidence_sources: sourceRows
@@ -2321,7 +2339,7 @@ export class PostgresMilestoneRepository
 
   async getExportClaims(runId: string, documentVersionId: string): Promise<ExportClaim[]> {
     const result = await this.pool.query<any>(
-      `select c.id,c.claim_text,c.claim_hash,c.type,c.status,c.location,c.hard_flag,
+      `select c.id,c.claim_text,c.claim_hash,c.type,c.status,c.location,c.hard_flag,c.hard_flag_reason,
        coalesce(jsonb_agg(jsonb_build_object('id',s.id,'uri',s.uri,'title',s.title,'publisher',s.publisher,
          'retrieved_at',s.retrieved_at,'content_hash',s.content_hash,'evidence_location',cs.evidence_location,
          'evidence',cs.evidence,'evidence_hash',case when cs.evidence is null then null else encode(digest(cs.evidence,'sha256'),'hex') end)
@@ -2344,12 +2362,21 @@ export class PostgresMilestoneRepository
           : undefined;
       return ExportClaimSchema.parse({
         ...row,
+        hard_flag_reason: projectHardFlagReason(row),
         sources: row.sources.map((source: any) => ({
           ...source,
-          ...(source.title === null ? { title: undefined } : {}),
-          ...(source.publisher === null ? { publisher: undefined } : {}),
-          ...(source.evidence_location === null ? { evidence_location: undefined } : {}),
-          ...(source.evidence === null ? { evidence: undefined } : {}),
+          ...(source.title === null
+            ? { title: undefined }
+            : { title: String(source.title).slice(0, 300) }),
+          ...(source.publisher === null
+            ? { publisher: undefined }
+            : { publisher: String(source.publisher).slice(0, 200) }),
+          ...(source.evidence_location === null
+            ? { evidence_location: undefined }
+            : { evidence_location: String(source.evidence_location).slice(0, 500) }),
+          ...(source.evidence === null
+            ? { evidence: undefined }
+            : { evidence: String(source.evidence).slice(0, 2_000) }),
         })),
         ...(product ? { product_identifier: product } : {}),
       });
@@ -2540,8 +2567,8 @@ export class PostgresMilestoneRepository
       }
       await client.query(
         `with copied as (
-           insert into claims(id,run_id,document_version_id,claim_text,claim_hash,type,status,location,hard_flag)
-           select gen_random_uuid(),run_id,$3,claim_text,claim_hash,type,status,location,hard_flag
+           insert into claims(id,run_id,document_version_id,claim_text,claim_hash,type,status,location,hard_flag,hard_flag_reason)
+           select gen_random_uuid(),run_id,$3,claim_text,claim_hash,type,status,location,hard_flag,hard_flag_reason
            from claims where run_id=$1 and document_version_id=$2
            returning id,claim_hash
          )
@@ -3822,7 +3849,7 @@ export class PostgresMilestoneRepository
   ): Promise<void> {
     for (const finding of findings)
       await client.query(
-        `insert into findings(run_id,document_version_id,step_execution_id,stable_key,category,rule_reference,severity,location,issue,evidence,suggested_fix,hard_flag) values($1,$2,$3,$4,$5,$6,$7,$8::jsonb,$9,$10,$11,$12)`,
+        `insert into findings(run_id,document_version_id,step_execution_id,stable_key,category,rule_reference,severity,location,issue,evidence,suggested_fix,hard_flag,hard_flag_reason) values($1,$2,$3,$4,$5,$6,$7,$8::jsonb,$9,$10,$11,$12,$13)`,
         [
           runId,
           documentVersionId,
@@ -3836,6 +3863,7 @@ export class PostgresMilestoneRepository
           finding.evidence ?? null,
           finding.suggested_fix,
           finding.hard_flag,
+          "hard_flag_reason" in finding ? (finding.hard_flag_reason ?? null) : null,
         ],
       );
   }

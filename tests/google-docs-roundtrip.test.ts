@@ -793,6 +793,49 @@ function adapterAgainst(
 }
 
 describe("Google Docs export round trip", () => {
+  it("round-trips bounded readable evidence without leaking raw source bodies", async () => {
+    const rawBody = "<html><body>PRIVATE RAW BODY</body></html>";
+    const result = rendered({
+      claims: [
+        {
+          id: "claim-attribution",
+          claim_text: "The chair was designed by Hans Wegner.",
+          type: "provenance",
+          status: "verified",
+          hard_flag: true,
+          hard_flag_reason: "designer_attribution",
+          location: { field: "body_markdown", line_start: 1 },
+          claim_hash: "a".repeat(64),
+          sources: [
+            {
+              id: "source-1",
+              uri: "https://www.mobelaris.com/products/chair",
+              title: "Wishbone chair",
+              publisher: "Mobelaris",
+              retrieved_at: "2026-08-23T10:00:00.000Z",
+              content_hash: "b".repeat(64),
+              evidence_location: "product JSON-LD designer field",
+              evidence: "Designer: Hans Wegner",
+              evidence_hash: "c".repeat(64),
+            },
+          ],
+        },
+      ],
+    });
+    expect(result.markdown).toContain("designer_attribution");
+    expect(result.markdown).toContain("title: Wishbone chair; publisher: Mobelaris");
+    expect(result.markdown).toContain("product JSON-LD designer field");
+    expect(result.markdown).toContain("Designer: Hans Wegner");
+    expect(result.markdown).not.toContain(rawBody);
+    const completed = nativeDocument(result);
+    const { adapter } = adapterAgainst(recoveryDocument(result, "missing", "revision-1"), {
+      afterBatchDocument: completed,
+    });
+    await expect(adapter.export("bounded-evidence-key", result)).resolves.toMatchObject({
+      external_document_id: "doc-round-trip",
+    });
+  });
+
   it("keeps one rendered operation to exactly one Google paragraph", async () => {
     // The direct invariant the live failure violated: an interior newline in
     // inserted text makes Google start a new paragraph, so a multi-line

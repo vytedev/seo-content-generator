@@ -4,6 +4,7 @@ import {
   runVersionedDeterministicChecks,
 } from "../../shared/deterministic-run.js";
 import { inventoryFacts } from "../../shared/fact-inventory.js";
+import { deriveFactHardFlagReason } from "../../shared/hard-flags.js";
 import {
   auditDraftLinks,
   NoNetworkDraftLinkVerifier,
@@ -23,7 +24,11 @@ import {
 } from "../../shared/milestone-three.js";
 import type { PipelineStepId } from "../../shared/pipeline.js";
 import type { ReviewProvider } from "../providers/review-provider.js";
-import { NoNetworkFactVerifier, type FactVerifier } from "../providers/fact-verifier.js";
+import {
+  NoNetworkFactVerifier,
+  factFindingStableKey,
+  type FactVerifier,
+} from "../providers/fact-verifier.js";
 import { withHeartbeat } from "./lease-heartbeat.js";
 import { classifyError, logger } from "../logger.js";
 import { executePaidOperation } from "../providers/paid-operation-lifecycle.js";
@@ -290,16 +295,26 @@ export class MilestoneThreeOrchestrator {
                     : providerResponse;
                 const checked = {
                   ...reviewed,
-                  findings: reviewed.findings.map((finding) => ({
-                    ...finding,
-                    hard_flag:
-                      step === "review_fact_checking" &&
-                      factInventory.some(
-                        (item) =>
-                          item.classification === "attribution_provenance" &&
-                          JSON.stringify(item.location) === JSON.stringify(finding.location),
-                      ),
-                  })),
+                  findings: reviewed.findings.map((finding) => {
+                    const hardFlagReason =
+                      step === "review_fact_checking"
+                        ? factInventory
+                            .filter(
+                              (item) =>
+                                finding.stable_key ===
+                                  factFindingStableKey(item.stable_key, "unverified") ||
+                                finding.stable_key ===
+                                  factFindingStableKey(item.stable_key, "contradicted"),
+                            )
+                            .map(deriveFactHardFlagReason)
+                            .find((reason) => reason !== null)
+                        : null;
+                    return {
+                      ...finding,
+                      hard_flag: Boolean(hardFlagReason),
+                      ...(hardFlagReason ? { hard_flag_reason: hardFlagReason } : {}),
+                    };
+                  }),
                 };
                 logger.info("provider.response_validated", {
                   run_id: runId,

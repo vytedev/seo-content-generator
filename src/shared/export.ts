@@ -6,7 +6,7 @@ import type { Root, Content, PhrasingContent } from "mdast";
 import { StructuredDraftSchema, assertExactImagePlacements, contentHash } from "./milestone-two.js";
 import { normaliseHttpUrl } from "./checker/contracts.js";
 import { assertEditoriallyExportable } from "./editorial-integrity.js";
-import { HardFlagReasonSchema } from "./hard-flags.js";
+import { HardFlagReasonSchema, projectHardFlagReason } from "./hard-flags.js";
 
 const text = z.string().trim().min(1);
 const hash = z.string().regex(/^[a-f0-9]{64}$/);
@@ -14,12 +14,12 @@ export const ExportSourceSchema = z
   .object({
     id: text,
     uri: z.string().url(),
-    title: text.optional(),
-    publisher: text.optional(),
+    title: text.max(300).optional(),
+    publisher: text.max(200).optional(),
     retrieved_at: z.string().datetime({ offset: true }),
     content_hash: hash,
-    evidence_location: text.optional(),
-    evidence: text.optional(),
+    evidence_location: text.max(500).optional(),
+    evidence: text.max(2_000).optional(),
     evidence_hash: hash.nullable(),
   })
   .strict();
@@ -380,6 +380,7 @@ export function renderExport(input: unknown): ExportRenderResult {
   assertTemplatePolicy(p.schema_template);
   const used = validateLinks(p.draft.markdown, p.internal_links);
   const none = (v?: string) => v?.trim() || "None";
+  const mandatoryReason = (claim: ExportClaim) => projectHardFlagReason(claim) ?? "not mandatory";
   const sections: Record<string, string> = {
     Metadata: [
       `# ${p.draft.title}`,
@@ -447,12 +448,12 @@ export function renderExport(input: unknown): ExportRenderResult {
     "Fact-check claims": [
       "## Fact-check claims",
       "",
-      "| Claim ID | Claim | Type | Status | Mandatory | Location | Product ID | Source IDs / evidence hashes |",
+      "| Claim ID | Claim | Type | Status | Mandatory reason | Location | Product ID | Source IDs / evidence hashes |",
       "| --- | --- | --- | --- | --- | --- | --- | --- |",
       ...(p.claims.length
         ? p.claims.map(
             (c) =>
-              `| ${c.id} | ${escape(c.claim_text)} | ${c.type} | ${c.status} | ${c.hard_flag ? "yes" : "no"} | ${escape(JSON.stringify(c.location))} | ${escape(c.product_identifier ?? "None")} | ${escape(c.sources.map((s) => `${s.id}: ${s.uri} [${s.content_hash}/${s.evidence_hash ?? "no evidence hash"}]`).join("; ") || "None")} |`,
+              `| ${c.id} | ${escape(c.claim_text)} | ${c.type} | ${c.status} | ${mandatoryReason(c)} | ${escape(JSON.stringify(c.location))} | ${escape(c.product_identifier ?? "None")} | ${escape(c.sources.map((s) => `${s.id}: ${s.uri} [${s.content_hash}/${s.evidence_hash ?? "no evidence hash"}]; title: ${s.title ?? "Untitled source"}; publisher: ${s.publisher ?? "Unknown"}; retrieved: ${s.retrieved_at}; extraction: ${s.evidence_location ?? "Unspecified"}; excerpt: ${s.evidence ?? "No bounded excerpt stored"}`).join("; ") || "None")} |`,
           )
         : ["| None | None | None | None | None | None | None | None |"]),
     ].join("\n"),

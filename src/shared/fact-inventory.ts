@@ -2,6 +2,7 @@ import { canonicalHash } from "./milestone-two.js";
 import type { FactInventoryItem, ReviewResponse } from "./milestone-three.js";
 import { ReviewResponseSchema } from "./milestone-three.js";
 import type { StructuredDraft } from "./milestone-two.js";
+import { deriveFactHardFlagReason } from "./hard-flags.js";
 
 const FIGURE =
   /\b(?:£|\$|€)?\d+(?:[,.]\d+)*(?:\s?(?:%|cm|mm|m|kg|g|years?|days?|weeks?|months?|hours?))?\b/i;
@@ -128,7 +129,12 @@ export function enforceFactReview(
         item.classification === "attribution_provenance"
           ? ("provenance" as const)
           : item.claim_type,
-      ...(item.classification === "attribution_provenance" ? { hard_flag: true } : {}),
+      ...(deriveFactHardFlagReason(item)
+        ? {
+            hard_flag: true,
+            hard_flag_reason: deriveFactHardFlagReason(item),
+          }
+        : {}),
     };
   });
   return ReviewResponseSchema.parse({ ...response, claims });

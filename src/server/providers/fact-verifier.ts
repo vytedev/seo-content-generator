@@ -5,6 +5,7 @@ import { z } from "zod";
 import type { SitemapClient, SitemapCandidate } from "./internal-link-discovery.js";
 import { nodeHttpsPinnedFetcher, type PinnedFetcher } from "./public-page-retriever.js";
 import { isCanonicalProductRoute } from "../../shared/product-route.js";
+import { deriveFactHardFlagReason } from "../../shared/hard-flags.js";
 import {
   ReviewRequestSchema,
   ReviewResponseSchema,
@@ -127,6 +128,8 @@ export function factVerifierConfigFromEnv(
 
 const hash = (value: string) => createHash("sha256").update(value).digest("hex");
 const stableKey = (prefix: string, value: string) => `${prefix}-${hash(value).slice(0, 20)}`;
+export const factFindingStableKey = (inventoryKey: string, status: "unverified" | "contradicted") =>
+  stableKey("fact", `${inventoryKey}:${status}`);
 function unresolvedSource(
   item: FactInventoryItem,
   retrievedAt: string,
@@ -150,7 +153,7 @@ function findingFor(
   const provenance =
     item.classification === "attribution_provenance" || item.claim_type === "provenance";
   return {
-    stable_key: stableKey("fact", `${item.stable_key}:${status}`),
+    stable_key: factFindingStableKey(item.stable_key, status),
     category: provenance ? "provenance" : "fact_checking",
     rule_reference: provenance ? "facts.provenance_always_review" : `facts.${status}`,
     severity: "blocker" as const,
@@ -477,6 +480,7 @@ export class PublicStorefrontFactVerifier implements FactVerifier {
 }
 
 function claimRecord(item: FactInventoryItem, status: Status, sourceKey: string) {
+  const hardFlagReason = deriveFactHardFlagReason(item);
   return {
     stable_key: stableKey("claim", item.stable_key),
     inventory_key: item.stable_key,
@@ -485,7 +489,8 @@ function claimRecord(item: FactInventoryItem, status: Status, sourceKey: string)
       item.classification === "attribution_provenance" ? ("provenance" as const) : item.claim_type,
     status,
     location: item.location,
-    hard_flag: item.classification === "attribution_provenance" || item.claim_type === "provenance",
+    hard_flag: hardFlagReason !== null,
+    ...(hardFlagReason ? { hard_flag_reason: hardFlagReason } : {}),
     source_key: sourceKey,
   };
 }

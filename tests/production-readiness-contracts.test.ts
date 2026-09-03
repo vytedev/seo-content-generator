@@ -11,6 +11,7 @@ import {
   normalisePaidOperationStage,
   permitsTestDoubles,
   projectHardFlagReason,
+  deriveFactHardFlagReason,
   PersistedReviewFindingSchema,
 } from "../src/shared/index.js";
 
@@ -201,6 +202,20 @@ describe("production-readiness contracts", () => {
       "provenance",
     );
     expect(projectHardFlagReason({ hard_flag: false })).toBeNull();
+    expect(
+      deriveFactHardFlagReason({
+        text: "The chair was designed by Hans Wegner.",
+        classification: "attribution_provenance",
+        claim_type: "provenance",
+      }),
+    ).toBe("designer_attribution");
+    expect(
+      deriveFactHardFlagReason({
+        text: "The collection has documented provenance.",
+        classification: "attribution_provenance",
+        claim_type: "provenance",
+      }),
+    ).toBe("provenance");
 
     const finding = {
       stable_key: "fact.provenance",

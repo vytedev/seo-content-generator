@@ -263,6 +263,9 @@ export type PersistedReviewResponse = z.infer<typeof PersistedReviewResponseSche
 export const EvidenceSourceProjectionSchema = z
   .object({
     url: z.string().max(2_048),
+    title: z.string().max(300).optional(),
+    publisher: z.string().max(200).optional(),
+    evidence_location: z.string().max(500).optional(),
     extraction_method: z.string().max(120),
     retrieved_at: z.string().datetime({ offset: true }),
     content_hash: z.string().regex(/^[a-f0-9]{64}$/),

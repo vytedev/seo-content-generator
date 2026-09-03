@@ -16,6 +16,7 @@ import {
 } from "../../shared/errors.js";
 import { QueueOptionsSchema, type QueueLease, type QueueOptions } from "../../shared/queue.js";
 import { PaidOperationProjectionSchema } from "../../shared/paid-operation.js";
+import { projectHardFlagReason } from "../../shared/hard-flags.js";
 import { paidOperationAmbiguity } from "../providers/paid-operation-lifecycle.js";
 import { SerpEvidenceSchema, type SerpEvidence } from "../../shared/ingest-contracts.js";
 import { SerpProbeWorkSchema, type SerpProbeWork } from "../../shared/serp-evidence.js";
@@ -1308,6 +1309,7 @@ export class InMemoryMilestoneRepository
         const selection = snapshot?.selection_evidence as Record<string, unknown> | undefined;
         return {
           ...finding,
+          hard_flag_reason: projectHardFlagReason(finding),
           disposition: disposition?.decision ?? null,
           rationale: disposition?.rationale ?? null,
           evidence_sources:
@@ -1319,6 +1321,13 @@ export class InMemoryMilestoneRepository
               ? [
                   {
                     url: String(source.uri).slice(0, 2_048),
+                    ...(source.title ? { title: String(source.title).slice(0, 300) } : {}),
+                    ...(source.source_type === "public_storefront"
+                      ? { publisher: "Mobelaris" }
+                      : source.publisher
+                        ? { publisher: String(source.publisher).slice(0, 200) }
+                        : {}),
+                    evidence_location: snapshot.extraction_method.slice(0, 500),
                     extraction_method: snapshot.extraction_method.slice(0, 120),
                     retrieved_at: String(source.retrieved_at),
                     content_hash: String(snapshot.content_hash ?? source.content_hash),
@@ -1751,8 +1760,11 @@ export class InMemoryMilestoneRepository
     this.requireRun(runId);
     return this.claims
       .filter((claim) => claim.run_id === runId && claim.document_version_id === documentVersionId)
-      .map((claim) =>
-        ExportClaimSchema.parse({
+      .map((claim) => {
+        const source = this.sources.find(
+          (item) => item.run_id === runId && item.stable_key === claim.source_key,
+        );
+        return ExportClaimSchema.parse({
           id: stableId(
             "claim",
             runId,
@@ -1764,11 +1776,36 @@ export class InMemoryMilestoneRepository
           type: claim.type,
           status: claim.status,
           hard_flag: claim.hard_flag,
+          hard_flag_reason: projectHardFlagReason({
+            hard_flag: Boolean(claim.hard_flag),
+            hard_flag_reason: claim.hard_flag_reason as never,
+          }),
           location: claim.location,
           claim_hash: canonicalHash({ text: claim.claim_text, location: claim.location }),
-          sources: [],
-        }),
-      );
+          sources: source
+            ? [
+                {
+                  id: String(source.stable_key),
+                  uri: String(source.uri),
+                  ...(source.title ? { title: String(source.title).slice(0, 300) } : {}),
+                  ...(source.source_type === "public_storefront" ? { publisher: "Mobelaris" } : {}),
+                  retrieved_at: String(source.retrieved_at),
+                  content_hash: String(source.content_hash),
+                  ...(typeof (source.snapshot as Record<string, unknown>).extraction_method ===
+                  "string"
+                    ? {
+                        evidence_location: String(
+                          (source.snapshot as Record<string, unknown>).extraction_method,
+                        ).slice(0, 500),
+                      }
+                    : {}),
+                  evidence: String(claim.evidence ?? source.evidence ?? "").slice(0, 2_000),
+                  evidence_hash: claim.evidence ? contentHash(String(claim.evidence)) : null,
+                },
+              ]
+            : [],
+        });
+      });
   }
 
   async getRejectedFindings(
