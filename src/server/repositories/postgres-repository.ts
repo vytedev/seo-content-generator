@@ -4214,6 +4214,12 @@ export class PostgresMilestoneRepository
         "The command payload hash does not match its canonical input.",
       );
     return this.transaction(async (client) => {
+      // Serialise the complete check/mutate/terminal-outbox transaction by client key.
+      // A concurrent identical request waits and then observes the committed terminal result;
+      // a different payload waits and conflicts before any domain mutation.
+      await client.query("select pg_advisory_xact_lock(hashtextextended($1, 0))", [
+        command.idempotency_key,
+      ]);
       const existing = await client.query<{
         command_id: string;
         run_id: string | null;

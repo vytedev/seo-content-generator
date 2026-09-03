@@ -188,7 +188,8 @@ export function createLocalServices(config: LocalServicesConfig): {
       throw new Error("Production requires configured live internal-link discovery.");
     if (!factVerifierConfig)
       throw new Error("Production requires configured public storefront verification.");
-    if (!serpProbeConfig) throw new Error("Production requires configured SERP probing.");
+    // SERP composition is auxiliary and warning-only. Absence disables only that probe;
+    // serpProbeConfigFromEnv still rejects malformed configuration when explicitly enabled.
     if (allowUnverifiedLinkBypass)
       throw new Error("Production forbids the unverified-link bypass.");
     if (config.fixture) throw new Error("Production forbids deterministic test fixtures.");
@@ -324,7 +325,6 @@ export function createLocalServices(config: LocalServicesConfig): {
       googleClient &&
       linkDiscoveryConfig &&
       factVerifierConfig &&
-      serpProbeConfig &&
       !allowUnverifiedLinkBypass &&
       !config.fixture &&
       config.authMode !== "disabled-test",

@@ -17,7 +17,10 @@ const configSchema = z
 export type SerpProbeConfig = z.infer<typeof configSchema>;
 
 export function serpProbeConfigFromEnv(env: NodeJS.ProcessEnv): SerpProbeConfig | null {
-  if (env.SERP_PROBE_ENABLED !== "true") return null;
+  const enabled = env.SERP_PROBE_ENABLED?.trim().toLowerCase();
+  if (enabled === undefined || enabled === "" || enabled === "false") return null;
+  if (enabled !== "true")
+    throw new Error("SERP_PROBE_ENABLED must be exactly 'true' or 'false' when set.");
   return configSchema.parse({
     enabled: env.SERP_PROBE_ENABLED,
     endpoint: env.SERP_PROBE_ENDPOINT,

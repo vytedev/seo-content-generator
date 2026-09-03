@@ -75,6 +75,8 @@ services:
       INTERNAL_LINK_MAX_RESPONSE_BYTES: ${INTERNAL_LINK_MAX_RESPONSE_BYTES:-5242880}
       INTERNAL_LINK_MAX_SITEMAP_URLS: ${INTERNAL_LINK_MAX_SITEMAP_URLS:-5000}
       FACT_VERIFIER_ALLOWED_ORIGINS: ${FACT_VERIFIER_ALLOWED_ORIGINS:?FACT_VERIFIER_ALLOWED_ORIGINS is required}
+      # Optional warning-only auxiliary probe; false requires no provider credentials.
+      # Explicit true fails startup unless its endpoint/token configuration is valid.
       SERP_PROBE_ENABLED: ${SERP_PROBE_ENABLED:-false}
       SERP_PROBE_ENDPOINT: ${SERP_PROBE_ENDPOINT:-}
       SERP_PROBE_TOKEN: ${SERP_PROBE_TOKEN:-}

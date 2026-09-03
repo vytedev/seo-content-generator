@@ -1,5 +1,9 @@
 import { describe, expect, it, vi } from "vitest";
-import { ConfiguredSerpProbe, type SerpProbeConfig } from "../src/server/providers/serp-probe.js";
+import {
+  ConfiguredSerpProbe,
+  serpProbeConfigFromEnv,
+  type SerpProbeConfig,
+} from "../src/server/providers/serp-probe.js";
 
 const handoff = {
   plane_ticket: "MM03-01",
@@ -20,6 +24,15 @@ const config: SerpProbeConfig = {
 };
 
 describe("configured SERP probe", () => {
+  it("is optional unless explicitly enabled, then fails closed on malformed config", () => {
+    expect(serpProbeConfigFromEnv({})).toBeNull();
+    expect(serpProbeConfigFromEnv({ SERP_PROBE_ENABLED: "false" })).toBeNull();
+    expect(() => serpProbeConfigFromEnv({ SERP_PROBE_ENABLED: "sometimes" })).toThrow(
+      "must be exactly 'true' or 'false'",
+    );
+    expect(() => serpProbeConfigFromEnv({ SERP_PROBE_ENABLED: "true" })).toThrow();
+  });
+
   it("rejects a streamed response exceeding the strict byte cap", async () => {
     const body = new ReadableStream<Uint8Array>({
       start(controller) {

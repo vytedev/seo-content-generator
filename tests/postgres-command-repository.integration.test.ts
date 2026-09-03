@@ -138,6 +138,109 @@ integration("PostgreSQL command repository command-kind parity", () => {
     );
   });
 
+  it("concurrently replays the same create_run without duplicate side effects", async () => {
+    const firstCommand = command(
+      "create_run",
+      "pg-concurrent-create-replay",
+      { handoff, warnings: [] },
+      "pg-concurrent-create-first",
+    );
+    const secondDraft = {
+      ...firstCommand,
+      command_id: "pg-concurrent-create-second",
+      requested_at: "2026-09-03T10:00:01Z",
+    };
+    const secondCommand = {
+      ...secondDraft,
+      payload_hash: commandPayloadHash(secondDraft as RunCommand),
+    } as RunCommand;
+    const results = await Promise.all([
+      repository.submitCommand(firstCommand),
+      repository.submitCommand(secondCommand),
+    ]);
+    expect(results.map((result) => result.replayed).sort()).toEqual([false, true]);
+    expect(results[1]!.run_id).toBe(results[0]!.run_id);
+    expect(results[1]!.result).toEqual(results[0]!.result);
+    expect(await counts(results[0]!.run_id, firstCommand.idempotency_key)).toEqual({
+      commands: 1,
+      activity: 1,
+      queue: 1,
+    });
+    expect(
+      Number(
+        (
+          await pool!.query<{ count: number }>("select count(*)::int count from runs where id=$1", [
+            results[0]!.run_id,
+          ])
+        ).rows[0]!.count,
+      ),
+    ).toBe(1);
+  });
+
+  it("keeps a concurrent conflicting create payload side-effect free", async () => {
+    const key = "pg-concurrent-create-conflict";
+    const accepted = command("create_run", key, { handoff, warnings: [] }, "pg-conflict-first");
+    const conflicting = command(
+      "create_run",
+      key,
+      { handoff: { ...handoff, word_count_target: 901 }, warnings: [] },
+      "pg-conflict-second",
+    );
+    const settled = await Promise.allSettled([
+      repository.submitCommand(accepted),
+      repository.submitCommand(conflicting),
+    ]);
+    const fulfilled = settled.find(
+      (
+        result,
+      ): result is PromiseFulfilledResult<Awaited<ReturnType<typeof repository.submitCommand>>> =>
+        result.status === "fulfilled",
+    );
+    const rejected = settled.find(
+      (result): result is PromiseRejectedResult => result.status === "rejected",
+    );
+    expect(fulfilled).toBeDefined();
+    expect(rejected?.reason).toBeInstanceOf(RepositoryConflictError);
+    expect(await counts(fulfilled!.value.run_id, key)).toEqual({
+      commands: 1,
+      activity: 1,
+      queue: 1,
+    });
+  });
+
+  it("concurrently replays a state-mutating cancel without duplicate side effects", async () => {
+    const runId = await seed("pg-concurrent-cancel-seed");
+    const firstCommand = command(
+      "cancel_run",
+      "pg-concurrent-cancel-replay",
+      { run_id: runId },
+      "pg-concurrent-cancel-first",
+    );
+    const secondDraft = {
+      ...firstCommand,
+      command_id: "pg-concurrent-cancel-second",
+      requested_at: "2026-09-03T10:00:01Z",
+    };
+    const results = await Promise.all([
+      repository.submitCommand(firstCommand),
+      repository.submitCommand({
+        ...secondDraft,
+        payload_hash: commandPayloadHash(secondDraft as RunCommand),
+      } as RunCommand),
+    ]);
+    expect(results.map((result) => result.replayed).sort()).toEqual([false, true]);
+    expect(results[1]!.result).toEqual(results[0]!.result);
+    expect(await counts(runId, firstCommand.idempotency_key)).toEqual({
+      commands: 1,
+      activity: 1,
+      queue: 0,
+    });
+    const state = await pool!.query<{ status: string }>("select status from runs where id=$1", [
+      runId,
+    ]);
+    expect(state.rows[0]?.status).toBe("cancelled");
+  });
+
   it("stores step lifecycle history at transition time", async () => {
     const runId = await seed("pg-step-activity-seed");
     const lease = await repository.claimStep(runId, "internal_link_discovery", "worker");
