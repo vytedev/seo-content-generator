@@ -11,6 +11,7 @@ const runtimeConfig = z
     ALLOW_NON_LOCAL_DATABASE: z.enum(["true", "false"]).default("false"),
     RUNTIME_MODE: z.enum(["local", "test", "production"]).default("local"),
     MIGRATION_POLICY: z.enum(["verify-only", "on-startup"]).default("verify-only"),
+    PROCESS_ROLE: z.enum(["combined", "api"]).default("combined"),
   })
   .parse(process.env);
 
@@ -28,10 +29,12 @@ const { app, ready, close } = createLocalApp(
         allowNonLocalDatabase: runtimeConfig.ALLOW_NON_LOCAL_DATABASE === "true",
         runtimeMode: runtimeConfig.RUNTIME_MODE,
         migrationPolicy: runtimeConfig.MIGRATION_POLICY,
+        processRole: runtimeConfig.PROCESS_ROLE,
       }
     : {
         runtimeMode: runtimeConfig.RUNTIME_MODE,
         migrationPolicy: runtimeConfig.MIGRATION_POLICY,
+        processRole: runtimeConfig.PROCESS_ROLE,
       },
 );
 
@@ -43,6 +46,7 @@ const server = app.listen(port, runtimeConfig.HOST, () => {
     pipeline_configured: Boolean(databaseUrl),
     database_configured: Boolean(databaseUrl),
     runtime_mode: runtimeConfig.RUNTIME_MODE,
+    process_role: runtimeConfig.PROCESS_ROLE,
   });
 });
 

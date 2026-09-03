@@ -64,14 +64,56 @@ describe("local server composition", () => {
       createLocalServices({
         databaseUrl: "postgresql://localhost:5432/mm0301",
         runtimeMode: "production",
+        processRole: "worker",
       }),
-    ).toThrow("Operator authentication configuration is required");
+    ).toThrow("Production forbids a loopback PostgreSQL database.");
     expect(() =>
       createLocalServices({
         databaseUrl: "postgresql://user@postgres/database",
         runtimeMode: "production",
+        processRole: "worker",
+      }),
+    ).toThrow("Production requires explicit non-local database approval.");
+    expect(() =>
+      createLocalServices({
+        databaseUrl: "postgresql://user@postgres/database",
+        runtimeMode: "production",
+        processRole: "api",
+        allowNonLocalDatabase: true,
       }),
     ).toThrow("Operator authentication configuration is required");
+  });
+
+  it("ignores shared operator auth variables in worker composition", async () => {
+    const prior = {
+      email: process.env.OPERATOR_EMAIL,
+      hash: process.env.OPERATOR_PASSWORD_HASH,
+      secret: process.env.SESSION_SECRET,
+      ttl: process.env.SESSION_TTL_HOURS,
+    };
+    process.env.OPERATOR_EMAIL = "invalid-shared-value";
+    process.env.OPERATOR_PASSWORD_HASH = "invalid-shared-value";
+    process.env.SESSION_SECRET = "invalid";
+    process.env.SESSION_TTL_HOURS = "invalid";
+    try {
+      const services = createLocalServices({
+        databaseUrl: "postgresql://127.0.0.1:1/unreachable",
+        runtimeMode: "test",
+        processRole: "worker",
+      });
+      await expect(services.ready).rejects.toBeDefined();
+      await services.close();
+    } finally {
+      for (const [name, value] of Object.entries({
+        OPERATOR_EMAIL: prior.email,
+        OPERATOR_PASSWORD_HASH: prior.hash,
+        SESSION_SECRET: prior.secret,
+        SESSION_TTL_HOURS: prior.ttl,
+      })) {
+        if (value === undefined) delete process.env[name];
+        else process.env[name] = value;
+      }
+    }
   });
 
   it("allows an explicitly configured non-loopback local/test database", async () => {

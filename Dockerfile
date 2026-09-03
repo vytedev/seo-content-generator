@@ -47,6 +47,7 @@ COPY --chown=node:node package*.json ./
 RUN npm ci --omit=dev && npm cache clean --force
 
 COPY --chown=node:node --from=build /app/dist ./dist
+COPY --chown=node:node --from=build /app/drizzle ./drizzle
 
 EXPOSE 3000
 

@@ -1,0 +1,76 @@
+# Repository-level two-process topology test with fake providers.
+# Host networking avoids creating an extra bridge network; the disposable
+# in-compose PostgreSQL listens on 127.0.0.1:55432. Uses the test runtime
+# mode's deterministic mocks — no production credentials or live calls.
+services:
+  postgres-test:
+    image: postgres:16-alpine
+    network_mode: host
+    command: ["postgres", "-p", "55432"]
+    environment:
+      POSTGRES_PASSWORD: postgres
+      POSTGRES_DB: topology_test
+    restart: "no"
+
+  migrate-test:
+    build:
+      context: ../..
+      dockerfile: Dockerfile
+      target: production
+    network_mode: host
+    command: ["npm", "run", "db:migrate"]
+    environment:
+      DATABASE_URL: postgresql://postgres:postgres@127.0.0.1:55432/topology_test
+      RUNTIME_MODE: test
+    depends_on:
+      postgres-test:
+        condition: service_started
+    restart: "no"
+
+  api-test:
+    build:
+      context: ../..
+      dockerfile: Dockerfile
+      target: production
+    network_mode: host
+    environment:
+      HOST: 127.0.0.1
+      PORT: 53110
+      PROCESS_ROLE: api
+      RUNTIME_MODE: local
+      DATABASE_URL: postgresql://postgres:postgres@127.0.0.1:55432/topology_test
+      OPERATOR_EMAIL: operator@example.test
+      OPERATOR_PASSWORD_HASH: scrypt$$16384$$8$$1$$FDRKkFRPZZ318wdZBy_Nlw$$VH5p1Jpl9t7wGULq0Eim6Ky9ZsoFsQgPaK19HumTD4Q
+      SESSION_SECRET: topology-test-session-secret-at-least-32-chars
+      SESSION_TTL_HOURS: "12"
+    depends_on:
+      migrate-test:
+        condition: service_completed_successfully
+    healthcheck:
+      test: ["CMD-SHELL", "curl --fail --silent http://127.0.0.1:53110/api/ready || exit 1"]
+      interval: 5s
+      timeout: 5s
+      retries: 12
+      start_period: 5s
+    restart: "no"
+
+  worker-test:
+    build:
+      context: ../..
+      dockerfile: Dockerfile
+      target: production
+    network_mode: host
+    command: ["npm", "run", "start:worker"]
+    environment:
+      RUNTIME_MODE: test
+      DATABASE_URL: postgresql://postgres:postgres@127.0.0.1:55432/topology_test
+    depends_on:
+      migrate-test:
+        condition: service_completed_successfully
+    healthcheck:
+      test: ["CMD", "npm", "run", "healthcheck:worker"]
+      interval: 5s
+      timeout: 5s
+      retries: 6
+      start_period: 3s
+    restart: unless-stopped

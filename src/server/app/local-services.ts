@@ -85,14 +85,22 @@ export interface LocalServicesConfig {
   runtimeMode?: "local" | "test" | "production";
   /** Runtime never mutates schema; migrations must complete before startup. */
   migrationPolicy?: "verify-only" | "on-startup";
+  /** Production entrypoint role; development defaults to the historical combined process. */
+  processRole?: "combined" | "api" | "worker";
+  /** Standalone workers use this to turn a fatal queue-loop error into process failure. */
+  onWorkerFailure?: (error: unknown) => void;
 }
 
 export function createLocalServices(config: LocalServicesConfig): {
   appOptions: CreateAppOptions;
   ready: Promise<void>;
+  workerHealth: () => { status: "running" | "stopped" | "failed" };
   close(deadlineMs?: number): Promise<ShutdownResult>;
 } {
   const runtimeMode = RuntimeModeSchema.parse(config.runtimeMode ?? "local");
+  const processRole = config.processRole ?? "combined";
+  if (runtimeMode === "production" && processRole === "combined")
+    throw new Error("Production requires separate API and worker process roles.");
   const testDoublesAllowed = permitsTestDoubles(runtimeMode);
   const migrationPolicy = config.migrationPolicy ?? "verify-only";
   if (migrationPolicy !== "verify-only")
@@ -100,7 +108,9 @@ export function createLocalServices(config: LocalServicesConfig): {
   // Validate any attempted Google configuration even when the database is unavailable;
   // only a wholly absent configuration is allowed to select credential-free behaviour.
   const googleConfig = googleOAuthConfigFromEnv(process.env);
-  const authConfig = authConfigFromEnv(process.env);
+  // A worker may receive the shared deployment environment, but must never parse, validate,
+  // retain or use API-only operator credentials.
+  const authConfig = processRole === "worker" ? undefined : authConfigFromEnv(process.env);
   const factVerifierConfig = factVerifierConfigFromEnv(process.env);
   const linkDiscoveryConfig = linkDiscoveryConfigFromEnv(process.env);
   const serpProbeConfig = serpProbeConfigFromEnv(process.env);
@@ -134,10 +144,11 @@ export function createLocalServices(config: LocalServicesConfig): {
         }),
       },
       ready: Promise.resolve(),
+      workerHealth: () => ({ status: "stopped" }),
       close: async () => "closed",
     };
   }
-  if (config.authMode !== "disabled-test" && !authConfig) {
+  if (processRole !== "worker" && config.authMode !== "disabled-test" && !authConfig) {
     throw new Error(
       "Operator authentication configuration is required when DATABASE_URL is configured",
     );
@@ -181,7 +192,7 @@ export function createLocalServices(config: LocalServicesConfig): {
     if (allowUnverifiedLinkBypass)
       throw new Error("Production forbids the unverified-link bypass.");
     if (config.fixture) throw new Error("Production forbids deterministic test fixtures.");
-    if (config.authMode === "disabled-test")
+    if (config.authMode === "disabled-test" && processRole !== "worker")
       throw new Error("Production forbids the authentication test bypass.");
   }
   const googleDocsAdapter = googleClient
@@ -297,6 +308,7 @@ export function createLocalServices(config: LocalServicesConfig): {
         worker_status: "failed",
         ...classifyError(error),
       });
+      config.onWorkerFailure?.(error);
     },
     new SerpProbeWorker(
       repository,
@@ -346,8 +358,10 @@ export function createLocalServices(config: LocalServicesConfig): {
     }
     if (!(await verifyDatabaseAndMigrations()))
       throw new Error("Database migrations are not current; apply migrations before startup.");
-    await queueWorker.start();
-    reconciliationComplete = true;
+    if (processRole !== "api") {
+      await queueWorker.start();
+      reconciliationComplete = true;
+    }
   })().catch((error) => {
     startupFailure = error;
     throw error;
@@ -358,7 +372,7 @@ export function createLocalServices(config: LocalServicesConfig): {
   return {
     appOptions: {
       auth:
-        config.authMode === "disabled-test"
+        config.authMode === "disabled-test" || processRole === "worker"
           ? { mode: "disabled" }
           : {
               mode: "enabled",
@@ -370,7 +384,7 @@ export function createLocalServices(config: LocalServicesConfig): {
       findingsRepository: repository,
       queue: repository,
       commands: repository,
-      workerHealth: () => queueWorker.health(),
+      workerHealth: () => (processRole === "api" ? { status: "stopped" } : queueWorker.health()),
       runtimeMode,
       readiness: async () => {
         let database = false;
@@ -383,11 +397,12 @@ export function createLocalServices(config: LocalServicesConfig): {
           database = false;
           migrations = false;
         }
-        const worker = queueWorker.health().status === "running";
+        const ownsWorker = processRole !== "api";
+        const worker = ownsWorker ? queueWorker.health().status === "running" : true;
         const checks = {
           database,
           migrations,
-          reconciliation: reconciliationComplete,
+          reconciliation: ownsWorker ? reconciliationComplete : true,
           worker,
           configuration: requiredProductionConfig,
         };
@@ -416,12 +431,15 @@ export function createLocalServices(config: LocalServicesConfig): {
       calibration: { repository: calibrationRepository, service: calibrationService },
     },
     ready,
+    workerHealth: () => queueWorker.health(),
     close: async (deadlineMs = 10_000) => {
       if (!Number.isSafeInteger(deadlineMs) || deadlineMs < 0)
         throw new Error("Service shutdown deadline must be a non-negative integer");
       const expiresAt = Date.now() + deadlineMs;
-      const worker = await queueWorker.stop(Math.max(0, expiresAt - Date.now()));
-      if (worker === "deadline_exceeded" || Date.now() >= expiresAt) return "deadline_exceeded";
+      if (processRole !== "api") {
+        const worker = await queueWorker.stop(Math.max(0, expiresAt - Date.now()));
+        if (worker === "deadline_exceeded" || Date.now() >= expiresAt) return "deadline_exceeded";
+      }
       // pg does not provide a safe cancellation primitive for checked-out client work. Bound
       // end(); if it misses the deadline its sockets/timers are unref'd so the process can exit
       // while the durable queue lease expires naturally.

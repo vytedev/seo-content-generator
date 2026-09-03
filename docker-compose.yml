@@ -1,8 +1,19 @@
-# Keep Compose from implicitly parsing `.env`; the service loads it in raw mode
-# so values containing `$` (such as password hashes) are passed unchanged.
-# Run with: COMPOSE_DISABLE_ENV_FILE=1 docker compose up -d
-
+# Production topology: migrations gate independent API and worker processes.
+# Keep Compose from interpolating secret values: COMPOSE_DISABLE_ENV_FILE=1 docker compose up -d
 services:
+  migrate:
+    build:
+      context: .
+      dockerfile: Dockerfile
+      target: production
+    command: ["npm", "run", "db:migrate"]
+    environment:
+      DATABASE_URL: ${DATABASE_URL:?DATABASE_URL is required}
+      RUNTIME_MODE: production
+    restart: "no"
+    networks:
+      - app_network
+
   app:
     build:
       context: .
@@ -12,14 +23,64 @@ services:
       - path: .env
         format: raw
     restart: unless-stopped
+    depends_on:
+      migrate:
+        condition: service_completed_successfully
     environment:
       HOST: 0.0.0.0
       PORT: 3000
+      PROCESS_ROLE: api
       ALLOW_NON_LOCAL_DATABASE: "true"
       RUNTIME_MODE: production
+      MIGRATION_POLICY: verify-only
       GOOGLE_OAUTH_REDIRECT_URI: https://content-generator.vyte.dev/api/integrations/google/callback
     healthcheck:
       test: ["CMD-SHELL", "curl --fail --silent http://127.0.0.1:3000/api/ready || exit 1"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 15s
+    networks:
+      - app_network
+      - gateway
+
+  worker:
+    build:
+      context: .
+      dockerfile: Dockerfile
+      target: production
+    command: ["npm", "run", "start:worker"]
+    # Worker receives only its required runtime/integration variables from the
+    # deployment environment. Operator session/OAuth credentials stay on app.
+    restart: unless-stopped
+    depends_on:
+      migrate:
+        condition: service_completed_successfully
+    environment:
+      DATABASE_URL: ${DATABASE_URL:?DATABASE_URL is required}
+      ALLOW_NON_LOCAL_DATABASE: "true"
+      RUNTIME_MODE: production
+      MIGRATION_POLICY: verify-only
+      OPENROUTER_API_KEY: ${OPENROUTER_API_KEY:-}
+      OPENROUTER_MODEL: ${OPENROUTER_MODEL:-}
+      HF_TOKEN: ${HF_TOKEN:-}
+      HF_MODEL: ${HF_MODEL:-}
+      GOOGLE_OAUTH_CLIENT_ID: ${GOOGLE_OAUTH_CLIENT_ID:?GOOGLE_OAUTH_CLIENT_ID is required}
+      GOOGLE_OAUTH_CLIENT_SECRET: ${GOOGLE_OAUTH_CLIENT_SECRET:?GOOGLE_OAUTH_CLIENT_SECRET is required}
+      GOOGLE_OAUTH_REDIRECT_URI: https://content-generator.vyte.dev/api/integrations/google/callback
+      GOOGLE_TOKEN_ENCRYPTION_KEY: ${GOOGLE_TOKEN_ENCRYPTION_KEY:?GOOGLE_TOKEN_ENCRYPTION_KEY is required}
+      INTERNAL_LINK_SITEMAP_URL: ${INTERNAL_LINK_SITEMAP_URL:?INTERNAL_LINK_SITEMAP_URL is required}
+      INTERNAL_LINK_SITE_ORIGIN: ${INTERNAL_LINK_SITE_ORIGIN:?INTERNAL_LINK_SITE_ORIGIN is required}
+      INTERNAL_LINK_ALLOWED_ORIGINS: ${INTERNAL_LINK_ALLOWED_ORIGINS:?INTERNAL_LINK_ALLOWED_ORIGINS is required}
+      INTERNAL_LINK_MAX_RESPONSE_BYTES: ${INTERNAL_LINK_MAX_RESPONSE_BYTES:-5242880}
+      INTERNAL_LINK_MAX_SITEMAP_URLS: ${INTERNAL_LINK_MAX_SITEMAP_URLS:-5000}
+      FACT_VERIFIER_ALLOWED_ORIGINS: ${FACT_VERIFIER_ALLOWED_ORIGINS:?FACT_VERIFIER_ALLOWED_ORIGINS is required}
+      SERP_PROBE_ENABLED: ${SERP_PROBE_ENABLED:-false}
+      SERP_PROBE_ENDPOINT: ${SERP_PROBE_ENDPOINT:-}
+      SERP_PROBE_TOKEN: ${SERP_PROBE_TOKEN:-}
+      SERP_PROBE_PROVIDER: ${SERP_PROBE_PROVIDER:-}
+    healthcheck:
+      test: ["CMD", "npm", "run", "healthcheck:worker"]
       interval: 30s
       timeout: 10s
       retries: 3
@@ -30,3 +91,6 @@ services:
 networks:
   app_network:
     driver: bridge
+  gateway:
+    external: true
+    name: caddy
