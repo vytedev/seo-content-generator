@@ -5,6 +5,7 @@ import type {
   Finding,
   InternalLinkHierarchy,
 } from "../../../shared/checker/index.js";
+import { INTERNAL_LINK_HIERARCHY_RANK } from "../../../shared/internal-link-hierarchy.js";
 import { EmptyState } from "../../components/EmptyState.js";
 import { PageHeader } from "../../components/PageHeader.js";
 import { Button } from "../../components/ui/button.js";
@@ -45,14 +46,6 @@ type ValidationErrors = Partial<Record<ValidationKey, string>>;
 let nextRowId = 0;
 const createRowId = (kind: string) => `${kind}-${++nextRowId}`;
 
-const hierarchyRanks: Record<InternalLinkHierarchy, number> = {
-  collection: 1,
-  designer_hub: 2,
-  sub_collection: 3,
-  product: 4,
-  broad_category: 5,
-  homepage: 6,
-};
 const hierarchyOptions: Array<{ value: InternalLinkHierarchy; label: string }> = [
   { value: "collection", label: "Collection" },
   { value: "designer_hub", label: "Designer hub" },
@@ -185,7 +178,7 @@ export function DraftChecker() {
         url: link.url.trim(),
         status: Number(link.status),
         hierarchy: link.hierarchy,
-        hierarchy_rank: hierarchyRanks[link.hierarchy],
+        hierarchy_rank: INTERNAL_LINK_HIERARCHY_RANK[link.hierarchy],
       })),
     };
 

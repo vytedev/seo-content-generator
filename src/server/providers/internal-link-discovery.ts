@@ -4,10 +4,11 @@ import { isIP } from "node:net";
 import { nodeHttpsPinnedFetcher, type PinnedFetcher } from "./public-page-retriever.js";
 import type { Pool } from "pg";
 import { z } from "zod";
+import { InternalLinkHierarchySchema } from "../../shared/checker/contracts.js";
 import {
   INTERNAL_LINK_HIERARCHY_RANK,
-  InternalLinkHierarchySchema,
-} from "../../shared/checker/contracts.js";
+  classifyInternalLinkHierarchy,
+} from "../../shared/internal-link-hierarchy.js";
 import {
   InternalLinkSchema,
   LiveInternalLinkSchema,
@@ -17,7 +18,6 @@ import {
   type LinkDiscoveryMetadata,
 } from "../../shared/milestone-two.js";
 import { canonicaliseInternalUrl } from "../../shared/internal-link-url.js";
-import { isCanonicalProductRoute } from "../../shared/product-route.js";
 import type {
   DraftLinkVerifier,
   LinkVerificationOutcome,
@@ -877,7 +877,7 @@ export class SafeUrlVerifier {
         outcome: "direct_200",
         method,
         verified_at: this.now().toISOString(),
-        hierarchy: classifyHierarchy(url),
+        hierarchy: classifyInternalLinkHierarchy(url) ?? "broad_category",
       };
     } catch (error) {
       const timeout =
@@ -902,16 +902,6 @@ function canonicalUrl(value: string, origin: string, allowedOrigins: readonly st
   if (!allowedOrigins.includes(url.origin))
     throw new Error("Candidate URL is outside the configured internal origin.");
   return url;
-}
-function classifyHierarchy(url: URL): z.infer<typeof InternalLinkHierarchySchema> {
-  const path = url.pathname.toLowerCase();
-  if (path === "/") return "homepage";
-  if (/\/designers?\//.test(path)) return "designer_hub";
-  if (isCanonicalProductRoute(url)) return "product";
-  const segments = path.split("/").filter(Boolean);
-  if (segments.includes("collections"))
-    return segments.length > 2 ? "sub_collection" : "collection";
-  return "broad_category";
 }
 function isCommercialHierarchy(value: z.infer<typeof InternalLinkHierarchySchema>): boolean {
   return value !== "homepage" && value !== "broad_category";
@@ -1273,7 +1263,8 @@ export async function mergeAndVerifyDetailed(
   for (const item of search) {
     try {
       const url = canonicalUrl(item.url, config.siteOrigin, config.allowedOrigins);
-      const hierarchy = classifyHierarchy(url);
+      const hierarchy = classifyInternalLinkHierarchy(url);
+      if (!hierarchy) continue;
       if (!isCommercialHierarchy(hierarchy)) continue;
       const canonical = url.toString();
       const existing = merged.get(canonical);
@@ -1292,7 +1283,8 @@ export async function mergeAndVerifyDetailed(
   let editorial = 0;
   const commercialCandidates = [...merged.values()].filter((candidate) => {
     try {
-      if (isCommercialHierarchy(classifyHierarchy(new URL(candidate.url)))) return true;
+      const hierarchy = classifyInternalLinkHierarchy(new URL(candidate.url));
+      if (hierarchy && isCommercialHierarchy(hierarchy)) return true;
     } catch {
       // Canonicalisation already ran; retain defensive exclusion.
     }
@@ -1314,8 +1306,8 @@ export async function mergeAndVerifyDetailed(
     })
     .sort((a, b) => {
       const hierarchyDifference =
-        INTERNAL_LINK_HIERARCHY_RANK[classifyHierarchy(new URL(a.url))] -
-        INTERNAL_LINK_HIERARCHY_RANK[classifyHierarchy(new URL(b.url))];
+        INTERNAL_LINK_HIERARCHY_RANK[classifyInternalLinkHierarchy(new URL(a.url))!] -
+        INTERNAL_LINK_HIERARCHY_RANK[classifyInternalLinkHierarchy(new URL(b.url))!];
       return hierarchyDifference || b.preScore - a.preScore || a.url.localeCompare(b.url, "en-GB");
     });
   // Reserve bounded verification capacity across hierarchy types before filling
@@ -1327,10 +1319,10 @@ export async function mergeAndVerifyDetailed(
   for (const hierarchy of InternalLinkHierarchySchema.options) {
     for (const candidate of scoredCandidates) {
       if (preselected.length >= MAX_PRESELECT) break;
-      if (classifyHierarchy(new URL(candidate.url)) !== hierarchy) continue;
+      if (classifyInternalLinkHierarchy(new URL(candidate.url)) !== hierarchy) continue;
       if (
         [...preselected].filter(
-          (selected) => classifyHierarchy(new URL(selected.url)) === hierarchy,
+          (selected) => classifyInternalLinkHierarchy(new URL(selected.url)) === hierarchy,
         ).length >= MIN_PRESELECT_PER_HIERARCHY
       )
         break;

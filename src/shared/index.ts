@@ -7,6 +7,7 @@ export * from "./command-repository.js";
 export * from "./export.js";
 export * from "./hard-flags.js";
 export * from "./ingest-contracts.js";
+export * from "./internal-link-hierarchy.js";
 export * from "./milestone-two.js";
 export * from "./milestone-three.js";
 export * from "./milestone-four.js";

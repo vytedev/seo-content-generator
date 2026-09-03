@@ -1,12 +1,11 @@
 import { z } from "zod";
-import {
-  INTERNAL_LINK_HIERARCHY_RANK,
-  InternalLinkHierarchySchema,
-  type InternalLinkHierarchy,
-} from "./checker/contracts.js";
+import { InternalLinkHierarchySchema } from "./checker/contracts.js";
 import { parseMarkdown } from "./checker/markdown.js";
 import { canonicaliseInternalUrl } from "./internal-link-url.js";
-import { isCanonicalProductRoute } from "./product-route.js";
+import {
+  INTERNAL_LINK_HIERARCHY_RANK,
+  classifyInternalLinkHierarchy,
+} from "./internal-link-hierarchy.js";
 import type { ReviewFinding } from "./milestone-three.js";
 import { InternalLinkSchema, type InternalLink, type StructuredDraft } from "./milestone-two.js";
 
@@ -95,17 +94,7 @@ export interface LinkAuditInput {
   internal_origins: string[];
 }
 
-export function classifyInternalLinkHierarchy(url: string): InternalLinkHierarchy {
-  const parsed = new URL(url);
-  const path = parsed.pathname.toLocaleLowerCase("en-GB");
-  if (path === "/") return "homepage";
-  if (/\/designers?\//.test(path)) return "designer_hub";
-  if (isCanonicalProductRoute(parsed)) return "product";
-  const segments = path.split("/").filter(Boolean);
-  if (segments.includes("collections"))
-    return segments.length > 2 ? "sub_collection" : "collection";
-  return "broad_category";
-}
+export { classifyInternalLinkHierarchy } from "./internal-link-hierarchy.js";
 
 function key(rule: string, subject: string): string {
   let hash = 2166136261;
@@ -237,6 +226,19 @@ export async function auditDraftLinks(
     else {
       const entry = shortlist.get(url)!;
       const classified = classifyInternalLinkHierarchy(url);
+      if (!classified) {
+        findings.push(
+          finding(
+            "link.hierarchy_classification",
+            url,
+            `Hierarchy metadata for “${url}” could not be classified safely.`,
+            "Correct the malformed target before relying on hierarchy priority.",
+            occurrence.model.location,
+            "warning",
+          ),
+        );
+        continue;
+      }
       const expectedRank = INTERNAL_LINK_HIERARCHY_RANK[classified];
       if (
         outcome.hierarchy !== classified ||
