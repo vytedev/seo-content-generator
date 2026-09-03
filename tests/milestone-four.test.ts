@@ -1316,7 +1316,7 @@ describe("milestone four", () => {
     ).rejects.toThrow("evidence is missing");
   });
 
-  it("authorises the capped exact block once and replays without a second authorisation", async () => {
+  it("refuses a capped blocker when the canonical correction plan is unable", async () => {
     const { repository, run } = await setup();
     makeUnrepairable((await repository.getDraft(run.run_id))!.draft);
     await new MilestoneFourOrchestrator(
@@ -1328,56 +1328,17 @@ describe("milestone four", () => {
     ).run(run.run_id);
     const state = (repository as any).runs.get(run.run_id);
     expect(state.deterministicRepairCycles).toBe(2);
-    const blockedMarkdown = state.draft.draft.markdown;
-    const key = `exceptional:${run.run_id}:current`;
-    await expect(
-      repository.authoriseExceptionalCorrection({
-        run_id: run.run_id,
-        idempotency_key: key,
-        explicit_confirmation: true,
-      }),
-    ).resolves.toBe("authorised");
-    expect(repository.exceptionalCorrectionAuthorisations).toHaveLength(1);
-    expect((await repository.getRevisionFindings(run.run_id, state.draft.version.id)).source).toBe(
-      "operator_authorised_repair",
+    expect((await repository.getRunDetail(run.run_id)).exceptional_correction.available).toBe(
+      false,
     );
-
-    // Simulate a disconnected first request after the authorisation commit: an HTTP replay must
-    // resume the non-terminal durable run, while operation checkpoints prevent duplicate calls.
-    const recovery = new MockRevisionProvider("revision-v1");
-    const app = createApp({
-      testOnlySynchronousPipeline: true,
-      serveClient: false,
-      milestoneFour: {
-        repository,
-        orchestrator: new MilestoneFourOrchestrator(
-          repository,
-          fixture,
-          recovery,
-          new MockCoherenceProvider("coherence-v1"),
-          repository,
-        ),
-      },
-    });
-    const replay = await request(app)
-      .post(`/api/runs/${run.run_id}/exceptional-correction/authorise`)
-      .send({ idempotency_key: key, explicit_confirmation: true });
-    expect(replay.status).toBe(200);
-    expect(replay.body.status).toBe("running");
-    expect(recovery.calls).toHaveLength(0);
-    expect((await repository.getDraft(run.run_id))!.draft.markdown).toBe(blockedMarkdown);
-    expect(repository.exports).toHaveLength(0);
-    expect(repository.exceptionalCorrectionAuthorisations).toHaveLength(1);
-
     await expect(
       repository.authoriseExceptionalCorrection({
         run_id: run.run_id,
-        idempotency_key: `${key}:other`,
+        idempotency_key: `exceptional:${run.run_id}:unable`,
         explicit_confirmation: true,
       }),
-      // A different key on an already-authorised run is an explicit conflict,
-      // matching PostgreSQL, rather than the incidental eligibility message.
-    ).rejects.toThrow(/already has an exceptional authorisation/i);
+    ).rejects.toThrow("Exceptional correction is not available for this exact document.");
+    expect(repository.exceptionalCorrectionAuthorisations).toHaveLength(0);
   });
 
   it("does not retry an exception labelled malformed after dispatch", async () => {

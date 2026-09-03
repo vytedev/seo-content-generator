@@ -8,8 +8,9 @@ import { FindingLocationSchema } from "../../shared/checker/index.js";
 import { revisionBindingExclusions } from "../../shared/revision-planning.js";
 import type { FindingLocation } from "../../shared/revision-application.js";
 import {
-  bindExceptionalBlockers,
   ExceptionalBlockerBindingSchema,
+  previewExceptionalCorrection,
+  type ExceptionalCorrectionFinding,
 } from "../../shared/exceptional-recovery.js";
 import type { Pool, PoolClient } from "pg";
 import {
@@ -3411,8 +3412,8 @@ export class PostgresMilestoneRepository
       const draft = authority ? await this.getDraft(input.run_id) : null;
       const blockerRows = authority
         ? (
-            await client.query<{ id: string; rule_reference: string; location: any }>(
-              `select id,rule_reference,location from findings
+            await client.query<ExceptionalCorrectionFinding>(
+              `select id,stable_key,category,rule_reference,severity,location,issue,evidence,suggested_fix from findings
                where run_id=$1 and document_version_id=$2 and step_execution_id=$3 and severity='blocker'
                order by created_at,stable_key`,
               [input.run_id, authority.document_version_id, authority.step_execution_id],
@@ -3433,17 +3434,21 @@ export class PostgresMilestoneRepository
             )
           ).rows.map((row) => row.location as FindingLocation)
         : [];
-      const bindings = draft
-        ? bindExceptionalBlockers(
-            draft.draft,
-            (await this.getHandoff(input.run_id)).primary_keyword,
-            blockerRows,
-            revisionBindingExclusions({
+      const links = draft ? await this.getLinksArtifact(input.run_id) : null;
+      const preview = draft
+        ? previewExceptionalCorrection({
+            draft: draft.draft,
+            handoff: await this.getHandoff(input.run_id),
+            documentVersionId: authority!.document_version_id,
+            findings: blockerRows,
+            exclusions: revisionBindingExclusions({
               document: draft.draft,
               rejectedLocations: rejectedForAuthority,
             }),
-          )
+            ...(links?.body ? { internalLinks: links.body } : {}),
+          })
         : null;
+      const bindings = preview?.bindings ?? null;
       if (!input.explicit_confirmation || !authority || !bindings)
         throw new ConflictError("Exceptional correction is not available for this exact document.");
       await client.query(
@@ -3585,6 +3590,41 @@ export class PostgresMilestoneRepository
         [runId],
       )
     ).rows[0];
+    const exceptionalBlockers = current
+      ? (
+          await this.pool.query<ExceptionalCorrectionFinding & { location: FindingLocation }>(
+            `select f.id,f.stable_key,f.category,f.rule_reference,f.severity,f.location,f.issue,f.evidence,f.suggested_fix
+               from findings f join deterministic_reruns rr on rr.step_execution_id=f.step_execution_id
+              where f.run_id=$1 and f.document_version_id=$2 and f.severity='blocker'
+              order by f.created_at,f.stable_key`,
+            [runId, current.version.id],
+          )
+        ).rows
+      : [];
+    const rejectedLocations = current
+      ? (
+          await this.pool.query<{ location: FindingLocation }>(
+            `select f.location from findings f
+               join finding_dispositions d on d.finding_id=f.id and d.run_id=f.run_id
+              where f.run_id=$1 and f.document_version_id=$2 and d.decision='rejected'`,
+            [runId, current.version.id],
+          )
+        ).rows.map((row) => row.location)
+      : [];
+    const exceptionalPreview =
+      current && exceptionalBlockers.length === blockEvidence.deterministic_blockers
+        ? previewExceptionalCorrection({
+            draft: current.draft,
+            handoff: await this.getHandoff(runId),
+            documentVersionId: current.version.id,
+            findings: exceptionalBlockers,
+            exclusions: revisionBindingExclusions({
+              document: current.draft,
+              rejectedLocations,
+            }),
+            ...(linksArtifact?.body ? { internalLinks: linksArtifact.body } : {}),
+          })
+        : null;
     const steps = PIPELINE_STEPS.flatMap((definition) => {
       const rows = executions.filter((item: any) => item.step === definition.id);
       return (
@@ -3672,18 +3712,10 @@ export class PostgresMilestoneRepository
           blockReason === "deterministic_blockers" &&
           run.deterministic_repair_cycles === 2 &&
           !exceptional &&
-          blockEvidence.deterministic_blockers > 0,
+          blockEvidence.deterministic_blockers > 0 &&
+          exceptionalPreview !== null,
         authorised: Boolean(exceptional),
-        requires_ai: current
-          ? ((
-              await this.pool.query<{ requires_ai: boolean }>(
-                `select coalesce(bool_or(f.rule_reference not in ('keyword.related.meaningful_section','links.verified_internal_presence','on_page.meta_description.length','keyword.primary.h2')),false) requires_ai
-                 from findings f join deterministic_reruns rr on rr.step_execution_id=f.step_execution_id
-                 where f.run_id=$1 and f.document_version_id=$2 and f.severity='blocker'`,
-                [runId, current.version.id],
-              )
-            ).rows[0]?.requires_ai ?? null)
-          : null,
+        requires_ai: exceptionalPreview?.requires_ai ?? null,
       },
       block_reason: blockReason,
       block_counts: blockEvidence,
@@ -4179,16 +4211,16 @@ export class PostgresMilestoneRepository
             throw new UnprocessableError("Editorial correction is not configured.");
           result = await this.editorialCorrectionHandler(runId);
           break;
-        case "authorise_exceptional_correction":
-          result = {
-            outcome: await this.authoriseExceptionalCorrection({
-              run_id: runId,
-              idempotency_key: command.idempotency_key,
-              explicit_confirmation: command.explicit_confirmation,
-            }),
-          };
-          queueAccepted = true;
+        case "authorise_exceptional_correction": {
+          const outcome = await this.authoriseExceptionalCorrection({
+            run_id: runId,
+            idempotency_key: command.idempotency_key,
+            explicit_confirmation: command.explicit_confirmation,
+          });
+          result = { outcome };
+          queueAccepted = outcome === "authorised";
           break;
+        }
         case "probe_serp": {
           const source = await client.query<{ input_hash: string }>(
             "select input_hash from runs where id=$1",

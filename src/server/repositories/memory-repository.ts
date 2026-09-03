@@ -31,7 +31,11 @@ import {
 import { PIPELINE_STEPS, type Handoff, type PipelineStepId } from "../../shared/pipeline.js";
 import { FindingLocationSchema } from "../../shared/checker/index.js";
 import { revisionBindingExclusions } from "../../shared/revision-planning.js";
-import { bindExceptionalBlockers } from "../../shared/exceptional-recovery.js";
+import {
+  bindExceptionalBlockers,
+  previewExceptionalCorrection,
+  type ExceptionalCorrectionFinding,
+} from "../../shared/exceptional-recovery.js";
 import {
   DeterministicManifestSchema,
   DeterministicRunResultSchema,
@@ -2488,13 +2492,14 @@ export class InMemoryMilestoneRepository
         finding.step_execution_id === executionId &&
         finding.step === "automated_checks_rerun" &&
         finding.severity === "blocker",
-    );
-    const bindings = run.draft
-      ? bindExceptionalBlockers(
-          run.draft.draft,
-          run.handoff.primary_keyword,
-          exactBlockers,
-          revisionBindingExclusions({
+    ) as ExceptionalCorrectionFinding[];
+    const preview = run.draft
+      ? previewExceptionalCorrection({
+          draft: run.draft.draft,
+          handoff: run.handoff,
+          documentVersionId: documentVersionId!,
+          findings: exactBlockers,
+          exclusions: revisionBindingExclusions({
             document: run.draft.draft,
             // Same exclusions execution will apply, so authorisation can never
             // record authority over rejected prose.
@@ -2508,8 +2513,10 @@ export class InMemoryMilestoneRepository
                 : [],
             ),
           }),
-        )
+          ...(run.links ? { internalLinks: run.links } : {}),
+        })
       : null;
+    const bindings = preview?.bindings ?? null;
     if (
       !input.explicit_confirmation ||
       run.status !== "blocked" ||
@@ -2583,6 +2590,32 @@ export class InMemoryMilestoneRepository
     const coherenceBlockers = currentFindings.filter(
       (item) => item.step === "final_coherence_export" && item.severity === "blocker",
     ).length;
+    const exceptionalBlockers = currentFindings.filter(
+      (item) => item.step === "automated_checks_rerun" && item.severity === "blocker",
+    ) as ExceptionalCorrectionFinding[];
+    const exceptionalExclusions = current
+      ? revisionBindingExclusions({
+          document: current.draft,
+          rejectedLocations: currentFindings.flatMap((finding) =>
+            this.dispositions.some(
+              (item) => item.finding_id === finding.id && item.decision === "rejected",
+            )
+              ? [finding.location]
+              : [],
+          ),
+        })
+      : null;
+    const exceptionalPreview =
+      current && exceptionalBlockers.length === deterministicBlockers && exceptionalExclusions
+        ? previewExceptionalCorrection({
+            draft: current.draft,
+            handoff: run.handoff,
+            documentVersionId: current.version.id,
+            findings: exceptionalBlockers,
+            exclusions: exceptionalExclusions,
+            ...(run.links ? { internalLinks: run.links } : {}),
+          })
+        : null;
     const draftOperationStatus = [...this.outputKeys.entries()].find(
       ([key, value]) => key.startsWith("draft-state:") && value.includes(`\"run_id\":\"${runId}\"`),
     );
@@ -2699,16 +2732,10 @@ export class InMemoryMilestoneRepository
           run.blockReason === "deterministic_blockers" &&
           run.deterministicRepairCycles === 2 &&
           !run.exceptionalCorrectionAuthorised &&
-          deterministicBlockers > 0,
+          deterministicBlockers > 0 &&
+          exceptionalPreview !== null,
         authorised: run.exceptionalCorrectionAuthorised,
-        requires_ai: currentFindings.some(
-          (item) =>
-            item.step === "automated_checks_rerun" &&
-            item.severity === "blocker" &&
-            !["keyword.related.meaningful_section", "links.verified_internal_presence"].includes(
-              item.rule_reference,
-            ),
-        ),
+        requires_ai: exceptionalPreview?.requires_ai ?? null,
       },
       block_reason: run.blockReason ?? "unknown",
       block_counts: {
@@ -2918,17 +2945,19 @@ export class InMemoryMilestoneRepository
             throw new UnprocessableError("Editorial correction is not configured.");
           result = await this.editorialCorrectionHandler(runId);
           break;
-        case "authorise_exceptional_correction":
-          result = {
-            outcome: await this.authoriseExceptionalCorrection({
-              run_id: runId,
-              idempotency_key: command.idempotency_key,
-              explicit_confirmation: true,
-            }),
-          };
-          await this.enqueueRun(runId);
-          queueAccepted = true;
+        case "authorise_exceptional_correction": {
+          const outcome = await this.authoriseExceptionalCorrection({
+            run_id: runId,
+            idempotency_key: command.idempotency_key,
+            explicit_confirmation: true,
+          });
+          result = { outcome };
+          if (outcome === "authorised") {
+            await this.enqueueRun(runId);
+            queueAccepted = true;
+          }
           break;
+        }
         case "probe_serp":
           if (this.requireRun(runId).ingest.input_hash !== command.handoff_hash)
             throw new ConflictError("SERP handoff hash mismatch.");

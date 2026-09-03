@@ -1,7 +1,10 @@
 import { describe, expect, it } from "vitest";
 import { applyRevisionEnvelope } from "../src/shared/revision-application.js";
 import type { RevisionRequest } from "../src/shared/milestone-four.js";
-import { bindExceptionalBlockers } from "../src/shared/exceptional-recovery.js";
+import {
+  bindExceptionalBlockers,
+  previewExceptionalCorrection,
+} from "../src/shared/exceptional-recovery.js";
 import type {
   AuthorisedReadabilityAuthority as AuthorisedReadabilityAuthorityInput,
   RevisionBindingExclusions,
@@ -969,6 +972,31 @@ describe("frozen exceptional readability authority", () => {
         selectReadabilityBlocks({ findingId: "readability", markdown: AUTH_DOC }),
       ),
     ).toBe(bindings![0]!.target_set_identity);
+  });
+
+  it("hides exceptional correction when a bound blocker has no executable plan", () => {
+    const base = request(AUTH_DOC);
+    const draft = { ...base.current_document, markdown: AUTH_DOC };
+    expect(
+      previewExceptionalCorrection({
+        draft,
+        handoff: base.handoff,
+        documentVersionId: base.document_version_id,
+        findings: [
+          {
+            id: "faq-count",
+            stable_key: "faq-count",
+            category: "structure",
+            rule_reference: "structure.faq_count",
+            severity: "blocker",
+            location: { field: "on_page.faqs" },
+            issue: "FAQ count is outside the allowed range.",
+            suggested_fix: "Adjust the FAQ count.",
+          },
+        ],
+        exclusions: { lines: [], sections: new Set() },
+      }),
+    ).toBeNull();
   });
 
   it("uses exactly the persisted blocks and no others", () => {

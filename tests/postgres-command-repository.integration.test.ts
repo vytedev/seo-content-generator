@@ -216,6 +216,25 @@ integration("PostgreSQL command repository command-kind parity", () => {
     30_000,
   );
 
+  it("does not enqueue or report acceptance for a domain-level exceptional replay", async () => {
+    const runId = await seed("pg-exceptional-domain-replay-seed");
+    vi.spyOn(repository, "authoriseExceptionalCorrection").mockResolvedValueOnce("replay");
+    const submitted = await repository.submitCommand(
+      command(
+        "authorise_exceptional_correction",
+        "pg-exceptional-domain-replay",
+        { run_id: runId, explicit_confirmation: true },
+        "command-authorise-exceptional-domain-replay",
+      ),
+    );
+    expect(submitted).toMatchObject({
+      queue_accepted: false,
+      result: { outcome: "replay" },
+    });
+    expect((await counts(runId, "pg-exceptional-domain-replay")).queue).toBe(0);
+    vi.restoreAllMocks();
+  });
+
   it.each(commandKinds)("rolls back %s when domain mutation fails", async (kind) => {
     const invalid =
       kind === "create_run"

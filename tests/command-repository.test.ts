@@ -146,6 +146,29 @@ describe("memory command repository command-kind parity", () => {
     expect(repository.commandActivity).toHaveLength(1);
   });
 
+  it("does not enqueue or report acceptance for a domain-level exceptional replay", async () => {
+    const repository = new InMemoryMilestoneRepository();
+    const run = await repository.createIngest(
+      "exceptional-replay-seed",
+      "a".repeat(64),
+      handoff,
+      [],
+    );
+    repository.queueJobs.splice(0);
+    vi.spyOn(repository, "authoriseExceptionalCorrection").mockResolvedValue("replay");
+    const submitted = await repository.submitCommand(
+      command("authorise_exceptional_correction", "exceptional-domain-replay", {
+        run_id: run.run_id,
+        explicit_confirmation: true,
+      }),
+    );
+    expect(submitted).toMatchObject({
+      queue_accepted: false,
+      result: { outcome: "replay" },
+    });
+    expect(repository.queueJobs).toHaveLength(0);
+  });
+
   it.each(cases)("rolls back %s when its domain mutation fails", async (kind) => {
     const repository = new InMemoryMilestoneRepository();
     const before = {

@@ -42,7 +42,10 @@ describe("S5 command-only pipeline routes", () => {
     const repository = new InMemoryMilestoneRepository();
     const run = await repository.createIngest("s5-seed", "a".repeat(64), handoff as never, []);
     repository.queueJobs.splice(0);
-    vi.spyOn(repository, "authoriseExceptionalCorrection").mockResolvedValue("authorised");
+    const authorise = vi
+      .spyOn(repository, "authoriseExceptionalCorrection")
+      .mockResolvedValueOnce("authorised")
+      .mockResolvedValue("replay");
     const orchestrator = { run: vi.fn() };
     const app = createApp({
       serveClient: false,
@@ -56,11 +59,17 @@ describe("S5 command-only pipeline routes", () => {
       .expect(202);
     const replay = await request(app)
       .post(`/api/runs/${run.run_id}/exceptional-correction/authorise`)
-      .send(body)
+      .send({ ...body, idempotency_key: "s5-exceptional-replay-domain-key" })
       .expect(202);
-    expect(replay.body).toEqual({ ...first.body, replayed: true });
-    expect(repository.commands).toHaveLength(1);
+    expect(first.body).toMatchObject({ queue_accepted: true, result: { outcome: "authorised" } });
+    expect(replay.body).toMatchObject({
+      replayed: false,
+      queue_accepted: false,
+      result: { outcome: "replay" },
+    });
+    expect(repository.commands).toHaveLength(2);
     expect(repository.queueJobs).toHaveLength(1);
+    expect(authorise).toHaveBeenCalledTimes(2);
     expect(orchestrator.run).not.toHaveBeenCalled();
   });
 });
