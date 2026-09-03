@@ -747,7 +747,7 @@ describe("renderExport completeness (step 1.12 artefact)", () => {
     expect(rendered.markdown).toContain("- Primary keyword: wishbone chair");
     expect(rendered.markdown).toContain("- Locales for translation: sv-SE");
     expect(rendered.markdown).toContain(
-      "| claim-1 | The chair was designed in 1949. | provenance | unverified | yes |",
+      '| claim-1 | The chair was designed in 1949. | provenance | unverified | unknown_legacy | {"field":"body_markdown","line_start":3} |',
     );
     expect(rendered.markdown).toContain("style-vague-heading | writing_style");
     expect(rendered.markdown).toContain("No rationale supplied");

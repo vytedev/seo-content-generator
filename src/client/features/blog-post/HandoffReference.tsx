@@ -1,3 +1,7 @@
+import { useState } from "react";
+import { Button } from "../../components/ui/button.js";
+import { GoogleDocsConnection } from "../runs/GoogleDocsConnection.js";
+
 const HANDOFF_FIELDS: Array<{ name: string; description: string }> = [
   { name: "primary_keyword", description: "The keyword this post must rank for." },
   { name: "related_keywords", description: "Supporting terms from your own research." },
@@ -18,6 +22,7 @@ const HANDOFF_FIELDS: Array<{ name: string; description: string }> = [
  * when landing on the page with in-progress work still open.
  */
 export function HandoffReference() {
+  const [connectionsOpen, setConnectionsOpen] = useState(false);
   return (
     <section
       aria-labelledby="handoff-reference-heading"
@@ -41,6 +46,24 @@ export function HandoffReference() {
         This comes from your keyword-research chat in Claude — copy the JSON it produces straight
         across.
       </p>
+      <div className="mt-4 border-t border-rule pt-4">
+        <h3 className="text-sm font-semibold text-ink">Google connections</h3>
+        <p className="mt-1 text-xs text-muted">
+          Connect optional Search Console enrichment before starting. Google Docs is required later
+          for export.
+        </p>
+        <Button
+          type="button"
+          variant="outline"
+          size="sm"
+          className="mt-3"
+          aria-expanded={connectionsOpen}
+          onClick={() => setConnectionsOpen((open) => !open)}
+        >
+          {connectionsOpen ? "Hide connections" : "Manage connections"}
+        </Button>
+        {connectionsOpen ? <GoogleDocsConnection /> : null}
+      </div>
     </section>
   );
 }

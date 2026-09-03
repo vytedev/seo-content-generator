@@ -1,4 +1,5 @@
 import { writeFile, unlink } from "node:fs/promises";
+import pg from "pg";
 import { z } from "zod";
 import { createLocalServices } from "./app/local-services.js";
 import { classifyError, logger } from "./logger.js";
@@ -42,14 +43,25 @@ services = createLocalServices({
   onWorkerFailure: terminateForWorkerFailure,
 });
 await services.ready;
+const heartbeatPool = new pg.Pool({ connectionString: config.DATABASE_URL, max: 1 });
+const heartbeat = async () => {
+  await heartbeatPool.query(
+    `insert into worker_heartbeats(worker_name,heartbeat_at) values('pipeline',clock_timestamp())
+     on conflict(worker_name) do update set heartbeat_at=excluded.heartbeat_at`,
+  );
+};
+await heartbeat();
+const heartbeatTimer = setInterval(() => void heartbeat().catch(terminateForWorkerFailure), 5_000);
 logger.info("worker.process_started", { runtime_mode: config.RUNTIME_MODE });
 
 for (const signal of ["SIGINT", "SIGTERM"] as const)
   process.once(signal, () => {
     if (stopping) return;
     stopping = true;
-    void services
-      .close(10_000)
+    clearInterval(heartbeatTimer);
+    void heartbeatPool
+      .end()
+      .then(() => services.close(10_000))
       .then(async (result) => {
         await removePidFile();
         process.exit(result === "closed" ? 0 : 1);

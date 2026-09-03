@@ -385,9 +385,23 @@ export function createApp(options: CreateAppOptions = {}): Express {
 
   const clientDirectory = path.resolve(process.cwd(), "dist/client");
   if (options.serveClient !== false && existsSync(clientDirectory)) {
-    app.use(express.static(clientDirectory));
-    app.get("/{*path}", (_request, response) => {
-      response.sendFile(path.join(clientDirectory, "index.html"));
+    app.use(express.static(clientDirectory, { index: false }));
+    app.get("/{*path}", async (_request, response, next) => {
+      try {
+        const html = await import("node:fs/promises").then(({ readFile }) =>
+          readFile(path.join(clientDirectory, "index.html"), "utf8"),
+        );
+        response
+          .type("html")
+          .send(
+            html.replace(
+              'id="root"',
+              `id="root" data-runtime-mode="${options.runtimeMode ?? "local"}"`,
+            ),
+          );
+      } catch (error) {
+        next(error);
+      }
     });
   } else {
     app.use((_request, response) => {

@@ -26,6 +26,11 @@ import type {
 } from "../shared/paid-operation.js";
 import type { Handoff } from "../shared/pipeline.js";
 
+export const workerHeartbeats = pgTable("worker_heartbeats", {
+  workerName: text("worker_name").primaryKey(),
+  heartbeatAt: timestamp("heartbeat_at", { withTimezone: true }).notNull(),
+});
+
 export const applicationSchemaVersion = pgTable(
   "application_schema_version",
   {
@@ -35,7 +40,7 @@ export const applicationSchemaVersion = pgTable(
   },
   (t) => [
     check("application_schema_version_singleton", sql`${t.singleton}=true`),
-    check("application_schema_version_current", sql`${t.version}=54`),
+    check("application_schema_version_current", sql`${t.version}=55`),
   ],
 );
 

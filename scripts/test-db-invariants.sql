@@ -587,7 +587,7 @@ END $$;
 
 DO $$
 BEGIN
-  IF (SELECT version FROM application_schema_version WHERE singleton=true) IS DISTINCT FROM 54 THEN
+  IF (SELECT version FROM application_schema_version WHERE singleton=true) IS DISTINCT FROM 55 THEN
     RAISE EXCEPTION 'application schema readiness marker is missing or stale';
   END IF;
 END $$;

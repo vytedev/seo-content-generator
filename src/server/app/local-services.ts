@@ -61,7 +61,7 @@ import {
   linkDiscoveryConfigFromEnv,
 } from "../providers/internal-link-discovery.js";
 
-export const CURRENT_APPLICATION_SCHEMA_VERSION = 54;
+export const CURRENT_APPLICATION_SCHEMA_VERSION = 55;
 
 export async function databaseSchemaIsCurrent(pool: Pick<pg.Pool, "query">): Promise<boolean> {
   try {
@@ -398,11 +398,25 @@ export function createLocalServices(config: LocalServicesConfig): {
           migrations = false;
         }
         const ownsWorker = processRole !== "api";
-        const worker = ownsWorker ? queueWorker.health().status === "running" : true;
+        let externalWorker = false;
+        if (!ownsWorker && database) {
+          try {
+            externalWorker = Boolean(
+              (
+                await pool.query<{ alive: boolean }>(
+                  "select exists(select 1 from worker_heartbeats where worker_name='pipeline' and heartbeat_at>clock_timestamp()-interval '15 seconds') alive",
+                )
+              ).rows[0]?.alive,
+            );
+          } catch {
+            externalWorker = false;
+          }
+        }
+        const worker = ownsWorker ? queueWorker.health().status === "running" : externalWorker;
         const checks = {
           database,
           migrations,
-          reconciliation: ownsWorker ? reconciliationComplete : true,
+          reconciliation: ownsWorker ? reconciliationComplete : externalWorker,
           worker,
           configuration: requiredProductionConfig,
         };

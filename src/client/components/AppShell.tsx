@@ -20,7 +20,7 @@ function RuntimeModeBadge({ mode }: { mode: RuntimeMode }) {
   return (
     <span
       className={`border px-2 py-1 text-xs font-semibold ${runtime.mode === "production" ? "border-success/40 text-success" : "border-warning/40 text-warning"}`}
-      role="status"
+      aria-label={`Runtime mode: ${runtime.label}`}
     >
       {runtime.label}
     </span>

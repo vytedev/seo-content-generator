@@ -3,7 +3,7 @@ import { readdir, readFile } from "node:fs/promises";
 import pg from "pg";
 import { z } from "zod";
 
-const CURRENT_APPLICATION_SCHEMA_VERSION = 54;
+const CURRENT_APPLICATION_SCHEMA_VERSION = 55;
 const MIGRATION_LOCK_KEY = 0x4d4d3033;
 const { DATABASE_URL } = z.object({ DATABASE_URL: z.string().min(1) }).parse(process.env);
 const pool = new pg.Pool({ connectionString: DATABASE_URL, max: 1 });
@@ -48,13 +48,18 @@ try {
         )
       ).rows[0]?.version ?? null)
     : null;
-  if (markerVersion !== null && markerVersion !== CURRENT_APPLICATION_SCHEMA_VERSION)
+  if (
+    markerVersion !== null &&
+    (markerVersion < 54 || markerVersion > CURRENT_APPLICATION_SCHEMA_VERSION)
+  )
     throw new Error(`Unsupported application schema marker: ${markerVersion}`);
   const schemaAlreadyCurrent = markerVersion === CURRENT_APPLICATION_SCHEMA_VERSION;
-  if (schemaAlreadyCurrent) {
-    // Pre-runner databases at the immutable schema marker already contain every migration.
-    // Adopt their exact image checksums; never replay DDL against them.
-    for (const migration of migrations) {
+  if (markerVersion !== null) {
+    // Marker-based databases predate this runner. Adopt only migrations through
+    // their proven marker, then execute later files normally.
+    for (const migration of migrations.filter(
+      ({ name }) => Number.parseInt(name.slice(0, 4), 10) <= markerVersion,
+    )) {
       const row = recorded.rows.find((candidate) => candidate.name === migration.name);
       if (!row)
         await client.query("insert into application_migrations(name, checksum) values($1,$2)", [
@@ -67,7 +72,8 @@ try {
           migration.checksum,
         ]);
     }
-  } else {
+  }
+  if (!schemaAlreadyCurrent) {
     for (const migration of migrations) {
       const row = recorded.rows.find((candidate) => candidate.name === migration.name);
       if (row) {
@@ -78,6 +84,8 @@ try {
           ]);
         continue;
       }
+      const adoptionVersion = markerVersion ?? -1;
+      if (Number.parseInt(migration.name.slice(0, 4), 10) <= adoptionVersion) continue;
       for (const statement of migration.sql
         .split("--> statement-breakpoint")
         .map((part) => part.trim()))

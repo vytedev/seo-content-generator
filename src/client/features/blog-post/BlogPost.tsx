@@ -14,7 +14,6 @@ import {
   resumeRequest,
 } from "../../lib/run-detail-api.js";
 import { FindingsReview } from "../findings/FindingsReview.js";
-import { GoogleDocsConnection } from "../runs/GoogleDocsConnection.js";
 import { NewRun } from "../runs/NewRun.js";
 import { RunWorkspace, type RunAction } from "../runs/RunWorkspace.js";
 import { RunWorkspaceSkeleton } from "../runs/RunWorkspaceSkeleton.js";
@@ -407,16 +406,6 @@ export function BlogPost() {
             </div>
             <aside className="min-w-0 w-full space-y-8 md:sticky md:top-20">
               <HandoffReference />
-              <section aria-labelledby="google-connections-title">
-                <h2 id="google-connections-title" className="text-h3 text-ink">
-                  Google connections
-                </h2>
-                <p className="mt-1 text-sm text-muted">
-                  Connect optional Search Console enrichment before starting a run. Google Docs is
-                  required later for export.
-                </p>
-                <GoogleDocsConnection />
-              </section>
             </aside>
           </div>
           {/* Full width, below the whole handoff area: the complete history is
