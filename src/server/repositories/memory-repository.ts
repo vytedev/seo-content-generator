@@ -326,6 +326,7 @@ export class InMemoryMilestoneRepository
       updatedAt: this.now(),
     });
     this.keys.set(key, runId);
+    this.appendStepActivity(runId, this.requireRun(runId).steps[0]!, "step_succeeded");
     await this.enqueueRun(runId);
     return result;
   }
@@ -376,6 +377,7 @@ export class InMemoryMilestoneRepository
       throw new Error("Step is already leased");
     if (state.status === "running") {
       state.status = "retryable_failed";
+      this.appendStepActivity(runId, state, "step_failed");
       state.token = null;
       state.expiresAt = null;
       state.error = "lease expired";
@@ -393,6 +395,7 @@ export class InMemoryMilestoneRepository
     }
     state.token = randomUUID();
     state.status = "running";
+    this.appendStepActivity(runId, state, "step_started");
     state.expiresAt = this.now() + this.leaseMs;
     if (!replaySucceeded) {
       run.status = "running";
@@ -423,6 +426,7 @@ export class InMemoryMilestoneRepository
     const { run, state } = this.findExecution(executionId);
     this.assertFenceState(state, token);
     state.status = "succeeded";
+    this.appendStepActivity(this.runIdFor(run), state, "step_succeeded");
     state.token = null;
     state.expiresAt = null;
     const order: PipelineStepId[] = [
@@ -479,6 +483,7 @@ export class InMemoryMilestoneRepository
     if (state.status === "cancelled") return;
     this.assertFenceState(state, token);
     state.status = "retryable_failed";
+    this.appendStepActivity(this.runIdFor(run), state, "step_failed");
     state.token = null;
     state.expiresAt = null;
     state.error = this.safeFailureMessage(error);
@@ -1162,6 +1167,7 @@ export class InMemoryMilestoneRepository
     state.expiresAt = null;
     if (currentFindings.length === 0) {
       state.status = "succeeded";
+      this.appendStepActivity(runId, state, "step_succeeded");
       this.findingReviewSubmissions.push({
         run_id: runId,
         review_set_id: reviewSetId,
@@ -1178,6 +1184,7 @@ export class InMemoryMilestoneRepository
       return;
     }
     state.status = "waiting";
+    this.appendStepActivity(runId, state, "step_waiting");
     run.status = "waiting";
     run.currentStep = "findings_review";
     run.blockReason = null;
@@ -1233,14 +1240,16 @@ export class InMemoryMilestoneRepository
         ...run.steps.filter((state) => state.step === "findings_review").map((s) => s.attempt),
       ) + 1;
     const executionId = stableId("execution", input.run_id, "findings_review", String(attempt));
-    run.steps.push({
+    const waitingStep: StepState = {
       id: executionId,
       step: "findings_review",
       status: "waiting",
       attempt,
       token: null,
       expiresAt: null,
-    });
+    };
+    run.steps.push(waitingStep);
+    this.appendStepActivity(input.run_id, waitingStep, "step_waiting");
     const pending = findings.map((finding) => ({
       ...finding,
       hard_flag: finding.hard_flag,
@@ -1467,6 +1476,7 @@ export class InMemoryMilestoneRepository
         };
         this.findingReviewSubmissions.push(appendedSubmission);
         waiting.status = "succeeded";
+        this.appendStepActivity(runId, waiting, "step_succeeded");
         // Findings review has concluded — the run moves on to the next
         // (externally-triggered, model-owned) step rather than staying
         // parked at the step that just succeeded.
@@ -2034,6 +2044,7 @@ export class InMemoryMilestoneRepository
       return "continue";
     }
     state.status = "succeeded";
+    this.appendStepActivity(input.run_id, state, "step_succeeded");
     state.token = null;
     state.expiresAt = null;
     if (run.deterministicRepairCycles >= 2) {
@@ -2112,6 +2123,7 @@ export class InMemoryMilestoneRepository
   ): Promise<void> {
     const { run, state } = this.assertFence(runId, executionId, token);
     state.status = "blocked";
+    this.appendStepActivity(runId, state, "step_blocked");
     state.token = null;
     state.expiresAt = null;
     run.status = "blocked";
@@ -2335,6 +2347,7 @@ export class InMemoryMilestoneRepository
     });
     if (blockers && run.coherenceReturnCycles >= 2) {
       fenced.state.status = "blocked";
+      this.appendStepActivity(input.run_id, fenced.state, "step_blocked");
       fenced.state.token = null;
       fenced.state.expiresAt = null;
       run.status = "blocked";
@@ -2345,6 +2358,7 @@ export class InMemoryMilestoneRepository
     if (blockers) {
       run.coherenceReturnCycles += 1;
       fenced.state.status = "succeeded";
+      this.appendStepActivity(input.run_id, fenced.state, "step_succeeded");
       fenced.state.token = null;
       fenced.state.expiresAt = null;
       run.status = "running";
@@ -2397,6 +2411,7 @@ export class InMemoryMilestoneRepository
     )
       throw new Error("Final export is incomplete");
     state.status = "succeeded";
+    this.appendStepActivity(runId, state, "step_succeeded");
     state.token = null;
     state.expiresAt = null;
     run.status = "succeeded";
@@ -2751,12 +2766,39 @@ export class InMemoryMilestoneRepository
       paid_operation_ambiguities: paidOperationAmbiguities,
       serp_probe: (() => {
         const evidence = this.serpEvidence.get(`${runId}:${run.ingest.input_hash}`) ?? null;
+        const warning = evidence ? serpWarning(evidence) : null;
+        const warningValues = [
+          ...run.ingest.result.warnings.map((item) => ({
+            ...item,
+            warning_id: `ingest:${run.ingest.input_hash}:${item.code}`,
+          })),
+          ...(warning && evidence
+            ? [{ ...warning, warning_id: `serp:${evidence.evidence_id}` }]
+            : []),
+        ].filter(
+          (item, index, values) =>
+            values.findIndex((candidate) => candidate.code === item.code) === index,
+        );
         return {
           status: evidence?.status ?? "pending",
           evidence,
-          warning: evidence ? serpWarning(evidence) : null,
+          warning,
+          warnings: warningValues.map((item) => {
+            const acknowledged = this.commandActivity.find(
+              (activity) =>
+                activity.run_id === runId &&
+                activity.type === "warning_acknowledged" &&
+                activity.summary === `Warning acknowledged: ${item.warning_id}.`,
+            );
+            return {
+              ...item,
+              acknowledged: Boolean(acknowledged),
+              acknowledged_at: acknowledged?.occurred_at ?? null,
+            };
+          }),
         };
       })(),
+      activity: await this.listCommandActivity(runId),
       can_recover_deterministic_block:
         run.status === "blocked" &&
         run.blockReason === "deterministic_blockers" &&
@@ -2882,6 +2924,22 @@ export class InMemoryMilestoneRepository
     if (lease.expiresAt <= this.now())
       throw new Error("SERP completion requires a matching unexpired lease fence");
     this.serpEvidence.set(key, structuredClone(evidence));
+    const warning = serpWarning(evidence);
+    if (warning) {
+      const activityId = `warning:serp:${evidence.evidence_id}:recorded`;
+      if (!this.commandActivity.some((activity) => activity.activity_id === activityId))
+        this.commandActivity.push(
+          parseCommandActivity({
+            activity_id: activityId,
+            run_id: work.run_id,
+            sequence:
+              this.commandActivity.filter((activity) => activity.run_id === work.run_id).length + 1,
+            type: "warning_recorded",
+            occurred_at: evidence.retrieved_at,
+            summary: warning.message,
+          }),
+        );
+    }
   }
 
   private requireSerpWorkIdentity(rawWork: SerpProbeWork): SerpProbeWork {
@@ -3001,6 +3059,20 @@ export class InMemoryMilestoneRepository
           result = { queued: true };
           queueAccepted = true;
           break;
+        case "acknowledge_warning": {
+          const run = this.requireRun(runId);
+          const evidence = this.serpEvidence.get(`${runId}:${run.ingest.input_hash}`);
+          const validIds = new Set([
+            ...run.ingest.result.warnings.map(
+              (warning) => `ingest:${run.ingest.input_hash}:${warning.code}`,
+            ),
+            ...(evidence && serpWarning(evidence) ? [`serp:${evidence.evidence_id}`] : []),
+          ]);
+          if (!validIds.has(command.warning_id))
+            throw new UnprocessableError("The warning is not available for this run.");
+          result = { acknowledged: true, warning_id: command.warning_id };
+          break;
+        }
         case "retry_export": {
           const run = this.requireRun(runId);
           const final = [...run.steps]
@@ -3025,7 +3097,7 @@ export class InMemoryMilestoneRepository
           break;
         }
         default:
-          throw new UnprocessableError(`Command ${command.kind} is not implemented in S3.`);
+          throw new UnprocessableError("The command is not implemented.");
       }
       this.commands.push(structuredClone(command));
       this.commandActivity.push(
@@ -3039,6 +3111,17 @@ export class InMemoryMilestoneRepository
           summary: "Command accepted.",
         }),
       );
+      if (command.kind === "acknowledge_warning")
+        this.commandActivity.push(
+          parseCommandActivity({
+            activity_id: `warning:${command.command_id}:acknowledged`,
+            run_id: runId,
+            sequence: this.commandActivity.filter((item) => item.run_id === runId).length + 1,
+            type: "warning_acknowledged",
+            occurred_at: command.requested_at,
+            summary: `Warning acknowledged: ${command.warning_id}.`,
+          }),
+        );
       const terminal = CommandSubmissionResultSchema.parse({
         command_id: command.command_id,
         run_id: runId,
@@ -3069,6 +3152,7 @@ export class InMemoryMilestoneRepository
     this.requireRun(runId);
     return this.commandActivity
       .filter((activity) => activity.run_id === runId)
+      .sort((left, right) => left.sequence - right.sequence)
       .map((activity) => structuredClone(activity));
   }
 
@@ -3307,6 +3391,7 @@ export class InMemoryMilestoneRepository
           )
         ) {
           step.status = "retryable_failed";
+          this.appendStepActivity(run.ingest.result.run_id, step, "step_failed");
           step.token = null;
           step.expiresAt = null;
           step.error = "lease expired during startup recovery";
@@ -3467,8 +3552,37 @@ export class InMemoryMilestoneRepository
     this.assertFenceState(found.state, token);
     return found;
   }
+  private runIdFor(run: RunState): string {
+    const entry = [...this.runs.entries()].find(([, candidate]) => candidate === run);
+    if (!entry) throw new Error("Run state identity is unavailable");
+    return entry[0];
+  }
+
+  private appendStepActivity(
+    runId: string,
+    state: StepState,
+    type: "step_started" | "step_waiting" | "step_failed" | "step_blocked" | "step_succeeded",
+  ): void {
+    const activityId = `step:${state.id}:${type}`;
+    if (this.commandActivity.some((activity) => activity.activity_id === activityId)) return;
+    const label =
+      PIPELINE_STEPS.find((candidate) => candidate.id === state.step)?.name ?? state.step;
+    this.commandActivity.push(
+      parseCommandActivity({
+        activity_id: activityId,
+        run_id: runId,
+        sequence: this.commandActivity.filter((activity) => activity.run_id === runId).length + 1,
+        type,
+        occurred_at: new Date(this.now()).toISOString(),
+        step: state.step,
+        summary: `${label}: ${type.slice("step_".length).replaceAll("_", " ")}.`,
+      }),
+    );
+  }
+
   private completeValidatedStep(run: RunState, state: StepState): void {
     state.status = "succeeded";
+    this.appendStepActivity(this.runIdFor(run), state, "step_succeeded");
     state.token = null;
     state.expiresAt = null;
     run.blockReason = null;

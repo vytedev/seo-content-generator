@@ -247,7 +247,40 @@ export function BlogPost() {
     setRunInLocation("");
   }
 
+  async function acknowledgeWarning(warningId: string) {
+    if (!focusRunId) return;
+    const kind = "acknowledge-warning" as const;
+    const actionIdentity = `${focusRunId}:${kind}:${warningId}`;
+    const idempotencyKey =
+      actionKeys.current.get(actionIdentity) ?? newActionIdempotencyKey(kind, focusRunId);
+    actionKeys.current.set(actionIdentity, idempotencyKey);
+    setAction(kind);
+    setActionError("");
+    try {
+      const response = await apiFetch(
+        `/api/runs/${encodeURIComponent(focusRunId)}/warnings/${encodeURIComponent(warningId)}/acknowledge`,
+        { method: "POST", headers: { "Idempotency-Key": idempotencyKey } },
+      );
+      const body: unknown = await response.json();
+      parseRunCommandResponse(
+        body,
+        response.status,
+        focusRunId,
+        "The warning could not be acknowledged.",
+      );
+      actionKeys.current.delete(actionIdentity);
+      await fetchDetail(focusRunId, true);
+    } catch (error) {
+      setActionError(
+        error instanceof Error ? error.message : "The warning could not be acknowledged.",
+      );
+    } finally {
+      setAction(null);
+    }
+  }
+
   async function performAction(kind: Exclude<RunAction, null>) {
+    if (kind === "acknowledge-warning") return;
     if (!focusRunId || !detail) return;
     setAction(kind);
     setActionError("");
@@ -387,7 +420,7 @@ export function BlogPost() {
         <>
           <div className="mb-4 flex min-w-0 flex-wrap items-center gap-2">
             <span className="min-w-0 [overflow-wrap:anywhere] font-mono text-xs text-muted">
-              Blog post ID: {focusRunId}
+              Blog post: {shortRunReference(focusRunId)}
             </span>
             <Button type="button" variant="ghost" size="sm" onClick={startNew}>
               Start another blog post
@@ -438,6 +471,7 @@ export function BlogPost() {
                   detail={detail}
                   action={action}
                   onAction={performAction}
+                  onAcknowledgeWarning={acknowledgeWarning}
                   {...(phase === "needs-decision"
                     ? { onReviewFindings: () => setShowFindings(true) }
                     : {})}
@@ -449,6 +483,10 @@ export function BlogPost() {
       )}
     </div>
   );
+}
+
+function shortRunReference(runId: string): string {
+  return runId.length <= 12 ? runId : `${runId.slice(0, 8)}…${runId.slice(-4)}`;
 }
 
 function toSentenceCase(value: string): string {

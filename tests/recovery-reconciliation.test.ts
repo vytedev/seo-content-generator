@@ -14,6 +14,20 @@ const handoff = {
 };
 
 describe("memory startup recovery reconciliation", () => {
+  it("persists each step lifecycle transition once instead of synthesising current state", async () => {
+    const repository = new InMemoryMilestoneRepository();
+    const run = await ingestHandoff(handoff, "activity-lifecycle", repository);
+    const lease = await repository.claimStep(run.run_id, "internal_link_discovery", "worker");
+    await repository.completeStep(lease.execution_id, lease.token);
+    const first = await repository.listCommandActivity(run.run_id);
+    expect(await repository.listCommandActivity(run.run_id)).toEqual(first);
+    expect(first.filter((event) => event.type === "step_started")).toHaveLength(1);
+    expect(first.filter((event) => event.type === "step_succeeded")).toHaveLength(2);
+    expect(first.map((event) => event.sequence)).toEqual(
+      Array.from({ length: first.length }, (_, index) => index + 1),
+    );
+  });
+
   it("recovers claim then death after expiry and rejects the stale token", async () => {
     let now = 1_000;
     const repository = new InMemoryMilestoneRepository(100, () => now);

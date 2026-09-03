@@ -99,6 +99,55 @@ integration("PostgreSQL command repository command-kind parity", () => {
     }
   });
 
+  it("allocates concurrent command activity sequences without collisions", async () => {
+    const run = await repository.submitCommand(
+      command(
+        "create_run",
+        "pg-activity-concurrency-seed",
+        {
+          handoff,
+          warnings: Array.from({ length: 8 }, (_, index) => ({
+            code: "serp_probe_failed",
+            message: `Warning ${index}`,
+          })),
+        },
+        "pg-activity-seed-command",
+      ),
+    );
+    const runId = run.run_id;
+    await pool!.query("delete from pipeline_queue_jobs where run_id=$1", [runId]);
+    const warningId = `ingest:${(run.result as { input_hash: string }).input_hash}:serp_probe_failed`;
+    const commands = Array.from({ length: 8 }, (_, index) =>
+      command(
+        "acknowledge_warning",
+        `pg-concurrent-warning-${index}`,
+        { run_id: runId, warning_id: warningId },
+        `pg-concurrent-command-${index}`,
+      ),
+    );
+    await Promise.all(commands.map((item) => repository.submitCommand(item)));
+    const rows = (
+      await pool!.query<{ sequence: number }>(
+        "select sequence from run_activity_events where run_id=$1 order by sequence",
+        [runId],
+      )
+    ).rows;
+    expect(new Set(rows.map((row) => row.sequence)).size).toBe(rows.length);
+    expect(rows.map((row) => row.sequence)).toEqual(
+      Array.from({ length: rows.length }, (_, index) => index + 1),
+    );
+  });
+
+  it("stores step lifecycle history at transition time", async () => {
+    const runId = await seed("pg-step-activity-seed");
+    const lease = await repository.claimStep(runId, "internal_link_discovery", "worker");
+    await repository.completeStep(lease.execution_id, lease.token);
+    const before = await repository.listCommandActivity(runId);
+    expect(await repository.listCommandActivity(runId)).toEqual(before);
+    expect(before.filter((event) => event.type === "step_started")).toHaveLength(1);
+    expect(before.filter((event) => event.type === "step_succeeded")).toHaveLength(2);
+  });
+
   it.each(commandKinds)(
     "executes, replays and conflicts %s with one activity and no duplicate queue",
     async (kind) => {

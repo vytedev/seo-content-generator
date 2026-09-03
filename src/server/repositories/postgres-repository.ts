@@ -3570,6 +3570,24 @@ export class PostgresMilestoneRepository
           retrieved_at: serpRow.retrieved_at.toISOString(),
         })
       : null;
+    const ingestRow = (
+      await this.pool.query<{ input_hash: string; body_text: string | null }>(
+        `select r.input_hash,a.body_text from runs r
+          left join artifacts a on a.run_id=r.id and a.kind='ingest_result'
+          where r.id=$1 order by a.created_at limit 1`,
+        [runId],
+      )
+    ).rows[0];
+    const ingestWarnings = ingestRow?.body_text
+      ? IngestResultSchema.parse({
+          run_id: runId,
+          input_hash: ingestRow.input_hash,
+          handoff: await this.getHandoff(runId),
+          warnings: (JSON.parse(ingestRow.body_text) as { warnings?: unknown }).warnings ?? [],
+        }).warnings
+      : [];
+    const serpWarningValue = serpEvidence ? serpWarning(serpEvidence) : null;
+    const serpWarningId = serpEvidence ? `serp:${serpEvidence.evidence_id}` : null;
     const draftRecovery =
       run.status === "retryable_failed" && run.current_step === "draft" && !current
         ? draftOperation?.status === "provider_in_flight"
@@ -3726,8 +3744,39 @@ export class PostgresMilestoneRepository
       serp_probe: {
         status: serpEvidence?.status ?? "pending",
         evidence: serpEvidence,
-        warning: serpEvidence ? serpWarning(serpEvidence) : null,
+        warning: serpWarningValue,
+        warnings: await Promise.all(
+          [
+            ...ingestWarnings.map((item) => ({
+              ...item,
+              warning_id: `ingest:${ingestRow!.input_hash}:${item.code}`,
+            })),
+            ...(serpWarningValue && serpWarningId
+              ? [{ ...serpWarningValue, warning_id: serpWarningId }]
+              : []),
+          ]
+            .filter(
+              (item, index, values) =>
+                values.findIndex((candidate) => candidate.code === item.code) === index,
+            )
+            .map(async (item) => {
+              const acknowledgement = (
+                await this.pool.query<{ occurred_at: Date }>(
+                  `select occurred_at from run_activity_events
+                    where run_id=$1 and type='warning_acknowledged' and summary=$2
+                    order by sequence desc limit 1`,
+                  [runId, `Warning acknowledged: ${item.warning_id}.`],
+                )
+              ).rows[0];
+              return {
+                ...item,
+                acknowledged: Boolean(acknowledgement),
+                acknowledged_at: acknowledgement?.occurred_at.toISOString() ?? null,
+              };
+            }),
+        ),
       },
+      activity: await this.listCommandActivity(runId),
       can_recover_deterministic_block:
         run.status === "blocked" &&
         blockReason === "deterministic_blockers" &&
@@ -4098,6 +4147,36 @@ export class PostgresMilestoneRepository
           evidence.failure_reason,
         ],
       );
+      const warning = serpWarning(evidence);
+      if (warning) {
+        const sequence = (
+          await client.query<{ sequence: number }>(
+            "select coalesce(max(sequence),0)::int+1 sequence from run_activity_events where run_id=$1",
+            [work.run_id],
+          )
+        ).rows[0]!.sequence;
+        const activity = parseCommandActivity({
+          activity_id: `warning:serp:${evidence.evidence_id}:recorded`,
+          run_id: work.run_id,
+          sequence,
+          type: "warning_recorded",
+          occurred_at: evidence.retrieved_at,
+          summary: warning.message,
+        });
+        await client.query(
+          `insert into run_activity_events(activity_id,run_id,sequence,type,summary,payload,occurred_at)
+           values($1,$2,$3,$4,$5,$6::jsonb,$7) on conflict(activity_id) do nothing`,
+          [
+            activity.activity_id,
+            work.run_id,
+            sequence,
+            activity.type,
+            activity.summary,
+            JSON.stringify(activity),
+            activity.occurred_at,
+          ],
+        );
+      }
       const completed = await client.query(
         `update run_command_outbox set status='succeeded',terminal_result=jsonb_build_object('run_id',run_id::text,'queue_accepted',false,'result',jsonb_build_object('evidence_id',$2::text)),completed_at=clock_timestamp(),lease_owner=null,lease_token=null,lease_expires_at=null
          where command_id=$1 and run_id=$3 and kind='probe_serp' and status='processing'
@@ -4260,6 +4339,23 @@ export class PostgresMilestoneRepository
           queueAccepted = false;
           break;
         }
+        case "acknowledge_warning": {
+          const warningExists = await client.query(
+            `select 1 from runs r
+              left join artifacts a on a.run_id=r.id and a.kind='ingest_result'
+              left join serp_evidence e on e.run_id=r.id
+              where r.id=$1 and (
+                $2='serp:'||e.evidence_id and e.status in ('mismatch','failed','no_results')
+                or $2 like 'ingest:'||r.input_hash||':%'
+                  and (a.body_text::jsonb->'warnings') @> jsonb_build_array(jsonb_build_object('code',split_part($2,':',3)))
+              )`,
+            [runId, command.warning_id],
+          );
+          if (!warningExists.rows[0])
+            throw new UnprocessableError("The warning is not available for this run.");
+          result = { acknowledged: true, warning_id: command.warning_id };
+          break;
+        }
         case "retry_export": {
           const eligible = await client.query(
             `select 1 from runs r
@@ -4279,7 +4375,7 @@ export class PostgresMilestoneRepository
           break;
         }
         default:
-          throw new UnprocessableError(`Command ${command.kind} is not implemented in S3.`);
+          throw new UnprocessableError("The command is not implemented.");
       }
 
       await client.query(
@@ -4324,6 +4420,29 @@ export class PostgresMilestoneRepository
           activity.occurred_at,
         ],
       );
+      if (command.kind === "acknowledge_warning") {
+        const warningActivity = parseCommandActivity({
+          activity_id: `warning:${command.command_id}:acknowledged`,
+          run_id: runId,
+          sequence: sequence + 1,
+          type: "warning_acknowledged",
+          occurred_at: command.requested_at,
+          summary: `Warning acknowledged: ${command.warning_id}.`,
+        });
+        await client.query(
+          `insert into run_activity_events(activity_id,run_id,sequence,type,summary,payload,occurred_at)
+           values($1,$2,$3,$4,$5,$6::jsonb,$7)`,
+          [
+            warningActivity.activity_id,
+            runId,
+            warningActivity.sequence,
+            warningActivity.type,
+            warningActivity.summary,
+            JSON.stringify(warningActivity),
+            warningActivity.occurred_at,
+          ],
+        );
+      }
       return CommandSubmissionResultSchema.parse({
         command_id: command.command_id,
         run_id: runId,
@@ -4335,11 +4454,11 @@ export class PostgresMilestoneRepository
   }
 
   async listCommandActivity(runId: string) {
-    const rows = await this.pool.query<{ payload: unknown }>(
+    const stored = await this.pool.query<{ payload: unknown }>(
       "select payload from run_activity_events where run_id=$1 order by sequence",
       [runId],
     );
-    return rows.rows.map((row) => parseCommandActivity(row.payload));
+    return stored.rows.map((row) => parseCommandActivity(row.payload));
   }
 
   async claimQueueJob(owner: string, leaseMs: number): Promise<QueueLease | null> {

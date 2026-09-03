@@ -285,6 +285,30 @@ export function registerRunRoutes(app: Express, options: RunRouteOptions): void 
     }
   });
 
+  app.get("/api/runs/:runId/activity", async (request, response, next) => {
+    try {
+      response
+        .status(200)
+        .json({ activity: await options.commands.listCommandActivity(request.params.runId!) });
+    } catch (error) {
+      next(error);
+    }
+  });
+  app.post("/api/runs/:runId/warnings/:warningId/acknowledge", async (request, response, next) => {
+    try {
+      const submission = await options.commands.submitCommand(
+        buildRouteCommand({
+          kind: "acknowledge_warning",
+          run_id: request.params.runId!,
+          idempotency_key: routeCommandKey(request.get("Idempotency-Key")),
+          body: { warning_id: request.params.warningId! },
+        }),
+      );
+      await respondAccepted(response, submission);
+    } catch (error) {
+      next(error);
+    }
+  });
   app.get("/api/runs/:runId", async (request, response, next) => {
     try {
       response.status(200).json(await detailReader.getRunDetail(request.params.runId!));

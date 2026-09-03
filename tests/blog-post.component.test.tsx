@@ -378,6 +378,96 @@ describe("Blog Post page", () => {
     );
   });
 
+  it("shows and acknowledges a persisted SERP warning independently of progression", async () => {
+    const initial = detail({
+      serp_probe: {
+        status: "mismatch",
+        evidence: null,
+        warning: { code: "serp_composition_mismatch", message: "Commercial composition." },
+        warnings: [
+          {
+            warning_id: "serp:evidence-1",
+            code: "serp_composition_mismatch",
+            message: "Commercial composition.",
+            acknowledged: false,
+            acknowledged_at: null,
+          },
+        ],
+      },
+      activity: [
+        {
+          activity_id: "warning-recorded",
+          run_id: "run-m4-1",
+          sequence: 1,
+          type: "warning_recorded",
+          occurred_at: "2026-01-02T10:00:00.000Z",
+          summary: "Commercial composition.",
+        },
+      ],
+    });
+    const acknowledged = detail({
+      ...initial,
+      serp_probe: {
+        ...(initial as unknown as { serp_probe: Record<string, unknown> }).serp_probe,
+        warnings: [
+          {
+            warning_id: "serp:evidence-1",
+            code: "serp_composition_mismatch",
+            message: "Commercial composition.",
+            acknowledged: true,
+            acknowledged_at: "2026-01-02T10:01:00.000Z",
+          },
+        ],
+      },
+    });
+    let current = initial;
+    const fetchMock = vi.spyOn(globalThis, "fetch").mockImplementation(async (input, init) => {
+      const url = typeof input === "string" ? input : String((input as Request).url ?? "");
+      if (url.includes("/api/runs?")) return runsResponse({ runs: [summary()] });
+      if (url.includes("/warnings/") && init?.method === "POST") {
+        current = acknowledged;
+        return accepted();
+      }
+      return response(current);
+    });
+    const user = userEvent.setup();
+    render(<App authMode="test-bypass" />);
+
+    expect((await screen.findAllByText("Commercial composition.")).length).toBeGreaterThan(0);
+    await user.click(screen.getByRole("button", { name: "Acknowledge warning" }));
+    expect(await screen.findByText("Acknowledged")).toBeInTheDocument();
+    expect(fetchMock).toHaveBeenCalledWith(
+      "/api/runs/run-m4-1/warnings/serp%3Aevidence-1/acknowledge",
+      expect.objectContaining({
+        method: "POST",
+        headers: { "Idempotency-Key": expect.stringMatching(/^client:acknowledge-warning:/) },
+      }),
+    );
+    expect(screen.getAllByText("Running").length).toBeGreaterThan(0);
+  });
+
+  it("renders the durable activity timeline", async () => {
+    stubFetch({ runs: [summary()] }, () =>
+      detail({
+        activity: [
+          {
+            activity_id: "activity-1",
+            run_id: "run-m4-1",
+            sequence: 1,
+            type: "step_succeeded",
+            step: "ingest_handoff",
+            occurred_at: "2026-01-02T10:00:00.000Z",
+            summary: "Ingest handoff: succeeded.",
+          },
+        ],
+      }),
+    );
+    render(<App authMode="test-bypass" />);
+    expect(await screen.findByRole("heading", { name: "Activity" })).toBeInTheDocument();
+    expect(screen.getByText("Step completed")).toBeInTheDocument();
+    expect(screen.getByText("Ingest handoff: succeeded.")).toBeInTheDocument();
+  });
+
   it("shows persisted local bypass evidence in run detail", async () => {
     const bypassed = detail({
       link_discovery: {
@@ -1192,7 +1282,7 @@ describe("Blog Post page", () => {
     render(<App authMode="test-bypass" />);
 
     await screen.findByRole("navigation", { name: "Twelve-step pipeline" });
-    expect(screen.getByText(/quality score/i).parentElement).toHaveTextContent("94%");
+    expect(screen.queryByText(/quality score/i)).not.toBeInTheDocument();
     expect(screen.getByText(/cost/i).parentElement).toHaveTextContent(/0\.0235/);
     expect(screen.getByText("Model tokens (in / out)").parentElement).toHaveTextContent(
       "1,200 / 500",

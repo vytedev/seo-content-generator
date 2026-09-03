@@ -365,6 +365,13 @@
       "when": 1788364800000,
       "tag": "0052_real_screwball",
       "breakpoints": true
+    },
+    {
+      "idx": 53,
+      "version": "7",
+      "when": 1788366000000,
+      "tag": "0053_step_activity_lifecycle",
+      "breakpoints": true
     }
   ]
 }

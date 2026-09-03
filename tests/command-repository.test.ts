@@ -143,7 +143,9 @@ describe("memory command repository command-kind parity", () => {
         : command(kind, key, { ...body!, run_id: "run-changed" }, "changed");
     await assertReplayConflict({ repository, first, changed, expectedQueue });
     expect(repository.commands).toHaveLength(kind === "create_run" ? 2 : 1);
-    expect(repository.commandActivity).toHaveLength(1);
+    expect(
+      repository.commandActivity.filter((activity) => activity.type === "command_accepted"),
+    ).toHaveLength(1);
   });
 
   it("does not enqueue or report acceptance for a domain-level exceptional replay", async () => {

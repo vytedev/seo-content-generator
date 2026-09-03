@@ -6,6 +6,7 @@ import { Button } from "../../components/ui/button.js";
 import { Spinner } from "../../components/ui/spinner.js";
 import { StatusBadge } from "../../components/StatusBadge.js";
 import { GoogleDocsConnection } from "./GoogleDocsConnection.js";
+import { RunActivityTimeline } from "./RunActivityTimeline.js";
 import { friendlyFailure } from "./failure-copy.js";
 
 /**
@@ -29,7 +30,8 @@ function formatElapsed(sinceIso: string): string {
   return minutes < 1 ? `${seconds}s` : `${minutes}m ${String(seconds % 60).padStart(2, "0")}s`;
 }
 
-export type RunAction = "resume" | "export" | "cancel" | "exceptional-correction" | null;
+export type RunAction =
+  "resume" | "export" | "cancel" | "exceptional-correction" | "acknowledge-warning" | null;
 
 /**
  * The running/terminal surface for one article: the twelve-step rail, the
@@ -41,10 +43,12 @@ export function RunWorkspace({
   action,
   onAction,
   onReviewFindings,
+  onAcknowledgeWarning,
 }: {
   detail: RunDetailData;
   action: RunAction;
   onAction: (action: Exclude<RunAction, null>) => void;
+  onAcknowledgeWarning: (warningId: string) => void;
   /** Present only while status is "waiting" — surfaces a way into the findings decision screen. */
   onReviewFindings?: () => void;
 }) {
@@ -253,7 +257,6 @@ export function RunWorkspace({
 
       <div className="mb-4 flex flex-wrap items-center gap-x-6 gap-y-1 text-xs">
         <MetadataItem value={formatCost(detail.usage.cost_micros)} label="cost" />
-        <MetadataItem value={`${qualitySafetyPercent(detail.counts)}%`} label="quality score" />
         <MetadataItem value={`${detail.coherence_return_cycles} of 2`} label="revision cycles" />
       </div>
 
@@ -498,6 +501,36 @@ export function RunWorkspace({
 
           <LinkDiscoveryContext detail={detail} />
 
+          {detail.serp_probe.warnings.length > 0 && (
+            <ContextSection title="Search check">
+              <ul className="space-y-3">
+                {detail.serp_probe.warnings.map((warning) => (
+                  <li key={warning.warning_id} className="text-sm text-ink">
+                    <p>{warning.message}</p>
+                    {warning.acknowledged ? (
+                      <p className="mt-1 text-xs text-success">Acknowledged</p>
+                    ) : (
+                      <Button
+                        type="button"
+                        variant="outline"
+                        size="sm"
+                        className="mt-2"
+                        loading={action === "acknowledge-warning"}
+                        disabled={action !== null}
+                        onClick={() => onAcknowledgeWarning(warning.warning_id)}
+                      >
+                        Acknowledge warning
+                      </Button>
+                    )}
+                  </li>
+                ))}
+              </ul>
+              <p className="mt-2 text-xs text-muted">
+                This acknowledgement is recorded separately and does not pause the pipeline.
+              </p>
+            </ContextSection>
+          )}
+
           <ContextSection title="Completion summary">
             <DefinitionRow
               label="Model tokens (in / out)"
@@ -543,6 +576,8 @@ export function RunWorkspace({
               </p>
             )}
           </ContextSection>
+
+          <RunActivityTimeline activity={detail.activity} />
 
           {current && (
             <ContextSection title="Technical details">
@@ -724,15 +759,6 @@ function formatCost(micros: number) {
     minimumFractionDigits: 2,
     maximumFractionDigits: 4,
   }).format(micros / 1_000_000);
-}
-
-/**
- * A frontend-only display heuristic for client review — RunDetail has no
- * real "quality safety" field. Starts at 100% and deducts for warnings and
- * hard flags found so far; not a backend-computed metric.
- */
-function qualitySafetyPercent(counts: RunDetailData["counts"]): number {
-  return Math.max(0, 100 - (counts.warnings + counts.hard_flags) * 2);
 }
 
 /**
