@@ -61,15 +61,30 @@ import {
   linkDiscoveryConfigFromEnv,
 } from "../providers/internal-link-discovery.js";
 
+export const CURRENT_APPLICATION_SCHEMA_VERSION = 54;
+
+export async function databaseSchemaIsCurrent(pool: Pick<pg.Pool, "query">): Promise<boolean> {
+  try {
+    const result = await pool.query<{ version: number }>(
+      "select version from application_schema_version where singleton=true",
+    );
+    return result.rows[0]?.version === CURRENT_APPLICATION_SCHEMA_VERSION;
+  } catch {
+    return false;
+  }
+}
+
 export interface LocalServicesConfig {
   databaseUrl?: string;
   fixture?: DeterministicFixture;
   calibrationRetriever?: PublicPageRetriever;
   /** Tests without a database must opt out; real database composition fails closed. */
   authMode?: "required" | "disabled-test";
-  /** Explicit deployment opt-in for a non-loopback PostgreSQL endpoint. */
+  /** Explicit local/test opt-in for a non-loopback PostgreSQL endpoint. */
   allowNonLocalDatabase?: boolean;
   runtimeMode?: "local" | "test" | "production";
+  /** Runtime never mutates schema; migrations must complete before startup. */
+  migrationPolicy?: "verify-only" | "on-startup";
 }
 
 export function createLocalServices(config: LocalServicesConfig): {
@@ -79,6 +94,9 @@ export function createLocalServices(config: LocalServicesConfig): {
 } {
   const runtimeMode = RuntimeModeSchema.parse(config.runtimeMode ?? "local");
   const testDoublesAllowed = permitsTestDoubles(runtimeMode);
+  const migrationPolicy = config.migrationPolicy ?? "verify-only";
+  if (migrationPolicy !== "verify-only")
+    throw new Error("Migration-on-startup is forbidden; apply migrations before starting the app.");
   // Validate any attempted Google configuration even when the database is unavailable;
   // only a wholly absent configuration is allowed to select credential-free behaviour.
   const googleConfig = googleOAuthConfigFromEnv(process.env);
@@ -104,6 +122,16 @@ export function createLocalServices(config: LocalServicesConfig): {
         pipelineUnavailable: true,
         auth: { mode: "disabled" },
         runtimeMode,
+        readiness: async () => ({
+          ready: false,
+          checks: {
+            database: false,
+            migrations: false,
+            reconciliation: false,
+            worker: false,
+            configuration: true,
+          },
+        }),
       },
       ready: Promise.resolve(),
       close: async () => "closed",
@@ -116,8 +144,14 @@ export function createLocalServices(config: LocalServicesConfig): {
   }
   const url = new URL(config.databaseUrl);
   const databaseIsLocal = new Set(["localhost", "127.0.0.1", "::1"]).has(url.hostname);
-  if (!databaseIsLocal && !config.allowNonLocalDatabase) {
-    throw new Error("DATABASE_URL must target local PostgreSQL for this local-only application");
+  if (runtimeMode === "production") {
+    if (databaseIsLocal) throw new Error("Production forbids a loopback PostgreSQL database.");
+    if (!config.allowNonLocalDatabase)
+      throw new Error("Production requires explicit non-local database approval.");
+  } else if (!databaseIsLocal && !config.allowNonLocalDatabase) {
+    throw new Error(
+      "Local/test DATABASE_URL requires loopback PostgreSQL unless explicitly allowed.",
+    );
   }
   const pool = new pg.Pool({ connectionString: config.databaseUrl });
   // Seeded export templates stay pending until editorial approval. Local testing
@@ -269,6 +303,21 @@ export function createLocalServices(config: LocalServicesConfig): {
       serpProbeConfig ? new ConfiguredSerpProbe(serpProbeConfig) : null,
     ),
   );
+  let reconciliationComplete = false;
+  let startupFailure: unknown = null;
+  const requiredProductionConfig =
+    runtimeMode !== "production" ||
+    Boolean(
+      modelOptions &&
+      googleClient &&
+      linkDiscoveryConfig &&
+      factVerifierConfig &&
+      serpProbeConfig &&
+      !allowUnverifiedLinkBypass &&
+      !config.fixture &&
+      config.authMode !== "disabled-test",
+    );
+  const verifyDatabaseAndMigrations = () => databaseSchemaIsCurrent(pool);
   const ready = (async () => {
     if (runtimeMode === "production") {
       const [unsafeReferences, selectedTemplates] = await Promise.all([
@@ -295,8 +344,14 @@ export function createLocalServices(config: LocalServicesConfig): {
       )
         throw new Error("Production refuses missing or pending export templates.");
     }
+    if (!(await verifyDatabaseAndMigrations()))
+      throw new Error("Database migrations are not current; apply migrations before startup.");
     await queueWorker.start();
-  })();
+    reconciliationComplete = true;
+  })().catch((error) => {
+    startupFailure = error;
+    throw error;
+  });
   // Mark the promise observed for compositions that only inspect providers in tests; the same
   // rejecting promise is still returned and production awaits it before opening readiness.
   void ready.catch(() => undefined);
@@ -317,6 +372,30 @@ export function createLocalServices(config: LocalServicesConfig): {
       commands: repository,
       workerHealth: () => queueWorker.health(),
       runtimeMode,
+      readiness: async () => {
+        let database = false;
+        let migrations = false;
+        try {
+          await pool.query("select 1");
+          database = true;
+          migrations = await verifyDatabaseAndMigrations();
+        } catch {
+          database = false;
+          migrations = false;
+        }
+        const worker = queueWorker.health().status === "running";
+        const checks = {
+          database,
+          migrations,
+          reconciliation: reconciliationComplete,
+          worker,
+          configuration: requiredProductionConfig,
+        };
+        return {
+          ready: !startupFailure && Object.values(checks).every(Boolean),
+          checks,
+        };
+      },
       modelDiagnostic,
       googleOAuth: {
         configured: Boolean(googleConfig),

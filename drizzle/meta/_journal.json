@@ -372,6 +372,13 @@
       "when": 1788366000000,
       "tag": "0053_step_activity_lifecycle",
       "breakpoints": true
+    },
+    {
+      "idx": 54,
+      "version": "7",
+      "when": 1788367200000,
+      "tag": "0054_runtime_readiness_marker",
+      "breakpoints": true
     }
   ]
 }

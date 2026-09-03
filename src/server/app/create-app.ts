@@ -74,6 +74,16 @@ export interface CreateAppOptions {
   commands?: import("../../shared/command-repository.js").RunCommandRepository;
   workerHealth?: () => { status: "running" | "stopped" | "failed" };
   runtimeMode?: RuntimeMode;
+  readiness?: () => Promise<{
+    ready: boolean;
+    checks: {
+      database: boolean;
+      migrations: boolean;
+      reconciliation: boolean;
+      worker: boolean;
+      configuration: boolean;
+    };
+  }>;
   /** Test-only compatibility. Production-like composition must supply the durable queue. */
   testOnlySynchronousPipeline?: boolean;
   /** Explicitly disabled preserves isolated tests; local runtime always supplies enabled auth. */
@@ -107,6 +117,8 @@ export function createApp(options: CreateAppOptions = {}): Express {
       "resume",
       "checker",
       "health",
+      "live",
+      "ready",
       "integrations",
       "google",
       "callback",
@@ -210,6 +222,32 @@ export function createApp(options: CreateAppOptions = {}): Express {
       next();
     });
   }
+
+  app.get("/api/live", (_request, response) => response.status(200).json({ status: "live" }));
+
+  app.get("/api/ready", async (_request, response, next) => {
+    try {
+      const readiness = options.readiness
+        ? await options.readiness()
+        : {
+            ready: options.workerHealth?.().status !== "failed",
+            checks: {
+              database: !options.pipelineUnavailable,
+              migrations: !options.pipelineUnavailable,
+              reconciliation: options.workerHealth?.().status === "running",
+              worker: options.workerHealth?.().status !== "failed",
+              configuration: true,
+            },
+          };
+      response.status(readiness.ready ? 200 : 503).json({
+        status: readiness.ready ? "ready" : "not_ready",
+        runtime: runtimeState(options.runtimeMode ?? "test"),
+        checks: readiness.checks,
+      });
+    } catch (error) {
+      next(error);
+    }
+  });
 
   app.get("/api/health", (_request, response) => {
     const worker = options.workerHealth?.();

@@ -16,6 +16,30 @@ describe("local server composition", () => {
     await close();
   });
 
+  it("reports unconfigured local composition as live but not ready", async () => {
+    const { app, close } = createLocalApp({ authMode: "disabled-test" });
+    await request(app).get("/api/live").expect(200, { status: "live" });
+    const readiness = await request(app).get("/api/ready").expect(503);
+    expect(readiness.body.checks).toMatchObject({
+      database: false,
+      migrations: false,
+      reconciliation: false,
+      worker: false,
+      configuration: true,
+    });
+    await close();
+  });
+
+  it("forbids migration-on-startup before composing dependencies", () => {
+    expect(() =>
+      createLocalServices({
+        authMode: "disabled-test",
+        runtimeMode: "test",
+        migrationPolicy: "on-startup",
+      }),
+    ).toThrow("Migration-on-startup is forbidden");
+  });
+
   it("fails closed without PostgreSQL in normal runtime composition", () => {
     expect(() => createLocalApp({})).toThrow("PostgreSQL is required for operator authentication");
   });
@@ -32,10 +56,25 @@ describe("local server composition", () => {
         databaseUrl: "postgresql://user@example.com/database",
         authMode: "disabled-test",
       }),
-    ).toThrow("must target local PostgreSQL");
+    ).toThrow("requires loopback PostgreSQL");
   });
 
-  it("allows an explicitly configured non-loopback PostgreSQL deployment", async () => {
+  it("rejects production loopback databases and missing non-local approval", () => {
+    expect(() =>
+      createLocalServices({
+        databaseUrl: "postgresql://localhost:5432/mm0301",
+        runtimeMode: "production",
+      }),
+    ).toThrow("Operator authentication configuration is required");
+    expect(() =>
+      createLocalServices({
+        databaseUrl: "postgresql://user@postgres/database",
+        runtimeMode: "production",
+      }),
+    ).toThrow("Operator authentication configuration is required");
+  });
+
+  it("allows an explicitly configured non-loopback local/test database", async () => {
     const { close } = createLocalServices({
       databaseUrl: "postgresql://user@postgres/database",
       authMode: "disabled-test",

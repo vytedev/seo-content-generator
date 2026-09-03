@@ -26,6 +26,19 @@ import type {
 } from "../shared/paid-operation.js";
 import type { Handoff } from "../shared/pipeline.js";
 
+export const applicationSchemaVersion = pgTable(
+  "application_schema_version",
+  {
+    singleton: boolean("singleton").primaryKey().notNull().default(true),
+    version: integer("version").notNull(),
+    appliedAt: timestamp("applied_at", { withTimezone: true }).notNull().defaultNow(),
+  },
+  (t) => [
+    check("application_schema_version_singleton", sql`${t.singleton}=true`),
+    check("application_schema_version_current", sql`${t.version}=54`),
+  ],
+);
+
 const createdAt = timestamp("created_at", { withTimezone: true }).notNull().defaultNow();
 const updatedAt = timestamp("updated_at", { withTimezone: true }).notNull().defaultNow();
 
