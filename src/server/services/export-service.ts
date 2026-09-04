@@ -325,16 +325,22 @@ export class PostgresGoogleDocsExportService {
         'artifact',jsonb_build_object('id',a.id,'parent_id',a.parent_id,'step_execution_id',a.step_execution_id,'kind',a.kind,'media_type',a.media_type,'content_hash',a.content_hash),
         'rerun',jsonb_build_object('step_execution_id',dr.step_execution_id,'baseline_manifest_hash',dr.baseline_manifest_hash,'result_hash',dr.result_hash,'result',dr.result),
         'coherence',jsonb_build_object('operation_id',cc.operation_id,'producing_step_execution_id',cc.producing_step_execution_id,
-          'recovery_step_execution_id',(select recovery.recovery_step_execution_id from coherence_recoveries recovery
-            where recovery.operation_id=cc.operation_id and recovery.run_id=cc.run_id
-              and recovery.document_version_id=cc.document_version_id and recovery.recovery_step_execution_id=$3
-              and recovery.outcome='export' limit 1),
+          'persistence_step_execution_id',(select operation.step_execution_id from provider_operations operation
+            where operation.operation_id=cc.operation_id and operation.run_id=cc.run_id
+              and operation.document_version_id=cc.document_version_id
+              and operation.operation='final_coherence_export' and operation.content_hash=cc.response_hash limit 1),
+          'recovery_step_execution_ids',(select coalesce(jsonb_agg(recovery.recovery_step_execution_id order by recovery.created_at),'[]'::jsonb)
+            from coherence_recoveries recovery where recovery.operation_id=cc.operation_id and recovery.run_id=cc.run_id
+              and recovery.document_version_id=cc.document_version_id and recovery.outcome='export'),
           'request_hash',cc.request_hash,'response_hash',cc.response_hash,'response',cc.response,
-          'request',(select body_text::jsonb from artifacts where run_id=r.id and kind='coherence_request'
-            and step_execution_id in (cc.producing_step_execution_id,$3)
-            order by (step_execution_id=$3) desc limit 1))
+          'request',(select request_artifact.body_text::jsonb from provider_operations operation
+            join artifacts request_artifact on request_artifact.run_id=operation.run_id
+              and request_artifact.step_execution_id=operation.step_execution_id and request_artifact.kind='coherence_request'
+            where operation.operation_id=cc.operation_id and operation.run_id=cc.run_id
+              and operation.document_version_id=cc.document_version_id
+              and operation.operation='final_coherence_export' and operation.content_hash=cc.response_hash limit 1))
         ) value from runs r join document_versions d on d.id=$2 and d.run_id=r.id join artifacts a on a.id=d.artifact_id and a.run_id=d.run_id join deterministic_reruns dr on dr.run_id=d.run_id and dr.document_version_id=d.id join coherence_checkpoints cc on cc.run_id=d.run_id and cc.document_version_id=d.id where r.id=$1`,
-        [input.run_id, input.document_version_id, input.step_execution_id],
+        [input.run_id, input.document_version_id],
       );
       const exportManifest = {
         version: "2.0.0",

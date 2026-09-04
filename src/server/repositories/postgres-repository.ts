@@ -3055,18 +3055,31 @@ export class PostgresMilestoneRepository
     return this.transaction(async (client) => {
       await this.assertFence(client, runId, recoveryExecutionId, token);
       const result = await client.query<{
-        step_execution_id: string;
-        body_text: string;
+        producing_step_execution_id: string;
+        response: unknown;
+        response_hash: string;
+        artifact_body: string;
       }>(
-        `select o.step_execution_id,a.body_text from provider_operations o
+        `select c.producing_step_execution_id,c.response,c.response_hash,a.body_text artifact_body
+         from coherence_checkpoints c
+         join provider_operations o on o.operation_id=c.operation_id and o.run_id=c.run_id
+           and o.document_version_id=c.document_version_id
+           and o.operation='final_coherence_export' and o.content_hash=c.response_hash
          join artifacts a on a.run_id=o.run_id and a.step_execution_id=o.step_execution_id
            and a.kind='coherence_response'
-         where o.operation_id=$1 and o.run_id=$2 and o.document_version_id=$3`,
+         where c.operation_id=$1 and c.run_id=$2 and c.document_version_id=$3
+           and c.status='checkpointed' and c.response is not null and c.response_hash is not null`,
         [operationId, runId, documentVersionId],
       );
       const row = result.rows[0];
       if (!row) return null;
-      const response = CoherenceResponseSchema.parse(JSON.parse(row.body_text));
+      const response = CoherenceResponseSchema.parse(row.response);
+      const artifactResponse = CoherenceResponseSchema.parse(JSON.parse(row.artifact_body));
+      if (
+        canonicalHash(response) !== row.response_hash ||
+        canonicalHash(artifactResponse) !== row.response_hash
+      )
+        throw new Error("Persisted coherence recovery hash mismatch");
       const coherenceBlockers = response.findings.filter(
         (finding) => finding.severity === "blocker",
       ).length;
@@ -3087,7 +3100,7 @@ export class PostgresMilestoneRepository
           operationId,
           runId,
           documentVersionId,
-          row.step_execution_id,
+          row.producing_step_execution_id,
           recoveryExecutionId,
           outcome,
         ],
@@ -3124,7 +3137,7 @@ export class PostgresMilestoneRepository
           coherence_blockers: coherenceBlockers,
           outcome,
         },
-        producing_step_execution_id: row.step_execution_id,
+        producing_step_execution_id: row.producing_step_execution_id,
       });
     });
   }

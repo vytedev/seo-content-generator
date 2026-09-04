@@ -564,7 +564,72 @@ integration("PostgreSQL milestone four", () => {
     ).rows[0]!.coherence;
     expect(lineage.request).toBeTruthy();
     expect(lineage.producing_step_execution_id).toBeTruthy();
-    expect(lineage.recovery_step_execution_id).toBeTruthy();
+    expect(lineage.persistence_step_execution_id).toBeTruthy();
+    expect(lineage.recovery_step_execution_ids).toHaveLength(1);
+  });
+
+  it("anchors chained coherence recovery to the immutable checkpoint producer", async () => {
+    const { repository, run } = await setup("m4-pg-coherence-chained-replay");
+    const coherence = new MockCoherenceProvider("coherence-v1");
+    let checkpointCrash = true;
+    await expect(
+      orchestrator(repository, coherence, {
+        hit(boundary) {
+          if (checkpointCrash && boundary === "after_coherence_provider") {
+            checkpointCrash = false;
+            throw new Error("crash after the coherence checkpoint");
+          }
+        },
+      }).run(run.run_id),
+    ).rejects.toThrow("crash after the coherence checkpoint");
+
+    let persistenceCrash = true;
+    await expect(
+      orchestrator(repository, coherence, {
+        hit(boundary) {
+          if (persistenceCrash && boundary === "after_coherence_persist") {
+            persistenceCrash = false;
+            throw new Error("crash after coherence persistence");
+          }
+        },
+      }).run(run.run_id),
+    ).rejects.toThrow("crash after coherence persistence");
+
+    await orchestrator(repository, coherence).run(run.run_id);
+    expect(coherence.calls).toHaveLength(1);
+    expect(
+      (await pool!.query("select count(*)::int c from exports where run_id=$1", [run.run_id]))
+        .rows[0].c,
+    ).toBe(1);
+    const lineage = (
+      await pool!.query<{
+        checkpoint_producer: string;
+        recovery_producers: string[];
+        recoveries: number;
+      }>(
+        `select c.producing_step_execution_id checkpoint_producer,
+          array_agg(r.producing_step_execution_id order by r.created_at) recovery_producers,
+          count(r.*)::int recoveries
+         from coherence_checkpoints c join coherence_recoveries r on r.operation_id=c.operation_id
+         where c.run_id=$1 group by c.producing_step_execution_id`,
+        [run.run_id],
+      )
+    ).rows[0]!;
+    expect(lineage.recoveries).toBe(2);
+    expect(lineage.recovery_producers).toEqual([
+      lineage.checkpoint_producer,
+      lineage.checkpoint_producer,
+    ]);
+    const manifestLineage = (
+      await pool!.query<{ coherence: Record<string, unknown> }>(
+        "select manifest->'exact_lineage'->'coherence' coherence from export_manifests where run_id=$1",
+        [run.run_id],
+      )
+    ).rows[0]!.coherence;
+    expect(manifestLineage.request).toBeTruthy();
+    expect(manifestLineage.producing_step_execution_id).toBe(lineage.checkpoint_producer);
+    expect(manifestLineage.persistence_step_execution_id).toBeTruthy();
+    expect(manifestLineage.recovery_step_execution_ids).toHaveLength(2);
   });
 
   it("routes an eligible coherence blocker through one controlled recovery cycle", async () => {
