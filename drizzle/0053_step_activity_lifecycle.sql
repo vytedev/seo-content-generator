@@ -1,7 +1,8 @@
+-- Custom migration generated with drizzle-kit --custom.
 -- Allocate every run activity sequence under one run-scoped transaction lock.
 CREATE OR REPLACE FUNCTION allocate_run_activity_sequence() RETURNS trigger AS $$
 BEGIN
-  PERFORM pg_advisory_xact_lock(hashtextextended(NEW.run_id::text, 0));
+  PERFORM pg_advisory_xact_lock(hashtextextended('run_activity:' || NEW.run_id::text, 0));
   SELECT coalesce(max(sequence), 0) + 1 INTO NEW.sequence
     FROM run_activity_events WHERE run_id=NEW.run_id;
   NEW.payload := jsonb_set(NEW.payload, '{sequence}', to_jsonb(NEW.sequence), true);

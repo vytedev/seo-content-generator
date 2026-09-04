@@ -1,8 +1,14 @@
 import { readFileSync } from "node:fs";
 import { describe, expect, it } from "vitest";
 
-const migrationPath = "drizzle/0050_lyrical_the_professor.sql";
-const migration = readFileSync(migrationPath, "utf8");
+const migrationPaths = [
+  "drizzle/0050_exotic_mandarin.sql",
+  "drizzle/0051_production_readiness_invariants.sql",
+  "drizzle/0052_review_operation_safety.sql",
+  "drizzle/0053_step_activity_lifecycle.sql",
+  "drizzle/0054_production_readiness_marker.sql",
+];
+const migration = migrationPaths.map((path) => readFileSync(path, "utf8")).join("\n");
 
 describe("production-readiness persistence migration", () => {
   it("is the next append-only migration and creates command, activity, and SERP stores", () => {
@@ -26,7 +32,7 @@ describe("production-readiness persistence migration", () => {
 
   it("normalises revision checkpoints and marks ambiguous in-flight operations", () => {
     expect(migration).toContain(
-      'UPDATE "revision_operation_states" SET "status"=\'checkpointed\' WHERE "status"=\'response_validated\'',
+      'UPDATE "revision_operation_states"\nSET "status"=\'checkpointed\'\nWHERE "status"=\'response_validated\'',
     );
     for (const table of [
       "draft_operation_states",
@@ -37,7 +43,7 @@ describe("production-readiness persistence migration", () => {
       expect(migration).toContain(`ALTER TABLE "${table}" ADD COLUMN "release_reason" text`);
       expect(migration).toContain(`ALTER TABLE "${table}" ADD COLUMN "ambiguity_reason" text`);
       expect(migration).toContain(
-        `UPDATE "${table}" SET "ambiguity_reason"='provider_in_flight_without_checkpoint'`,
+        `UPDATE "${table}"\nSET "ambiguity_reason"='provider_in_flight_without_checkpoint'`,
       );
       expect(migration).toContain(`${table}_safety_reason`);
     }
@@ -51,8 +57,8 @@ describe("production-readiness persistence migration", () => {
     expect(migration).toContain("terminal run command is immutable");
     expect(migration).toContain("export_operations_terminal_result");
     expect(migration).toContain("exports_terminal_result");
-    expect(migration).toContain(
-      '"status"=\'succeeded\' AND "external_document_id" IS NOT NULL AND "external_url" IS NOT NULL',
+    expect(migration).toMatch(
+      /"status"='succeeded' and "(?:export_operations"\.)?"external_document_id" is not null and "(?:export_operations"\.)?"external_url" is not null/i,
     );
   });
 

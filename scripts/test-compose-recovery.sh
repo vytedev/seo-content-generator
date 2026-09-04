@@ -61,14 +61,18 @@ count=$(docker exec compose-postgres-test-1 psql -p 55432 -U postgres -d topolog
 duplicate_paid=$(docker exec compose-postgres-test-1 psql -p 55432 -U postgres -d topology_test -Atc \
   "select count(*) from (select provider,request_id from provider_usage where run_id='$run_id' and request_id is not null group by provider,request_id having count(*)>1) d")
 [[ "$duplicate_paid" == "0" ]] || { echo "duplicate provider work was recorded" >&2; exit 1; }
-missing_checksums=$(docker exec compose-postgres-test-1 psql -p 55432 -U postgres -d topology_test -Atc \
-  "select count(*) from application_migrations where checksum is null")
-[[ "$missing_checksums" == "0" ]] || { echo "migration adoption left missing checksums" >&2; exit 1; }
-# Prove drift fails closed in the same disposable database.
+migration_count=$(docker exec compose-postgres-test-1 psql -p 55432 -U postgres -d topology_test -Atc \
+  "select count(*) from drizzle.__drizzle_migrations")
+[[ "$migration_count" == "55" ]] || { echo "native Drizzle ledger is incomplete: $migration_count" >&2; exit 1; }
+# Prove drift fails closed in the same disposable database, then restore the disposable row.
+original_hash=$(docker exec compose-postgres-test-1 psql -p 55432 -U postgres -d topology_test -Atc \
+  "select hash from drizzle.__drizzle_migrations order by created_at limit 1")
 docker exec compose-postgres-test-1 psql -p 55432 -U postgres -d topology_test -v ON_ERROR_STOP=1 -c \
-  "update application_migrations set checksum=repeat('0',64) where name=(select min(name) from application_migrations)" >/dev/null
+  "update drizzle.__drizzle_migrations set hash=repeat('0',64) where created_at=(select min(created_at) from drizzle.__drizzle_migrations)" >/dev/null
 if "${compose[@]}" run --rm migrate-test >/dev/null 2>&1; then
   echo "migration checksum drift was accepted" >&2
   exit 1
 fi
-echo "Compose recovery passed: run=$run_id queue=$state activity=$count; checksum drift refused"
+docker exec compose-postgres-test-1 psql -p 55432 -U postgres -d topology_test -v ON_ERROR_STOP=1 -c \
+  "update drizzle.__drizzle_migrations set hash='$original_hash' where created_at=(select min(created_at) from drizzle.__drizzle_migrations)" >/dev/null
+echo "Compose recovery passed: run=$run_id queue=$state activity=$count; native ledger drift refused"

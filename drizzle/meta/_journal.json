@@ -355,36 +355,36 @@
     {
       "idx": 50,
       "version": "7",
-      "when": 1788363605451,
-      "tag": "0050_lyrical_the_professor",
+      "when": 1788497787449,
+      "tag": "0050_exotic_mandarin",
+      "breakpoints": true
+    },
+    {
+      "idx": 51,
+      "version": "7",
+      "when": 1788497788795,
+      "tag": "0051_production_readiness_invariants",
       "breakpoints": true
     },
     {
       "idx": 52,
       "version": "7",
-      "when": 1788364800000,
-      "tag": "0052_real_screwball",
+      "when": 1788497789970,
+      "tag": "0052_review_operation_safety",
       "breakpoints": true
     },
     {
       "idx": 53,
       "version": "7",
-      "when": 1788366000000,
+      "when": 1788497791120,
       "tag": "0053_step_activity_lifecycle",
       "breakpoints": true
     },
     {
       "idx": 54,
       "version": "7",
-      "when": 1788367200000,
-      "tag": "0054_runtime_readiness_marker",
-      "breakpoints": true
-    },
-    {
-      "idx": 55,
-      "version": "7",
-      "when": 1788368400000,
-      "tag": "0055_worker_readiness_heartbeat",
+      "when": 1788497792361,
+      "tag": "0054_production_readiness_marker",
       "breakpoints": true
     }
   ]

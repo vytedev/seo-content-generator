@@ -4218,7 +4218,7 @@ export class PostgresMilestoneRepository
       // A concurrent identical request waits and then observes the committed terminal result;
       // a different payload waits and conflicts before any domain mutation.
       await client.query("select pg_advisory_xact_lock(hashtextextended($1, 0))", [
-        command.idempotency_key,
+        `run_command:${command.idempotency_key}`,
       ]);
       const existing = await client.query<{
         command_id: string;

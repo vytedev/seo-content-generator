@@ -2,20 +2,21 @@ import { readFile } from "node:fs/promises";
 import { describe, expect, it } from "vitest";
 
 describe("migration runner safety", () => {
-  it("serialises migration decisions and records immutable SHA-256 checksums", async () => {
+  it("serialises migration execution through Drizzle's canonical ledger", async () => {
     const source = await readFile("scripts/migrate.ts", "utf8");
-    expect(source).toContain('createHash("sha256")');
-    expect(source).toContain("pg_advisory_xact_lock");
-    expect(source).toContain("Migration checksum drift detected");
-    expect(source).toContain("alter column checksum set not null");
+    expect(source).toContain("pg_advisory_lock");
+    expect(source).toContain("pg_advisory_unlock");
+    expect(source).toContain("readMigrationFiles");
+    expect(source).toContain("Drizzle migration checksum drift detected");
+    expect(source).toContain("migrate(drizzle(client)");
+    expect(source).toContain('migrationsSchema: "drizzle"');
+    expect(source).toContain('migrationsTable: "__drizzle_migrations"');
   });
 
-  it("adopts an existing schema marker 54 without replaying migration SQL", async () => {
+  it("does not create or adopt a competing application migration ledger", async () => {
     const source = await readFile("scripts/migrate.ts", "utf8");
-    expect(source).toContain("schemaAlreadyCurrent");
-    expect(source.indexOf("if (schemaAlreadyCurrent)")).toBeLessThan(
-      source.indexOf("for (const statement of migration.sql"),
-    );
-    expect(source).toContain("Unsupported application schema marker");
+    expect(source).not.toContain("application_migrations");
+    expect(source).not.toContain("schemaAlreadyCurrent");
+    expect(source).not.toContain("statement-breakpoint");
   });
 });

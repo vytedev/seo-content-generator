@@ -241,6 +241,39 @@ integration("PostgreSQL command repository command-kind parity", () => {
     expect(state.rows[0]?.status).toBe("cancelled");
   });
 
+  it("keeps command and activity advisory locks in separate namespaces", async () => {
+    const firstRunId = await seed("pg-reversed-lock-first");
+    const secondRunId = await seed("pg-reversed-lock-second");
+    // Before namespace prefixes, each command locked the other run's activity identity:
+    // command key B -> activity for run A, and command key A -> activity for run B.
+    await Promise.race([
+      Promise.all([
+        repository.submitCommand(
+          command("cancel_run", secondRunId, { run_id: firstRunId }, "pg-reversed-first-command"),
+        ),
+        repository.submitCommand(
+          command("cancel_run", firstRunId, { run_id: secondRunId }, "pg-reversed-second-command"),
+        ),
+      ]),
+      new Promise<never>((_, reject) =>
+        setTimeout(() => reject(new Error("reversed advisory locks did not complete")), 5_000),
+      ),
+    ]);
+
+    for (const runId of [firstRunId, secondRunId]) {
+      const sequences = (
+        await pool!.query<{ sequence: number }>(
+          "select sequence from run_activity_events where run_id=$1 order by sequence",
+          [runId],
+        )
+      ).rows.map(({ sequence }) => sequence);
+      expect(sequences).toEqual(Array.from({ length: sequences.length }, (_, index) => index + 1));
+      expect(
+        (await pool!.query("select status from runs where id=$1", [runId])).rows[0]?.status,
+      ).toBe("cancelled");
+    }
+  });
+
   it("stores step lifecycle history at transition time", async () => {
     const runId = await seed("pg-step-activity-seed");
     const lease = await repository.claimStep(runId, "internal_link_discovery", "worker");
