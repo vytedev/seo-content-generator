@@ -303,8 +303,8 @@ BEGIN
   EXCEPTION WHEN raise_exception THEN
     IF SQLERRM = 'review adoption deletion unexpectedly succeeded' THEN RAISE; END IF;
   END;
-  UPDATE review_operation_states SET status='provider_in_flight' WHERE operation_id=review_operation_id;
-  UPDATE review_operation_states SET status='checkpointed',response='{"findings":[],"usage":{"input_tokens":1,"output_tokens":1,"cost_micros":0}}'::jsonb,response_hash='review-response-hash',checkpointed_at=clock_timestamp() WHERE operation_id=review_operation_id;
+  UPDATE review_operation_states SET status='provider_in_flight',ambiguity_reason='provider_in_flight_without_checkpoint' WHERE operation_id=review_operation_id;
+  UPDATE review_operation_states SET status='checkpointed',response='{"findings":[],"usage":{"input_tokens":1,"output_tokens":1,"cost_micros":0}}'::jsonb,response_hash='review-response-hash',ambiguity_reason=null,checkpointed_at=clock_timestamp() WHERE operation_id=review_operation_id;
   BEGIN
     UPDATE review_operation_states SET status='provider_in_flight' WHERE operation_id=review_operation_id;
     RAISE EXCEPTION 'checkpointed review operation mutation unexpectedly succeeded';
@@ -587,7 +587,7 @@ END $$;
 
 DO $$
 BEGIN
-  IF (SELECT version FROM application_schema_version WHERE singleton=true) IS DISTINCT FROM 55 THEN
+  IF (SELECT version FROM application_schema_version WHERE singleton=true) IS DISTINCT FROM 56 THEN
     RAISE EXCEPTION 'application schema readiness marker is missing or stale';
   END IF;
 END $$;

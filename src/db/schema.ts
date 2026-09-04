@@ -40,7 +40,7 @@ export const applicationSchemaVersion = pgTable(
   },
   (t) => [
     check("application_schema_version_singleton", sql`${t.singleton}=true`),
-    check("application_schema_version_current", sql`${t.version}=55`),
+    check("application_schema_version_current", sql`${t.version}=56`),
   ],
 );
 
@@ -518,7 +518,7 @@ export const reviewOperationStates = pgTable(
     ),
     check(
       "review_operation_states_safety_reason",
-      sql`(${t.releaseReason} is null or (${t.status}='started' and ${t.releaseReason} in ('configuration_before_dispatch','authentication_before_dispatch','billing_before_dispatch','validation_before_dispatch'))) and (${t.ambiguityReason} is null or (${t.status}='provider_in_flight' and ${t.ambiguityReason} in ('provider_in_flight_without_checkpoint','external_side_effect_without_checkpoint','legacy_dispatch_outcome_unknown'))) and num_nonnulls(${t.releaseReason},${t.ambiguityReason}) <= 1`,
+      sql`((${t.status}='started' and ${t.ambiguityReason} is null) or (${t.status}='provider_in_flight' and ${t.releaseReason} is null and ${t.ambiguityReason} is not null and ${t.ambiguityReason} in ('provider_in_flight_without_checkpoint','external_side_effect_without_checkpoint','legacy_dispatch_outcome_unknown')) or (${t.status}='checkpointed' and ${t.releaseReason} is null and ${t.ambiguityReason} is null)) and (${t.releaseReason} is null or (${t.status}='started' and ${t.releaseReason} in ('configuration_before_dispatch','authentication_before_dispatch','billing_before_dispatch','validation_before_dispatch')))`,
     ),
   ],
 );
@@ -1453,7 +1453,7 @@ export const draftOperationStates = pgTable(
     ),
     check(
       "draft_operation_states_safety_reason",
-      sql`(${t.releaseReason} is null or (${t.status}='started' and ${t.releaseReason} in ('configuration_before_dispatch','authentication_before_dispatch','billing_before_dispatch','validation_before_dispatch'))) and (${t.ambiguityReason} is null or (${t.status}='provider_in_flight' and ${t.ambiguityReason} in ('provider_in_flight_without_checkpoint','external_side_effect_without_checkpoint','legacy_dispatch_outcome_unknown'))) and num_nonnulls(${t.releaseReason},${t.ambiguityReason}) <= 1`,
+      sql`((${t.status}='started' and ${t.ambiguityReason} is null) or (${t.status}='provider_in_flight' and ${t.releaseReason} is null and ${t.ambiguityReason} is not null and ${t.ambiguityReason} in ('provider_in_flight_without_checkpoint','external_side_effect_without_checkpoint','legacy_dispatch_outcome_unknown')) or (${t.status}='checkpointed' and ${t.releaseReason} is null and ${t.ambiguityReason} is null)) and (${t.releaseReason} is null or (${t.status}='started' and ${t.releaseReason} in ('configuration_before_dispatch','authentication_before_dispatch','billing_before_dispatch','validation_before_dispatch')))`,
     ),
   ],
 );
@@ -1549,7 +1549,7 @@ export const revisionOperationStates = pgTable(
     ),
     check(
       "revision_operation_states_safety_reason",
-      sql`(${t.releaseReason} is null or (${t.status}='started' and ${t.releaseReason} in ('configuration_before_dispatch','authentication_before_dispatch','billing_before_dispatch','validation_before_dispatch'))) and (${t.ambiguityReason} is null or (${t.status}='provider_in_flight' and ${t.ambiguityReason} in ('provider_in_flight_without_checkpoint','external_side_effect_without_checkpoint','legacy_dispatch_outcome_unknown'))) and num_nonnulls(${t.releaseReason},${t.ambiguityReason}) <= 1`,
+      sql`((${t.status}='started' and ${t.ambiguityReason} is null) or (${t.status}='provider_in_flight' and ${t.releaseReason} is null and ${t.ambiguityReason} is not null and ${t.ambiguityReason} in ('provider_in_flight_without_checkpoint','external_side_effect_without_checkpoint','legacy_dispatch_outcome_unknown')) or (${t.status}='checkpointed' and ${t.releaseReason} is null and ${t.ambiguityReason} is null)) and (${t.releaseReason} is null or (${t.status}='started' and ${t.releaseReason} in ('configuration_before_dispatch','authentication_before_dispatch','billing_before_dispatch','validation_before_dispatch')))`,
     ),
   ],
 );
@@ -1897,7 +1897,7 @@ export const coherenceCheckpoints = pgTable(
     ),
     check(
       "coherence_checkpoints_safety_reason",
-      sql`(${t.releaseReason} is null or (${t.status}='started' and ${t.releaseReason} in ('configuration_before_dispatch','authentication_before_dispatch','billing_before_dispatch','validation_before_dispatch'))) and (${t.ambiguityReason} is null or (${t.status}='provider_in_flight' and ${t.ambiguityReason} in ('provider_in_flight_without_checkpoint','external_side_effect_without_checkpoint','legacy_dispatch_outcome_unknown'))) and num_nonnulls(${t.releaseReason},${t.ambiguityReason}) <= 1`,
+      sql`((${t.status}='started' and ${t.ambiguityReason} is null) or (${t.status}='provider_in_flight' and ${t.releaseReason} is null and ${t.ambiguityReason} is not null and ${t.ambiguityReason} in ('provider_in_flight_without_checkpoint','external_side_effect_without_checkpoint','legacy_dispatch_outcome_unknown')) or (${t.status}='checkpointed' and ${t.releaseReason} is null and ${t.ambiguityReason} is null)) and (${t.releaseReason} is null or (${t.status}='started' and ${t.releaseReason} in ('configuration_before_dispatch','authentication_before_dispatch','billing_before_dispatch','validation_before_dispatch')))`,
     ),
   ],
 );

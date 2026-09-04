@@ -7,6 +7,8 @@ const migrationPaths = [
   "drizzle/0052_review_operation_safety.sql",
   "drizzle/0053_step_activity_lifecycle.sql",
   "drizzle/0054_production_readiness_marker.sql",
+  "drizzle/0055_curvy_luke_cage.sql",
+  "drizzle/0056_round_veda.sql",
 ];
 const migration = migrationPaths.map((path) => readFileSync(path, "utf8")).join("\n");
 

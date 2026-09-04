@@ -61,7 +61,7 @@ import {
   linkDiscoveryConfigFromEnv,
 } from "../providers/internal-link-discovery.js";
 
-export const CURRENT_APPLICATION_SCHEMA_VERSION = 55;
+export const CURRENT_APPLICATION_SCHEMA_VERSION = 56;
 
 export async function databaseSchemaIsCurrent(pool: Pick<pg.Pool, "query">): Promise<boolean> {
   try {

@@ -548,6 +548,23 @@ integration("PostgreSQL milestone four", () => {
       (await pool!.query("select count(*)::int c from exports where run_id=$1", [run.run_id]))
         .rows[0].c,
     ).toBe(1);
+    expect(
+      (
+        await pool!.query(
+          "select count(*)::int c from coherence_recoveries where run_id=$1 and outcome='export'",
+          [run.run_id],
+        )
+      ).rows[0].c,
+    ).toBe(1);
+    const lineage = (
+      await pool!.query<{ coherence: Record<string, unknown> }>(
+        "select manifest->'exact_lineage'->'coherence' coherence from export_manifests where run_id=$1",
+        [run.run_id],
+      )
+    ).rows[0]!.coherence;
+    expect(lineage.request).toBeTruthy();
+    expect(lineage.producing_step_execution_id).toBeTruthy();
+    expect(lineage.recovery_step_execution_id).toBeTruthy();
   });
 
   it("routes an eligible coherence blocker through one controlled recovery cycle", async () => {
@@ -813,6 +830,71 @@ integration("PostgreSQL milestone four", () => {
     expect((await repository.getRunDetail(run.run_id)).status).toBe("succeeded");
   });
 
+  it("rejects reasonless direct releases for every paid-operation state", async () => {
+    const { repository, run } = await setup("m4-pg-reasonless-release");
+    const document = (
+      await pool!.query<{ id: string }>(
+        "select id from document_versions where run_id=$1 order by revision desc limit 1",
+        [run.run_id],
+      )
+    ).rows[0]!.id;
+    const executionIds = new Map<string, string>();
+    for (const step of [
+      "draft",
+      "review_writing_style",
+      "revision_pass",
+      "final_coherence_export",
+    ] as const) {
+      const execution = await repository.claimStep(run.run_id, step, `reasonless-${step}`, true);
+      executionIds.set(step, execution.execution_id);
+      await pool!.query(
+        `update step_executions set status='retryable_failed',lease_token=null,lease_owner=null,
+           lease_expires_at=null,completed_at=null,updated_at=clock_timestamp() where id=$1`,
+        [execution.execution_id],
+      );
+    }
+    const execution = (step: string) => executionIds.get(step)!;
+    await pool!.query(
+      `insert into draft_operation_states(operation_id,run_id,producing_step_execution_id,request_hash,provider,model,contract_identity,purpose,status,ambiguity_reason)
+       values('reasonless-draft',$1,$2,'hash','test','model','contract','initial','provider_in_flight','provider_in_flight_without_checkpoint')`,
+      [run.run_id, execution("draft")],
+    );
+    await pool!.query(
+      `insert into review_operation_states(operation_id,run_id,document_version_id,producing_step_execution_id,step,request_hash,provider,model,status,ambiguity_reason)
+       values('reasonless-review',$1,$2,$3,'review_writing_style','hash','test','model','provider_in_flight','provider_in_flight_without_checkpoint')`,
+      [run.run_id, document, execution("review_writing_style")],
+    );
+    await pool!.query(
+      `insert into revision_operation_states(operation_id,run_id,document_version_id,producing_step_execution_id,request_hash,status,ambiguity_reason)
+       values('reasonless-revision',$1,$2,$3,'hash','provider_in_flight','provider_in_flight_without_checkpoint')`,
+      [run.run_id, document, execution("revision_pass")],
+    );
+    await pool!.query(
+      `insert into coherence_checkpoints(operation_id,run_id,document_version_id,producing_step_execution_id,request_hash,status,ambiguity_reason)
+       values('reasonless-coherence',$1,$2,$3,'hash','provider_in_flight','provider_in_flight_without_checkpoint')`,
+      [run.run_id, document, execution("final_coherence_export")],
+    );
+
+    for (const [table, operationId] of [
+      ["draft_operation_states", "reasonless-draft"],
+      ["review_operation_states", "reasonless-review"],
+      ["revision_operation_states", "reasonless-revision"],
+      ["coherence_checkpoints", "reasonless-coherence"],
+    ]) {
+      await expect(
+        pool!.query(
+          `update ${table} set status='started',ambiguity_reason=null where operation_id=$1`,
+          [operationId],
+        ),
+      ).rejects.toThrow(/invalid|violates check constraint/i);
+      await expect(
+        pool!.query(`update ${table} set ambiguity_reason=null where operation_id=$1`, [
+          operationId,
+        ]),
+      ).rejects.toThrow(/invalid|violates check constraint/i);
+    }
+  });
+
   it("persists revision model-mismatch release and safely retries the same operation", async () => {
     const { repository, run } = await setup("m4-pg-revision-model-mismatch");
     const fetcher = vi.fn();
@@ -1072,8 +1154,14 @@ integration("PostgreSQL milestone four", () => {
       ],
     );
     await pool!.query(
+      "alter table coherence_checkpoints disable trigger coherence_checkpoints_transition",
+    );
+    await pool!.query(
       "update coherence_checkpoints set response_hash=repeat('0',64) where operation_id=$1",
       [checkpoint.operation_id],
+    );
+    await pool!.query(
+      "alter table coherence_checkpoints enable trigger coherence_checkpoints_transition",
     );
 
     const adapter = { export: vi.fn() };

@@ -2253,11 +2253,13 @@ export class PostgresMilestoneRepository
   }): Promise<void> {
     await this.transaction(async (client) => {
       await this.assertFence(client, input.run_id, input.execution_id, input.token);
-      await client.query(
+      const changed = await client.query(
         `update revision_operation_states set status='started',ambiguity_reason=null,release_reason=$3
          where operation_id=$1 and run_id=$2 and status='provider_in_flight' and response is null`,
         [input.operation_id, input.run_id, input.reason],
       );
+      if (changed.rowCount !== 1)
+        throw new Error("Revision operation has no releasable provider reservation");
     });
   }
 
@@ -3216,7 +3218,36 @@ export class PostgresMilestoneRepository
         ],
       );
       const blockers = response.findings.some((finding) => finding.severity === "blocker");
-      if (blockers && run.coherence_return_cycles >= 2) {
+      const outcome = blockers
+        ? run.coherence_return_cycles >= 2
+          ? "blocked"
+          : "revise"
+        : "export";
+      const checkpoint = await client.query<{ producing_step_execution_id: string }>(
+        `select producing_step_execution_id from coherence_checkpoints
+         where operation_id=$1 and run_id=$2 and document_version_id=$3
+           and status='checkpointed' and response_hash=$4`,
+        [request.operation_id, input.run_id, input.document_version_id, canonicalHash(response)],
+      );
+      const producingExecutionId = checkpoint.rows[0]?.producing_step_execution_id;
+      if (!producingExecutionId)
+        throw new Error("Persisted coherence response has no matching immutable checkpoint");
+      if (producingExecutionId !== input.execution_id)
+        await client.query(
+          `insert into coherence_recoveries(operation_id,run_id,document_version_id,
+             producing_step_execution_id,recovery_step_execution_id,outcome)
+           values($1,$2,$3,$4,$5,$6)
+           on conflict(operation_id,recovery_step_execution_id) do nothing`,
+          [
+            request.operation_id,
+            input.run_id,
+            input.document_version_id,
+            producingExecutionId,
+            input.execution_id,
+            outcome,
+          ],
+        );
+      if (outcome === "blocked") {
         await client.query(
           `update step_executions set status='blocked',lease_token=null,lease_owner=null,lease_expires_at=null,updated_at=clock_timestamp() where id=$1`,
           [input.execution_id],
@@ -3227,7 +3258,7 @@ export class PostgresMilestoneRepository
         );
         return "blocked";
       }
-      if (blockers) {
+      if (outcome === "revise") {
         await this.requireFenceClient(
           client,
           "select complete_step_execution($1,$2) changed",

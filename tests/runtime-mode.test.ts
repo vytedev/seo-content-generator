@@ -59,7 +59,7 @@ describe("explicit runtime mode", () => {
       } as never),
     ).resolves.toBe(false);
     await expect(
-      databaseSchemaIsCurrent({ query: async () => ({ rows: [{ version: 55 }] }) } as never),
+      databaseSchemaIsCurrent({ query: async () => ({ rows: [{ version: 56 }] }) } as never),
     ).resolves.toBe(true);
   });
 
